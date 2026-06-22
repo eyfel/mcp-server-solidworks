@@ -1,7 +1,6 @@
 # Claude Code local config
 .claude/
 
-# Markdown dosyaları dahili çalışma notlarıdır; herkese açık depoya dahil edilmez.
 # Yalnızca README ve CONTRIBUTING yayınlanır.
 *.md
 !README.md
