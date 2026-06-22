@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Dev/test only. The contract test (tests/test_schema_contract.py) also runs
+# standalone with the stdlib (`python tests/test_schema_contract.py`); pytest is
+# only needed for the `pytest` runner / CI integration.
+pytest>=8.0.0

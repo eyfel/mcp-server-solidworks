@@ -1,0 +1,8 @@
+{
+  "state_version": "integer, default: 0, increments on every successful operation",
+  "active_document": "string or null",
+  "document_type": "PART | ASSEMBLY | DRAWING | null",
+  "active_sketch": "string or null",
+  "features": ["array of feature names"],
+  "dimensions": ["array of applied dimensions"]
+}

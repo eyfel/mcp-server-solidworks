@@ -1,0 +1,366 @@
+{
+    "open_new_part": {
+        "description": "Opens a new part document in SolidWorks, establishing the active document context for subsequent operations.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "template_path": "string (optional — full path to a part template; uses the default part template if omitted)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "create_sketch": {
+        "description": "Creates a new sketch on a plane OR on an existing model face. Default: plane name. With on_face=true, select the face by face_index (PREFERRED — the i-th face from analyze_model(faces); robust on revolve end-caps where a coordinate pick is ambiguous) or by a point (face_x,face_y,face_z) on the planar face. Enables sketching on existing geometry (e.g. a recess/hub on a part face, a bore on a shaft end). Auto-exits any active sketch first.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "plane": "string (plane mode — e.g. Front Plane, Top Plane, Right Plane, or a named ref plane like Plane1; required unless on_face)",
+                "on_face": "boolean (optional, default false — sketch on a model face instead of a plane)",
+                "face_index": "integer (on_face, PREFERRED — index of the target face from analyze_model(faces); bypasses coordinate picking. Takes priority over face_x/y/z)",
+                "face_x": "number (on_face — X of a point ON the target planar face, meters)",
+                "face_y": "number (on_face — Y of a point ON the target planar face, meters)",
+                "face_z": "number (on_face — Z of a point ON the target planar face, meters)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "add_sketch_entity": {
+        "description": "Adds a sketch entity to the active sketch. Supported types: 'rectangle' (x1,y1,x2,y2), 'circle' (cx,cy,radius), 'line' (x1,y1,x2,y2), 'arc' (x1,y1 start, x2,y2 end, xm,ym mid-arc point), 'arc_center' (cx,cy exact center, x1,y1 start, x2,y2 end, direction +1 CCW/-1 CW — radius-exact, stable for shallow arcs; created with SketchManager.AddToDB=true so SW input inference/snapping cannot skew the radius), 'ellipse' (cx,cy center, x1,y1 major-axis point, x2,y2 minor-axis point), 'spline' (points=[x1,y1,...] through-points), 'fillet' (vx,vy vertex to round, radius), 'chamfer' (vx,vy vertex to cut, distance). Mirror of analyze_model's sketch-segment output (every emitted segment kind maps to an entity_type here). On COMPLETED the response carries result_geometry: the REAL created geometry read back from SW (not the input) for in-band self-verification. New entity types are added at the execution layer without changing this schema.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "entity_type": "string (required: 'rectangle', 'circle', 'line', 'arc', 'arc_center', 'ellipse', 'spline', 'fillet', 'chamfer')",
+                "x1": "number (rectangle/line/arc/arc_center: X of first/start point; ellipse: X of major-axis point)",
+                "y1": "number (rectangle/line/arc/arc_center: Y of first/start point; ellipse: Y of major-axis point)",
+                "x2": "number (rectangle/line/arc/arc_center: X of second/end point; ellipse: X of minor-axis point)",
+                "y2": "number (rectangle/line/arc/arc_center: Y of second/end point; ellipse: Y of minor-axis point)",
+                "xm": "number (arc: X of mid-arc point)",
+                "ym": "number (arc: Y of mid-arc point)",
+                "cx": "number (circle/arc_center/ellipse: center X)",
+                "cy": "number (circle/arc_center/ellipse: center Y)",
+                "radius": "number (circle/fillet: radius)",
+                "vx": "number (fillet/chamfer: X of vertex)",
+                "vy": "number (fillet/chamfer: Y of vertex)",
+                "distance": "number (chamfer: equal distance on both sides)",
+                "direction": "number (arc_center: sweep sense from start to end, +1 CCW / -1 CW; default +1; ignored by other types)",
+                "points": "string (spline: JSON array of flat through-points '[x1,y1,x2,y2,...]', >= 2 points; parsed by the adapter into a number array; ignored by other types)"
+            }
+        },
+        "output": "→ see execution-response.json (add_sketch_entity additionally returns result_geometry: the real created segment geometry, read-only — does NOT affect state_version)"
+    },
+    "add_sketch_constraint": {
+        "description": "Applies a geometric constraint to sketch entities in the active sketch. Single-entity constraints (horizontal, vertical) need only px1/py1. Two-entity constraints (coincident, parallel, perpendicular, tangent, equal, midpoint) also require px2/py2. entity_type1/2 defaults to 'SKETCHSEGMENT'; use 'SKETCHPOINT' for point-based constraints.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "constraint_type": "string (required: 'horizontal', 'vertical', 'coincident', 'parallel', 'perpendicular', 'tangent', 'equal', 'midpoint')",
+                "px1": "number (required — X coordinate of point on first entity)",
+                "py1": "number (required — Y coordinate of point on first entity)",
+                "px2": "number (optional — X coordinate of point on second entity; required for two-entity constraints)",
+                "py2": "number (optional — Y coordinate of point on second entity; required for two-entity constraints)",
+                "entity_type1": "string (optional, default 'SKETCHSEGMENT' — 'SKETCHSEGMENT' or 'SKETCHPOINT')",
+                "entity_type2": "string (optional, default 'SKETCHSEGMENT' — 'SKETCHSEGMENT' or 'SKETCHPOINT')"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "add_dimension": {
+        "description": "Applies a smart dimension to a sketch segment by selecting it via a point on the segment. px/py must lie on or very near the target segment (e.g. the midpoint of a line). This approach works reliably for any sketch geometry, not just simple rectangles.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "px": "number (X coordinate of a point on the target segment, in document units)",
+                "py": "number (Y coordinate of a point on the target segment, in document units)",
+                "value": "number (dimension value in document units)",
+                "label_offset_x": "number (optional, default 0.0 — X offset from px for the dimension label position)",
+                "label_offset_y": "number (optional, default -0.015 — Y offset from py for the dimension label position)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "extrude_feature": {
+        "description": "Creates a 3D feature from the active sketch profile. Exits sketch mode automatically. feature_type discriminator: 'boss' (solid extrusion, default), 'cut' (material removal, requires existing solid body), 'revolve' (solid of revolution — requires angle and axis coords), 'sweep' (swept solid — requires path_sketch name), 'loft' (lofted solid — requires profiles JSON array of ≥2 sketch names).",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "depth": "number (required for boss/cut — extrusion/cut depth in document units)",
+                "feature_type": "string (optional, default 'boss': 'boss' | 'cut' | 'revolve' | 'sweep' | 'loft')",
+                "angle": "number (revolve only — revolution angle in DEGREES, default 360 = full revolve)",
+                "axis_x1": "number (revolve only — X of first endpoint of centerline segment)",
+                "axis_y1": "number (revolve only — Y of first endpoint of centerline segment)",
+                "axis_x2": "number (revolve only — X of second endpoint of centerline segment)",
+                "axis_y2": "number (revolve only — Y of second endpoint of centerline segment; default 0.001)",
+                "path_sketch": "string (sweep only — name of the sketch containing the sweep path)",
+                "profiles": "string (loft only — JSON array of sketch names e.g. '[\"Sketch1\",\"Sketch2\"]', minimum 2)",
+                "reverse": "boolean (boss/cut — flip feature direction; needed for a cut/boss sketched on a part face where material is on the opposite side)",
+                "through": "boolean (boss/cut — through-all end condition; depth ignored)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "add_edge_feature": {
+        "description": "Applies a 3D edge modifier to solid body edges. Operates post-extrusion on the solid, NOT on sketch segments. feature_type='fillet': rounds edge(s) with radius_or_distance as radius. feature_type='chamfer': applies equal-distance chamfer. PREFERRED edge selection: edge_indices (JSON array of integer indices from analyze_model(edges)) — robust for crowded/concave (inner-corner, small-radius) edges that coordinate picks can't disambiguate. Fallback: ex/ey/ez (single) or edges_json (multiple {ex,ey,ez}).",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "feature_type": "string (required: 'fillet' or 'chamfer')",
+                "radius_or_distance": "number (required — fillet radius or chamfer equal distance, in document units)",
+                "edge_indices": "string (optional, PREFERRED — JSON array of integer edge indices from analyze_model(edges), e.g. '[3,5]'; bypasses coordinate picking. Takes priority over edges_json/ex-ey-ez)",
+                "ex": "number (single-edge: X coordinate of point on target edge)",
+                "ey": "number (single-edge: Y coordinate of point on target edge)",
+                "ez": "number (single-edge: Z coordinate of point on target edge)",
+                "edges_json": "string (optional — JSON array of {ex,ey,ez} objects for multiple edges, overrides single ex/ey/ez if non-empty)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "create_drawing": {
+        "description": "Opens a new SolidWorks drawing document (A3 sheet, 1:1 scale). model_path is optional — an empty drawing is created if omitted. add_drawing_view requires the referenced part to be saved to disk.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "model_path": "string (optional — full path to the part/assembly to reference; empty drawing created if omitted)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "add_drawing_view": {
+        "description": "Adds a model projection view to the active drawing sheet. The referenced part must be saved to disk. view_type maps to SolidWorks standard views.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "view_type": "string (required: 'front', 'top', 'right', 'isometric', 'back', 'bottom', 'left')",
+                "pos_x": "number (optional, default 0.1 — X position on drawing sheet in meters)",
+                "pos_y": "number (optional, default 0.1 — Y position on drawing sheet in meters)",
+                "scale": "number (optional, default 1.0 — view scale)",
+                "model_path": "string (optional — full path to part file; auto-detects first open part if omitted)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "add_drawing_dimension": {
+        "description": "Applies a smart dimension to a drawing view segment nearest to point (px, py). Same coordinate selection approach as add_dimension but operates in a drawing document. Requires active drawing document.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "px": "number (X coordinate of a point on the target drawing segment, in sheet meters)",
+                "py": "number (Y coordinate of a point on the target drawing segment, in sheet meters)",
+                "value": "number (dimension value in document units)",
+                "label_offset_x": "number (optional, default 0.0)",
+                "label_offset_y": "number (optional, default -0.015)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "verify_state": {
+        "description": "Reads and returns the current CAD state without modifying the document, used to confirm expected state before or after operations.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {}
+        },
+        "output": "→ see execution-response.json"
+    },
+    "ensure_ready": {
+        "description": "Lifecycle/bootstrap — NOT a state-versioned CAD op. Served on its own POST /ensure_ready route (not /api/tool/execute), so it carries no operation_id/state_version. Ensures the execution server is running and SolidWorks is attached, launching SolidWorks via COM if it is closed. Does NOT open or create any document. Does NOT increment state_version.",
+        "input": {
+            "params": {}
+        },
+        "output": "{ status, comAttached, swLaunched, activeDocument, swVersion, stateVersion } (or comAttached=false + launchError/ensureError on failure)"
+    },
+    "export_document": {
+        "description": "Exports the active SolidWorks document to a file without closing it. DWG/DXF require an active drawing document. PDF uses SolidWorks PDF export options. state_version is NOT incremented (no CAD state change).",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "format": "string (required: 'STEP', 'IGES', 'STL', 'PDF', 'DWG', 'DXF' — DWG/DXF require active drawing doc)",
+                "file_path": "string (required — full output path including filename and extension)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "batch_export": {
+        "description": "Exports the active document to multiple formats in one call. Each format saved as file_path_base.<ext>. DWG/DXF skipped if active doc is not a drawing. Partial success reported in response Features list. state_version is NOT incremented.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "file_path_base": "string (required — output path without extension, e.g. 'C:/output/mypart')",
+                "formats_json": "string (required — JSON array of format strings, e.g. '[\"STEP\",\"STL\",\"PDF\"]')"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "close_document": {
+        "description": "Closes the active SolidWorks document, optionally saving before closing.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "save": "boolean (true to save before closing, false to discard changes)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "save_document": {
+        "description": "Saves the active SolidWorks document to disk. With file_path, does a SaveAs to that path (creating the directory); without it, an in-place Save (only if the document already has a path). Does NOT increment state_version (no geometry change). A part must be saved to disk before a drawing view can reference it.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "file_path": "string (optional — full output path incl. extension: .sldprt/.sldasm/.slddrw; in-place save if omitted)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "analyze_model": {
+        "description": "Analyzes the active part document without modifying it. Does NOT increment state_version. analysis_type='mass_properties': returns volume, surface_area, center of gravity (cx/cy/cz). analysis_type='geometry': returns bodies, faces, edges, vertices counts. analysis_type='edges': returns one JSON object listing every solid edge with start/end/midpoint 3D coords (meters, rounded to 6 decimals; closed/circular edges also include length) — pick an edge index (the `i` field) for add_edge_feature edge_indices, or a midpoint for coordinate selection. Slowest mode on very large parts (COM-bound). analysis_type='faces': returns one JSON object listing every solid face with a stable index `i` (planar faces also carry normal, area, and a representative on-plane point) — pick a face index for create_sketch(on_face, face_index). analysis_type='features': the COMPACT part recipe (default 'understand the part' read) — ordered feature tree (name/type, suppressed only when true), deduped driving dimensions (SI, rounded to 6 decimals), a per-sketch SUMMARY (segment counts + an inline {cx,cy,r} for single-full-circle profiles; NO per-segment coordinate dump), each sketch's plane {ref:'Front/Top/Right Plane', offset}, each extrude/cut's {end, depth (blind only), reversed}, pattern semantics, and equations + globals; features are in tree (history) order. analysis_type='sketch' (requires 'name'): ONE sketch's full geometry (every segment, rounded to 6 decimals) + plane — use only when exact sketch coordinates are needed.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "analysis_type": "string (required: 'mass_properties', 'geometry', 'edges', 'faces', 'features', or 'sketch')",
+                "name": "string (required only for analysis_type='sketch' — the sketch feature name, e.g. 'Sketch2')"
+            }
+        },
+        "output": "→ see execution-response.json — results encoded in CadState.Features list. mass_properties/geometry: flat 'key=value' strings. edges: a single JSON string {edge_count, edges:[{i,start,end,mid}]} (closed/circular edges also carry length). faces: a single JSON string {face_count, faces:[{i, planar, area, normal?, point?}]} (normal/point only for planar faces). features: a single consolidated JSON string {feature_count, features[], equations[]} — sketches carry a summary (counts [+circle]); NO raw segments. sketch: a single JSON string {name, sketch:{counts, segments[]}, plane} for the one named sketch."
+    },
+    "get_selection": {
+        "description": "Reports what the USER currently has selected in the SolidWorks GUI — the inverse of index-based selection. When the user clicks a face/edge/vertex/plane in the window (e.g. while describing what to do), this returns each selected entity mapped to the SAME stable index analyze_model(faces/edges) uses, so the AI knows exactly which geometry the user means. A selected FACE → {type:'face', i, planar, normal?, area, point?} → feed i to create_sketch(on_face=true, face_index=i). A selected EDGE → {type:'edge', i, start, end, mid} → feed i to add_edge_feature(edge_indices='[i]'). Also reports vertices (point) and reference planes (name). Read-only: does NOT change state_version and does NOT clear the selection — but call it BEFORE any tool that clears the selection (create_sketch/add_edge_feature/extrude cut, etc.).",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {}
+        },
+        "output": "→ see execution-response.json — results encoded in CadState.Features as a single JSON string {selected_count, selection:[{type, i?, ...geometry}]}. type ∈ face|edge|vertex|plane|other. face carries i/planar/area/normal?/point?; edge carries i/start/end/mid(+length if closed); vertex carries point; plane carries name. i = -1 if the selected face/edge could not be matched to a solid-body index."
+    },
+    "edit_sketch": {
+        "description": "Reopens an existing sketch feature for editing. Counterpart to create_sketch. Returns COMPLETED with ActiveSketch set to the sketch name. Exit by calling extrude_feature or any feature tool (which exits sketch mode automatically).",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "sketch_name": "string (required — exact sketch feature name, e.g. 'Sketch1')"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "add_reference_geometry": {
+        "description": "Creates reference geometry in the active part. type='plane': offset plane from ref_plane_name by offset (meters). type='axis': axis at intersection of two planes/edges (entity1_name/type and entity2_name/type). type='point': reference point at a vertex (px, py, pz).",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "type": "string (required: 'plane', 'axis', or 'point')",
+                "ref_plane_name": "string (plane only — base plane name, e.g. 'Front Plane')",
+                "offset": "number (plane only — offset distance in meters)",
+                "entity1_name": "string (axis only — first plane or edge name)",
+                "entity1_type": "string (axis only — 'PLANE' or 'EDGE', default 'PLANE')",
+                "entity2_name": "string (axis only — second plane or edge name)",
+                "entity2_type": "string (axis only — 'PLANE' or 'EDGE', default 'PLANE')",
+                "px": "number (point only — X coordinate of vertex)",
+                "py": "number (point only — Y coordinate of vertex)",
+                "pz": "number (point only — Z coordinate of vertex)"
+            }
+        },
+        "output": "→ see execution-response.json — created feature name in CadState.Features[0] (e.g. 'Plane1', 'Axis1')"
+    },
+    "create_pattern": {
+        "description": "Creates a linear or circular feature pattern. pattern_type='linear': repeats feature along X/Y/Z direction. pattern_type='circular': repeats feature around a named axis. Seed feature must be a solid feature (e.g. 'Boss-Extrude1'). Circular pattern requires a reference axis created with add_reference_geometry.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "pattern_type": "string (required: 'linear' or 'circular')",
+                "feature_name": "string (required — seed feature name, e.g. 'Boss-Extrude1')",
+                "spacing": "number (linear only — spacing between instances in meters, default 0.01)",
+                "count": "integer (number of instances including seed, default 2)",
+                "direction": "string (linear only — 'X', 'Y', or 'Z', default 'X')",
+                "count2": "integer (linear only — instances in second direction, default 1 = no D2 pattern)",
+                "spacing2": "number (linear only — spacing in second direction, default 0.01)",
+                "axis_name": "string (circular only — reference axis name, e.g. 'Axis1')",
+                "angle": "number (circular only — degrees; with equal_spacing=true this is the TOTAL spread (use 360 for a full ring), with equal_spacing=false it is the angle BETWEEN adjacent instances)",
+                "equal_spacing": "boolean (circular only, default true — true: angle=total spread, evenly divided; false: angle=per-instance spacing, may wrap/overlap)"
+            }
+        },
+        "output": "→ see execution-response.json — created pattern feature name in CadState.Features[0]"
+    },
+    "set_part_material": {
+        "description": "Assigns a material to the active part document (all configurations). Applied material appears in Mass Properties and the feature tree. Requires a part document — not a drawing.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "material_name": "string (required — EXACT library name, e.g. '1060 Alloy' (NOT 'Aluminum 1060 Alloy'), 'AISI 1020', 'ABS', 'Nylon 6/10')",
+                "library": "string (optional, default 'SolidWorks Materials' — material database name)"
+            }
+        },
+        "output": "→ see execution-response.json — applied material and library in CadState.Features"
+    },
+    "sheet_metal_feature": {
+        "description": "Creates sheet metal features on the active part. feature_type='base_flange': converts active sketch profile to sheet metal base (exits sketch automatically). feature_type='edge_flange': adds a flange to the edge at (ex,ey,ez). feature_type='flat_pattern': unfolds all bends (requires existing base_flange).",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "feature_type": "string (required: 'base_flange', 'edge_flange', or 'flat_pattern')",
+                "thickness": "number (base_flange — sheet thickness in meters, default 0.001)",
+                "bend_radius": "number (base_flange — bend radius in meters, default = thickness)",
+                "k_factor": "number (base_flange — K-factor for bend allowance, default 0.5)",
+                "ex": "number (edge_flange — X coordinate of point on target edge)",
+                "ey": "number (edge_flange — Y coordinate of point on target edge)",
+                "ez": "number (edge_flange — Z coordinate of point on target edge)",
+                "flange_length": "number (edge_flange — flange length in meters, default 0.02)",
+                "angle": "number (edge_flange — bend angle in degrees, default 90.0)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "modify_dimension": {
+        "description": "Universal parametric edit: sets a named display dimension's value in SI units (meters for length, radians for angle), rebuilds, and bumps state_version. Pairs with analyze_model(features), which reports each feature's dimension full-names + SI values. The keystone for building variants.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "name": "string (required — dimension full-name exactly as analyze_model(features) reports it, e.g. 'D1@Boss-Extrude1@Part.Part')",
+                "value": "number (required — new value in SI: meters for length/distance, radians for angle)"
+            }
+        },
+        "output": "→ see execution-response.json (additionally returns result_geometry {dimension, requested, effective}: the value read back from SolidWorks after rebuild, for in-band verification)"
+    },
+    "edit_feature": {
+        "description": "Discriminated structural edit of a named feature: suppress | unsuppress | delete | rename. Each rebuilds and bumps state_version. NOTE: suppress/delete change topology, so earlier coordinate/edge/face selections may no longer resolve — re-query analyze_model afterwards.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "feature_name": "string (required — exact feature-tree name, e.g. 'Boss-Extrude1')",
+                "action": "string (required: 'suppress', 'unsuppress', 'delete', or 'rename')",
+                "new_name": "string (required only for action='rename' — the new feature name)"
+            }
+        },
+        "output": "→ see execution-response.json — CadState.Features[0] holds the (possibly renamed) feature name (delete works for any feature type incl. sketches); empty for delete"
+    },
+    "activate_document": {
+        "description": "Switches the active SolidWorks document to an already-open one by title. Lifecycle op — does NOT check or increment state_version and does NOT change geometry. Lets a caller read/compare another open document (e.g. activate the original, analyze it, activate the copy).",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "title": "string (required — the title of an already-OPEN document, e.g. 'gear' or 'gear.SLDPRT')"
+            }
+        },
+        "output": "→ see execution-response.json — CadState.ActiveDocument holds the now-active document title"
+    }
+}

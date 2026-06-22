@@ -1,0 +1,78 @@
+{
+  "_meta": {
+    "name": "feature-graph",
+    "version": "0.0.1-draft",
+    "status": "DRAFT — vocabulary to be derived/expanded from real production SLDPRT files (see project-context). Do NOT freeze before validating against real designs.",
+    "role": "CAD-NEUTRAL intermediate representation (IR). The host AI (Planner) emits this; the deterministic solidworks-compiler lowers it to tool calls. The model NEVER emits raw tool sequences.",
+    "doubles_as": "Capability registry — the set of supported feature node types + params IS the capability list. The Planner validates intent against this single artifact (no separate chatty discovery protocol)."
+  },
+
+  "graph": {
+    "schema_version": "string (required — IR schema version this graph targets)",
+    "units": "string (fixed: 'meters' — all lengths are SI meters, matching execution layer)",
+    "nodes": "array of feature nodes (ordered; order defines build sequence)"
+  },
+
+  "node_common": {
+    "id": "string (required — stable node id, e.g. 'n1'; used as a reference target by later nodes)",
+    "type": "string (required — feature type discriminator; must be one of the registered types below)",
+    "ref": "reference object (optional — where this feature attaches; see reference_model). Omitted = canonical default datum."
+  },
+
+  "reference_model": {
+    "_note": "OPEN DESIGN QUESTION — this is the make-or-break part of the IR (persistent/topological naming). v0 supports only the cases below; expand from real designs.",
+    "datum": "string — canonical datum plane: 'front' | 'top' | 'right'",
+    "node_face": {
+      "node": "string — id of an earlier node",
+      "selector": "string — semantic face selector resolved at compile time by the reference resolver: 'top' | 'bottom' | 'side' | ..."
+    },
+    "position": "string — semantic position on the referenced entity: 'center' | 'corner' | ... (resolved to concrete coords by the resolver)"
+  },
+
+  "feature_types_v0": {
+    "_note": "Profile and operation are SEPARATED on purpose (avoids combinatorial type explosion like 'extruded_circle' + 'extruded_rectangle' + 'revolved_circle'...).",
+
+    "sketch": {
+      "description": "A 2D profile on a plane/face. Entities are profile primitives, not tools.",
+      "ref": "datum or node_face (the sketch plane)",
+      "profile": "array of profile primitives: { kind:'rectangle', width, height } | { kind:'circle', diameter } | { kind:'polygon', sides, diameter } ..."
+    },
+    "extrude": {
+      "description": "Solid extrusion of a referenced sketch node.",
+      "sketch": "string — id of a sketch node",
+      "operation": "string — 'boss' (add material) | 'cut' (remove material)",
+      "depth": "number — meters"
+    },
+    "revolve": {
+      "description": "Solid of revolution of a referenced sketch node about an axis.",
+      "sketch": "string — id of a sketch node",
+      "axis": "reference — axis definition (datum or sketch centerline)",
+      "angle": "number — radians (default 6.2832 = 360°)"
+    },
+    "hole": {
+      "description": "Parametric hole. Encapsulates sketch+cut; the compiler expands it.",
+      "ref": "node_face + position (e.g. top face of n1, center)",
+      "diameter": "number — meters",
+      "depth": "number — meters, or 'through'"
+    }
+  },
+
+  "validation_split": {
+    "plan_time_planner": "Structural + schema only: type is registered, required params present, node references (sketch/node ids) structurally resolvable, units correct.",
+    "compile_exec_time": "Geometric validity: referenced face actually exists after prior features, hole fits within the face, selectors resolve to exactly one entity. Owned by compiler + reference resolver + execution — NOT the Planner."
+  },
+
+  "example": {
+    "_intent": "Create a 20mm hole at the center of the top face of a 100x100x20mm block.",
+    "schema_version": "0.0.1-draft",
+    "units": "meters",
+    "nodes": [
+      { "id": "n1", "type": "sketch", "ref": { "datum": "top" },
+        "profile": [ { "kind": "rectangle", "width": 0.1, "height": 0.1 } ] },
+      { "id": "n2", "type": "extrude", "sketch": "n1", "operation": "boss", "depth": 0.02 },
+      { "id": "n3", "type": "hole",
+        "ref": { "node_face": { "node": "n2", "selector": "top" }, "position": "center" },
+        "diameter": 0.02, "depth": "through" }
+    ]
+  }
+}

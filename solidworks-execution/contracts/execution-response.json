@@ -1,0 +1,26 @@
+{
+  "COMPLETED": {
+    "operation_id": "string",
+    "status": "COMPLETED",
+    "verified": "boolean",
+    "state_version": "integer",
+    "cad_state": "→ state-format.json structure",
+    "error": null
+  },
+  "FAILED": {
+    "operation_id": "string",
+    "status": "FAILED",
+    "state_version": "integer (current state, not advanced)",
+    "cad_state": "→ state-format.json structure",
+    "error": {
+      "code": "string (e.g. FEATURE_CREATION_FAILED)",
+      "message": "string (human readable)"
+    }
+  },
+  "DUPLICATE": {
+    "operation_id": "string",
+    "status": "DUPLICATE",
+    "last_known_state_version": "integer",
+    "error": null
+  }
+}
