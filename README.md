@@ -84,13 +84,14 @@ The `adapters/` layer is provider-specific and replaceable. Because the executio
 
 ## Tool List
 
-The execution layer currently exposes the low-level **tools** below (the set keeps growing). All lengths are in meters (SolidWorks internal units).
+The execution layer currently exposes roughly **three dozen** low-level **tools** (the set keeps growing); a contract test keeps the adapter and the execution contract in exact sync (see [CONTRIBUTING.md](CONTRIBUTING.md)). All lengths are in meters (SolidWorks internal units).
 
 ### Document and lifecycle
 - `ensure_ready` — launches SolidWorks via COM and attaches if it is closed (does not open a document).
 - `open_new_part` — opens a new part document.
+- `open_document` — opens an existing file from disk (native `.sldprt`/`.sldasm`/`.slddrw`; imports `.ipt`/`.CATPart`/STEP/IGES via 3D Interconnect when the translator is available, otherwise returns a clear `OPEN_FAILED`).
 - `activate_document` — switches between open documents.
-- `save_document` — saves the part to disk.
+- `save_document` — saves the part or drawing to disk.
 - `close_document` — closes the document.
 
 ### Sketch
@@ -119,13 +120,21 @@ The execution layer currently exposes the low-level **tools** below (the set kee
 - `get_selection` — reads the geometry the user selected in the SolidWorks GUI and maps it to the analyze index.
 - `verify_state` — returns the current state and feature tree.
 
-### Drawing (basic / early stage)
-- `create_drawing` — creates a drawing document.
-- `add_drawing_view` — adds a view (isometric, front).
-- `add_drawing_dimension` — adds a dimension to the drawing.
+### Drawing
+The drawing tools were added after the initial part-modeling set and are now a substantial — though still maturing — capability. They are enough to take a model to a dimensioned multi-view drawing, and to read a drawing back for reverse-engineering.
+
+- `create_drawing` — creates a drawing document (A3 sheet).
+- `add_drawing_view` — adds a model view: `front`, `top`, `right`, `isometric`, `back`, `bottom`, `left`.
+- `add_flat_pattern_view` — adds a sheet-metal **flat-pattern** view (the unfolded blank with bend lines and bend notes); the correct, standard way to detail sheet-metal parts.
+- `auto_dimension_drawing` — transfers the model's driving dimensions into the views (the "Insert Model Items" automation) — the robust alternative to placing dimensions by coordinate.
+- `auto_center_marks` — automatically inserts center marks and centerlines on every hole/slot.
+- `add_hole_callout` — adds a hole callout on a hole edge.
+- `add_drawing_dimension` — adds a single dimension by sheet coordinate.
+- `add_section_view` — section view (**experimental**; the API path works on a clean drawing state but is not yet reliable under automation — see Project Status).
+- `analyze_drawing` — reads the active drawing structurally: per-view name/type/scale/position and its dimensions; with `include_geometry`, it also returns each view's **projected 2D geometry as clean primitives** (lines and curves), which is the clean shape used to reverse-engineer a part from its drawing independently of dimension-line clutter.
 
 ### Export
-- `export_document` — STEP, STL, IGES.
+- `export_document` — STEP, IGES, STL, **PDF, DWG, DXF** (PDF/DWG/DXF require a drawing document).
 - `batch_export` — batch export.
 
 ---
@@ -187,7 +196,17 @@ Update the path to match your own system.
 
 ## Project Status
 
-SolidPilot is a **working prototype / early alpha**. All low-level tools have been verified end-to-end against live SolidWorks; all COM calls are serialized on a single dedicated STA thread. The Feature Graph IR and compiler are designed but not yet built.
+SolidPilot is a **working prototype / early alpha**. The low-level tools have been verified end-to-end against live SolidWorks; all COM calls are serialized on a single dedicated STA thread.
+
+**Parts:** the part-modeling surface is the most mature — sketches, extrude/revolve/sweep/loft, fillets/chamfers, patterns, sheet metal, reference geometry, plus editing (`modify_dimension`, `edit_feature`) and rich analysis. Initially only the tools needed for part creation existed.
+
+**Technical drawing:** added later and now a real (if still maturing) capability — multi-view drawings, model-item auto-dimensioning, center marks, hole callouts, sheet-metal flat-pattern views, and a structural drawing reader. The reverse direction (**drawing → model**) has been demonstrated: a part reconstructed from its drawing alone (read via `analyze_drawing(include_geometry)`) matched the original exactly in volume, surface area, and topology. Section views are experimental and not yet reliable under automation.
+
+**Feature Graph IR + compiler (the strategic target):** designed but **not yet built**. The IR schema is drafted (`cad-planner/contracts/feature-graph.schema.json`, DRAFT v0), and an early experimental path exists — a single `submit_feature_graph` tool plus a Python compiler prototype with offline tests — but the **reference resolver** (the critical, make-or-break module) and full lowering are not implemented. This effort is tracked in its own ledger (`logs-ir.md`).
+
+> **Enabling the experimental IR tool:** `submit_feature_graph` is an experimental **test tool** and is **disabled by default**. To try it, set `SOLIDPILOT_ENABLE_IR=true` in the adapter's `.env` (default `false`) and reconnect the MCP server. While disabled, the tool is still registered but refuses to run; the matured low-level tools are unaffected either way.
+
+**Testing:** a contract test (`adapters/claude/tests/test_schema_contract.py`) fails on any tool/parameter drift between the adapter (`server.py`) and the execution contract (`tool-schemas.json`); it is the only automated test. Behavioral verification is manual against live SolidWorks, by design.
 
 Notes:
 - The Python MCP adapter does not hot-reload while running; after editing `server.py`, the MCP server must be reconnected.
@@ -203,8 +222,8 @@ The project is under active development. The main next goals:
 
 Support is also being developed in the following areas and is coming soon:
 
-- **Technical drawing:** maturing the current basic drawing tools into a comprehensive, automation-ready level.
-- **Assembly:** part mating, mates, component management, and bill of materials (BOM).
+- **Technical drawing:** the core drawing tools exist; remaining work is reliable section views, GD&T / datums, title blocks, detail views, and a bill of materials (BOM).
+- **Assembly:** component insertion, mates, component management, and BOM — the next domain to tackle.
 - **Analysis:** engineering analysis support.
 
 ---

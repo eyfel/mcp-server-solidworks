@@ -10,6 +10,17 @@
         },
         "output": "→ see execution-response.json"
     },
+    "open_document": {
+        "description": "Opens an EXISTING file from disk (counterpart to open_new_part, which makes a blank doc). Native .sldprt/.sldasm/.slddrw open directly by type (from the extension). Foreign .ipt (Inventor) / .CATPart (CATIA) / .step/.stp / .iges/.igs / .x_t/.x_b import as a PART via SolidWorks 3D Interconnect (must be enabled + translator licensed) — a failure returns OPEN_FAILED with guidance (convert to STEP or defer). Makes the opened document active and bumps state_version (a new active document, same effect class as open_new_part). Uses ISldWorks.OpenDoc6 (Silent).",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "file_path": "string (required — full path to the file to open; .sldprt/.sldasm/.slddrw native, .ipt/.CATPart/STEP/IGES/Parasolid imported as a part via 3D Interconnect)"
+            }
+        },
+        "output": "→ see execution-response.json — CadState.ActiveDocument = opened doc title; DocumentType = PART/ASSEMBLY/DRAWING; Features[0] = file name"
+    },
     "create_sketch": {
         "description": "Creates a new sketch on a plane OR on an existing model face. Default: plane name. With on_face=true, select the face by face_index (PREFERRED — the i-th face from analyze_model(faces); robust on revolve end-caps where a coordinate pick is ambiguous) or by a point (face_x,face_y,face_z) on the planar face. Enables sketching on existing geometry (e.g. a recess/hub on a part face, a bore on a shaft end). Auto-exits any active sketch first.",
         "input": {
@@ -147,6 +158,23 @@
         },
         "output": "→ see execution-response.json"
     },
+    "add_flat_pattern_view": {
+        "description": "Adds a FLAT PATTERN drawing view of a sheet-metal part (the unfolded blank with bend lines/notes) — the correct, standard way to detail sheet metal (sheet metal is dimensioned on its flat pattern, not the folded views). Uses IDrawingDoc.CreateFlatPatternViewFromModelView3(ModelName, ConfigName, LocX, LocY, LocZ, HideBendLines, FlipView). The part must be sheet metal (have a Flat-Pattern feature) and saved to disk. config_name defaults to the part's active configuration (falls back to 'Default'). Then auto_dimension_drawing places the blank/hole dimensions on it. Bumps state_version; result_geometry echoes {view_name, config, hide_bend_lines}.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "pos_x": "number (optional, default 0.1 — X position on drawing sheet in meters)",
+                "pos_y": "number (optional, default 0.1 — Y position on drawing sheet in meters)",
+                "scale": "number (optional, default 1.0 — view scale)",
+                "model_path": "string (optional — full path to the sheet-metal part; auto-detects first open part if omitted)",
+                "config_name": "string (optional — configuration to flatten; defaults to the part's active configuration, else 'Default')",
+                "hide_bend_lines": "boolean (optional, default false — hide the bend lines in the flat pattern)",
+                "flip_view": "boolean (optional, default false — flip the flat pattern view)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
     "add_drawing_dimension": {
         "description": "Applies a smart dimension to a drawing view segment nearest to point (px, py). Same coordinate selection approach as add_dimension but operates in a drawing document. Requires active drawing document.",
         "input": {
@@ -161,6 +189,64 @@
             }
         },
         "output": "→ see execution-response.json"
+    },
+    "auto_dimension_drawing": {
+        "description": "Automatically transfers the MODEL's driving dimensions into the active drawing's views (SolidWorks 'Insert Model Items > Dimensions'). The robust alternative to add_drawing_dimension's fragile coordinate pick: dimensions come straight from the model's parametric dimensions, correctly placed. Uses IDrawingDoc.InsertModelAnnotations3 (Types = swInsertDimensionsMarkedForDrawing, optionally + NotMarkedForDrawing). Bumps state_version; result_geometry echoes inserted_count. Requires an active drawing document with at least one model view.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "all_views": "boolean (optional, default true — insert into all views; false = only the currently selected view)",
+                "include_unmarked": "boolean (optional, default false — also insert driving dims NOT marked for drawing, i.e. ALL driving dims; more complete but noisier. Use if marked-only inserts 0 dims)",
+                "eliminate_duplicates": "boolean (optional, default true — avoid inserting the same model dimension into more than one view)"
+            }
+        },
+        "output": "→ see execution-response.json — result_geometry holds {inserted_count, all_views, include_unmarked}. inserted_count = number of dimensions placed (0 is valid; re-try with include_unmarked=true)."
+    },
+    "auto_center_marks": {
+        "description": "Automatically places center marks (with extended centerlines) on every hole/slot in every model view of the active drawing (SolidWorks 'Auto Insert > Center Marks', IView.AutoInsertCenterMarks2). Robust and automatic — no coordinate picking (the drawing-side analogue of index-based selection). The difficulty-2 capability a bracket/flange with holes needs on top of auto_dimension_drawing. Bumps state_version; result_geometry echoes the total center-mark count. Requires an active drawing with model views.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "include_slots": "boolean (optional, default true — also add slot center marks/centerlines for linear & arc slots, not just round holes)",
+                "extended_lines": "boolean (optional, default true — draw the extended centerlines through each hole, not just a small cross)"
+            }
+        },
+        "output": "→ see execution-response.json — result_geometry holds {center_marks, views_processed, include_slots}. center_marks = total center marks across all model views (0 if the part has no holes/slots)."
+    },
+    "add_hole_callout": {
+        "description": "Inserts a hole callout (e.g. 'n× ØD THRU') on the hole edge nearest the sheet point (px, py) in the active drawing, via IDrawingDoc.AddHoleCallout2. Coordinate-based — same fragile point pick as add_drawing_dimension (KNOWN-LIMITATIONS #6); prefer auto_center_marks for centerlines and use this for explicit per-hole callouts. Bumps state_version. Requires an active drawing.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "px": "number (X coordinate of a point on the target hole's projected circular edge, in sheet meters)",
+                "py": "number (Y coordinate of a point on the target hole's projected circular edge, in sheet meters)"
+            }
+        },
+        "output": "→ see execution-response.json"
+    },
+    "add_section_view": {
+        "description": "Creates a SECTION VIEW to expose internal/blind features (e.g. a blind pocket's depth) as visible, dimensionable edges — the difficulty-3 capability. Two ways to define the cut: EDGE mode (edge_x,edge_y → cut ALONG an existing projected edge, best when a real edge lies on the desired plane) or LINE mode (x1,y1,x2,y2 → draw a cut line, best for cutting THROUGH a feature's interior such as a pocket middle where no edge exists). IDrawingDoc.CreateSectionViewAt5 (with a CreateSectionViewAt2 fallback) places the section at (px,py). Bumps state_version. NOTE: coordinate-based (#6); after it lands, re-run auto_dimension_drawing or add_drawing_dimension to dimension the now-visible depth. Repeated failed attempts can wedge section creation — restart on a clean drawing state.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "edge_x": "number (EDGE mode: X of a point on an existing straight projected edge to cut along, sheet meters)",
+                "edge_y": "number (EDGE mode: Y of that point, sheet meters)",
+                "x1": "number (LINE mode: cut line start X, sheet meters)",
+                "y1": "number (LINE mode: cut line start Y, sheet meters)",
+                "x2": "number (LINE mode: cut line end X, sheet meters)",
+                "y2": "number (LINE mode: cut line end Y, sheet meters)",
+                "px": "number (section-view placement X, sheet meters — which side the section projects to)",
+                "py": "number (section-view placement Y, sheet meters)",
+                "label": "string (optional, default 'A' — section label, e.g. 'A' → 'SECTION A-A')",
+                "flip": "boolean (optional, default false — reverse the cut/viewing direction)",
+                "scale": "number (optional — section view scale; inherits the parent's if omitted)"
+            }
+        },
+        "output": "→ see execution-response.json — result_geometry holds {section_view, label}."
     },
     "verify_state": {
         "description": "Reads and returns the current CAD state without modifying the document, used to confirm expected state before or after operations.",
@@ -235,6 +321,17 @@
             }
         },
         "output": "→ see execution-response.json — results encoded in CadState.Features list. mass_properties/geometry: flat 'key=value' strings. edges: a single JSON string {edge_count, edges:[{i,start,end,mid}]} (closed/circular edges also carry length). faces: a single JSON string {face_count, faces:[{i, planar, area, normal?, point?}]} (normal/point only for planar faces). features: a single consolidated JSON string {feature_count, features[], equations[]} — sketches carry a summary (counts [+circle]); NO raw segments. sketch: a single JSON string {name, sketch:{counts, segments[]}, plane} for the one named sketch."
+    },
+    "analyze_drawing": {
+        "description": "Analyzes the active DRAWING document without modifying it (read-only, does NOT increment state_version) — the drawing-side sibling of analyze_model. Walks the views (IDrawingDoc.GetFirstView/GetNextView; the first view is the SHEET) and reports each view's name, type (swDrawingViewTypes_e int), scale, sheet position, and its display dimensions (full-name + SI value). Feeds the objective Stage-1 check (do a produced drawing's dims match the model?) and the Stage-2 re-modeling input.",
+        "input": {
+            "operation_id": "string (required, unique idempotency key)",
+            "state_version": "integer (required, must match current execution state)",
+            "params": {
+                "include_geometry": "boolean (optional, default false — also return each view's projected 2D geometry as clean primitives geometry:{lines, curves, frame} via IView.GetPolylines7, for reverse-engineering a part from its drawing independent of dimension clutter; coords in model-scale meters centered on the view, z=0; line segments carry the up/down / which-face profile structure a dim value can't)"
+            }
+        },
+        "output": "→ see execution-response.json — CadState.Features holds a single JSON string {view_count, dimension_count, views:[{name, type, scale, pos:[x,y], dimensions:[{name, value_si}], geometry?:{lines:[{x1,y1,x2,y2}], curves:[{n,x1,y1,xm,ym,x2,y2}], frame}}]}. view[0] is the drawing sheet. value_si in meters/radians, rounded to 6 decimals. geometry present only when include_geometry=true."
     },
     "get_selection": {
         "description": "Reports what the USER currently has selected in the SolidWorks GUI — the inverse of index-based selection. When the user clicks a face/edge/vertex/plane in the window (e.g. while describing what to do), this returns each selected entity mapped to the SAME stable index analyze_model(faces/edges) uses, so the AI knows exactly which geometry the user means. A selected FACE → {type:'face', i, planar, normal?, area, point?} → feed i to create_sketch(on_face=true, face_index=i). A selected EDGE → {type:'edge', i, start, end, mid} → feed i to add_edge_feature(edge_indices='[i]'). Also reports vertices (point) and reference planes (name). Read-only: does NOT change state_version and does NOT clear the selection — but call it BEFORE any tool that clears the selection (create_sketch/add_edge_feature/extrude cut, etc.).",
@@ -362,5 +459,18 @@
             }
         },
         "output": "→ see execution-response.json — CadState.ActiveDocument holds the now-active document title"
+    },
+    "submit_feature_graph": {
+        "description": "[EXPERIMENTAL / OPT-IN — P1.4/P1.7] Feature Graph IR + deterministic compiler path. NOT a COM/execution tool: it has NO ToolController/SolidWorksService case. The adapter's pycompiler (solidworks-compiler/pycompiler) lowers a CAD-neutral Feature Graph IR into ordered calls to the EXISTING low-level tools (create_sketch / add_sketch_entity / extrude_feature / analyze_model) and resolves semantic refs (top_face/center) against live geometry. Gated: refuses unless the operator kill switch SOLIDPILOT_ENABLE_IR is on AND i_understand_this_is_experimental=true. Coexists with the low-level tools WITHOUT changing them. v0-exp vocabulary: box, sketch+extrude (boss/cut), hole-on-face (selector 'top', position 'center', depth 'through_all'). The adapter resyncs its local state_version from GET /state after a run (one submit performs many state-bumping sub-ops).",
+        "input": {
+            "operation_id": "n/a at this level — each lowered sub-op carries its own operation_id (uuid4) and state_version on /api/tool/execute",
+            "state_version": "n/a at this level — the adapter resyncs its local state_version from GET /state after the run",
+            "params": {
+                "graph": "string (required — JSON Feature Graph IR per cad-planner/contracts/feature-graph.schema.json v0-exp; all lengths in meters)",
+                "i_understand_this_is_experimental": "boolean (required gate — must be true; set ONLY on an explicit user opt-in)",
+                "user_request": "string (optional — the user's opt-in phrase, recorded for the logs)"
+            }
+        },
+        "output": "Per-node report string: COMPLETED (nodes built) or FAILED (feature-level error + how far it got). Partial geometry may remain on failure (CAD ops are not transactional). Not itself in the state_version/idempotency envelope; its sub-ops are."
     }
 }

@@ -146,6 +146,7 @@ namespace SolidworksExecution.Controllers
             switch (request.Tool)
             {
                 case "open_new_part":          return _service.OpenNewPart(request);
+                case "open_document":          return _service.OpenDocument(request);
                 case "create_sketch":          return _service.CreateSketch(request);
                 case "add_sketch_entity":      return _service.AddSketchEntity(request);
                 case "add_dimension":          return _service.AddDimension(request);
@@ -153,7 +154,12 @@ namespace SolidworksExecution.Controllers
                 case "add_edge_feature":       return _service.AddEdgeFeature(request);
                 case "create_drawing":         return _service.CreateDrawing(request);
                 case "add_drawing_view":       return _service.AddDrawingView(request);
+                case "add_flat_pattern_view":  return _service.AddFlatPatternView(request);
                 case "add_drawing_dimension":  return _service.AddDrawingDimension(request);
+                case "auto_dimension_drawing": return _service.AutoDimensionDrawing(request);
+                case "auto_center_marks":      return _service.AutoCenterMarks(request);
+                case "add_hole_callout":       return _service.AddHoleCallout(request);
+                case "add_section_view":       return _service.AddSectionView(request);
                 case "save_document":          return _service.SaveDocument(request);
                 case "export_document":        return _service.ExportDocument(request);
                 case "batch_export":           return _service.BatchExport(request);
@@ -161,6 +167,7 @@ namespace SolidworksExecution.Controllers
                 case "verify_state":           return _service.VerifyState(request);
                 case "close_document":         return _service.CloseDocument(request);
                 case "analyze_model":          return _service.AnalyzeModel(request);
+                case "analyze_drawing":        return _service.AnalyzeDrawing(request);
                 case "get_selection":          return _service.GetSelection(request);
                 case "edit_sketch":            return _service.EditSketch(request);
                 case "add_reference_geometry": return _service.AddReferenceGeometry(request);

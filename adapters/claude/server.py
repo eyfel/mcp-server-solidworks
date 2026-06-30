@@ -1,10 +1,12 @@
 import json
 import uuid
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Optional
 from pydantic import Field
 from fastmcp import FastMCP
 from execution_client import call_tool, get_state, ensure_ready as _ensure_ready, ExecutionLayerError
 from response_mapper import map_response
+from config import ENABLE_EXPERIMENTAL_IR
+from ir_execution_port import run_feature_graph
 
 # P0.4 MCP hardening: discriminators are `Literal[...]` (invalid values rejected at the
 # MCP schema level, before any REST/COM round-trip) and numeric params carry Pydantic
@@ -99,6 +101,22 @@ def open_new_part(template_path: str = "") -> str:
     if template_path:
         params["template_path"] = template_path
     return _call("open_new_part", params)
+
+
+# ---------------------------------------------------------------------------
+# Tool: open_document
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def open_document(file_path: str) -> str:
+    """Open an EXISTING document from disk (counterpart to open_new_part, which makes a BLANK doc).
+    file_path: full path to the file.
+      - Native .sldprt / .sldasm / .slddrw open directly.
+      - Foreign .ipt (Inventor) / .CATPart (CATIA) / .step / .iges / .x_t import as a PART via SolidWorks
+        3D Interconnect (must be enabled in Tools > Options > Import, and the translator licensed). If
+        unsupported, returns a clear OPEN_FAILED so you can convert to STEP or defer that file.
+    Makes the opened document active and bumps state_version. Use this to load a sample part before
+    producing its drawing (create_drawing + add_drawing_view)."""
+    return _call("open_document", {"file_path": file_path})
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +383,44 @@ def add_drawing_view(
 
 
 # ---------------------------------------------------------------------------
+# Tool: add_flat_pattern_view
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def add_flat_pattern_view(
+    pos_x: float = 0.1,
+    pos_y: float = 0.1,
+    scale: Annotated[float, Field(
+        gt=0, description="View scale (1.0 = 1:1)")] = 1.0,
+    model_path: str = "",
+    config_name: str = "",
+    hide_bend_lines: bool = False,
+    flip_view: bool = False,
+) -> str:
+    """Add a FLAT PATTERN view of a SHEET-METAL part to the active drawing — the unfolded blank
+    with bend lines/notes. This is the correct, standard way to detail sheet metal: sheet metal is
+    dimensioned on its flat pattern (overall blank size, hole positions, bend lines), NOT on the
+    folded orthographic views. Use this instead of (or alongside an isometric of) the folded views
+    for a sheet-metal part; then call auto_dimension_drawing to place the blank/hole dimensions.
+
+    pos_x/pos_y: position on the drawing sheet in meters.
+    scale: view scale (default 1.0 = 1:1).
+    model_path: path to the sheet-metal part; if omitted, uses the first open part document.
+    config_name: configuration to flatten; if omitted, the part's active configuration is used
+        (falling back to 'Default').
+    hide_bend_lines: hide the bend lines in the flat pattern (default False).
+    flip_view: flip the flat pattern view (default False).
+
+    The part must be sheet metal (have a Flat-Pattern feature) and saved to disk, else returns
+    FLAT_PATTERN_VIEW_FAILED. Bumps state_version; result_geometry echoes {view_name, config}."""
+    return _call(
+        "add_flat_pattern_view",
+        {"pos_x": pos_x, "pos_y": pos_y, "scale": scale, "model_path": model_path,
+            "config_name": config_name, "hide_bend_lines": hide_bend_lines,
+            "flip_view": flip_view},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool: add_drawing_dimension
 # ---------------------------------------------------------------------------
 @mcp.tool()
@@ -384,6 +440,123 @@ def add_drawing_dimension(
         {"px": px, "py": py, "value": value, "label_offset_x": label_offset_x,
             "label_offset_y": label_offset_y},
     )
+
+
+# ---------------------------------------------------------------------------
+# Tool: auto_dimension_drawing
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def auto_dimension_drawing(
+    all_views: bool = True,
+    include_unmarked: bool = False,
+    eliminate_duplicates: bool = True,
+) -> str:
+    """Automatically transfer the MODEL's driving dimensions into the active drawing's views
+    (SolidWorks 'Insert Model Items > Dimensions'). This is the PREFERRED way to dimension a
+    drawing — far more reliable than add_drawing_dimension's coordinate pick, because the
+    dimensions come straight from the model's real parametric dimensions and are placed for you.
+    Call it AFTER create_drawing + add_drawing_view(s); then verify with analyze_drawing
+    (dimension_count should be > 0 and the values should match the model's driving dims).
+
+    all_views: insert into all drawing views (True) or only the currently selected view (False). Default True.
+    include_unmarked: also insert driving dimensions NOT marked for drawing (i.e. ALL driving dims), not just
+        those flagged 'marked for drawing'. More complete but noisier. Default False — if a marked-only pass
+        inserts 0 dimensions (the part's dims weren't marked for drawing), re-call with include_unmarked=True.
+    eliminate_duplicates: avoid inserting the same model dimension into more than one view. Default True.
+
+    Returns COMPLETED with result_geometry.inserted_count (the number of dimensions placed; 0 is a valid
+    outcome). Requires an active drawing with at least one model view. Bumps state_version."""
+    return _call(
+        "auto_dimension_drawing",
+        {"all_views": all_views, "include_unmarked": include_unmarked,
+            "eliminate_duplicates": eliminate_duplicates},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: auto_center_marks
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def auto_center_marks(
+    include_slots: bool = True,
+    extended_lines: bool = True,
+) -> str:
+    """Automatically place center marks (with extended centerlines) on every hole/slot in every
+    model view of the active drawing (SolidWorks 'Auto Insert > Center Marks'). This is the robust,
+    automatic way to add centerlines to a holed part's drawing — no coordinate picking. Call it
+    after the views exist (create_drawing + add_drawing_view), typically alongside
+    auto_dimension_drawing, for a difficulty-2-grade drawing of a bracket/flange with holes.
+
+    include_slots: also add slot center marks/centerlines for linear & arc slots (not just round holes). Default True.
+    extended_lines: draw the extended centerlines through each hole rather than a small cross. Default True.
+
+    Returns COMPLETED with result_geometry.center_marks (total marks placed across all views; 0 if the
+    part has no holes/slots). Bumps state_version. Requires an active drawing with model views."""
+    return _call(
+        "auto_center_marks",
+        {"include_slots": include_slots, "extended_lines": extended_lines},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: add_hole_callout
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def add_hole_callout(px: float, py: float) -> str:
+    """Insert a hole callout (e.g. '4× Ø8 THRU') on the hole edge nearest the sheet point (px, py)
+    in the active drawing. Coordinate-based selection — same fragile point pick as add_drawing_dimension
+    (KNOWN-LIMITATIONS #6), so place px/py right on the hole's projected circular edge. For centerlines
+    prefer auto_center_marks (robust/automatic); use this for explicit per-hole callouts where wanted.
+    px/py: a point on the target hole's projected circle, in drawing sheet coordinates (meters).
+    Requires an active drawing document. Bumps state_version."""
+    return _call("add_hole_callout", {"px": px, "py": py})
+
+
+# ---------------------------------------------------------------------------
+# Tool: add_section_view
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def add_section_view(
+    px: float,
+    py: float,
+    edge_x: Optional[float] = None,
+    edge_y: Optional[float] = None,
+    x1: Optional[float] = None,
+    y1: Optional[float] = None,
+    x2: Optional[float] = None,
+    y2: Optional[float] = None,
+    label: str = "A",
+    flip: bool = False,
+    scale: float = 0.0,
+) -> str:
+    """Create a SECTION VIEW that cuts the model so internal/blind features become visible, dimensionable
+    edges. Use this when a feature's size can't be shown in a projected view — most importantly a BLIND
+    POCKET's DEPTH (its floor is a hidden edge in an orthographic view, so auto_dimension_drawing can't
+    place the depth).
+
+    Two ways to define the cut (provide ONE pair-set):
+    - EDGE mode (edge_x, edge_y): cut ALONG an existing straight edge/line already projected in a view —
+      point at it. Best when a real edge lies on the plane you want (the cut runs collinear with it).
+    - LINE mode (x1,y1 → x2,y2): draw a cut line. Best for cutting THROUGH a feature's interior (e.g. the
+      MIDDLE of a pocket, where no edge exists). The line must fully cross the view through the feature.
+    All coordinates are drawing sheet coordinates in meters (KNOWN-LIMITATIONS #6 — coordinate-based).
+
+    px,py: where to place the section view (meters) — also picks which side the section projects toward.
+    label: section label (default 'A' → 'SECTION A-A'). flip: reverse the cut/viewing direction.
+    scale: optional section view scale; inherits the parent view's scale if 0/omitted.
+
+    After the section lands, call auto_dimension_drawing or add_drawing_dimension to dimension the
+    now-visible depth. Bumps state_version. Requires an active drawing with a parent model view. If it
+    returns SECTION_VIEW_FAILED, the drawing state may be wedged by prior failed attempts — a fresh
+    server/drawing state clears it."""
+    params: dict = {"px": px, "py": py, "label": label, "flip": flip}
+    for k, v in (("edge_x", edge_x), ("edge_y", edge_y),
+                 ("x1", x1), ("y1", y1), ("x2", x2), ("y2", y2)):
+        if v is not None:
+            params[k] = v
+    if scale and scale > 0:
+        params["scale"] = scale
+    return _call("add_section_view", params)
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +657,32 @@ def analyze_model(
         e.g. 'Sketch2'.
     Does NOT increment state_version."""
     return _call("analyze_model", {"analysis_type": analysis_type, "name": name})
+
+
+# ---------------------------------------------------------------------------
+# Tool: analyze_drawing
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def analyze_drawing(include_geometry: bool = False) -> str:
+    """Analyze the ACTIVE drawing document (read-only, does NOT change state) — the drawing-side sibling
+    of analyze_model. Returns a JSON object {view_count, dimension_count, views:[{name, type, scale, pos,
+    dimensions:[{name, value_si}]}]}: each view's name, type (swDrawingViewTypes_e int), scale, sheet
+    position [x,y] in meters, and its display dimensions (full-name + SI value, meters/radians, rounded to
+    6 decimals). The FIRST view is the drawing SHEET (interpret accordingly). Use it to (a) check a drawing
+    you produced — do its dimensions match the model? — and (b) read a drawing back for re-modeling.
+
+    include_geometry (default False): also return each view's PROJECTED 2D GEOMETRY as clean primitives —
+        geometry:{lines:[{x1,y1,x2,y2}], curves:[{n,x1,y1,xm,ym,x2,y2}], frame}. This is the CLEAN SHAPE
+        for reverse-engineering a part from its drawing, independent of dimension-line clutter (you read
+        the shape as vectors, not from a cluttered raster). Coordinates are in MODEL-scale METERS centered
+        on each view's centroid (z=0). Crucially, the line segments carry the UP/DOWN / which-face profile
+        structure that a dimension VALUE alone cannot (e.g. on a revolved flange's side view you can read
+        directly that a recess is on the BOTTOM face and a raised face is on the TOP). 'curves' are
+        tessellated arcs/circles reduced to start/mid/end (best-effort). Source: IView.GetPolylines7.
+        Heavier payload — use it when you need the shape to rebuild, not for a quick dim check.
+
+    Requires an active drawing document (call create_drawing first)."""
+    return _call("analyze_drawing", {"include_geometry": include_geometry})
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +925,75 @@ def activate_document(title: str) -> str:
     it, then activate your copy — without OS window switching. Does NOT change geometry or state_version.
     The document must already be OPEN. Returns the now-active document title."""
     return _call("activate_document", {"title": title})
+
+
+# ---------------------------------------------------------------------------
+# Tool: submit_feature_graph  (EXPERIMENTAL — Feature Graph IR + deterministic compiler)
+# ---------------------------------------------------------------------------
+def _resync_state_version() -> int:
+    """Realign the adapter's local state_version with the authoritative GET /state.
+
+    A submit_feature_graph run performs MANY execution ops (each bumping state_version) OUTSIDE the
+    normal _call() path, so afterwards — success OR failure — we resync the local value, or the NEXT
+    normal tool call would fail INVALID_STATE_VERSION (KNOWN-LIMITATIONS #5)."""
+    global _state_version
+    try:
+        _state_version = get_state()
+    except Exception:
+        pass
+    return _state_version
+
+
+@mcp.tool()
+def submit_feature_graph(
+    graph: str,
+    i_understand_this_is_experimental: bool = False,
+    user_request: str = "",
+) -> str:
+    """[EXPERIMENTAL — OPT-IN ONLY. Do NOT use for normal CAD work.]
+
+    Build a part from a CAD-neutral Feature Graph IR via the deterministic compiler (ONE IR ->
+    MANY low-level tool calls). This is an UNPROVEN test path that may partially build or fail.
+
+    NEVER call this tool unless the user has EXPLICITLY asked to use the Feature Graph IR /
+    experimental compiler path (e.g. "use the IR compiler", "submit a feature graph"). For ALL
+    normal modeling use the low-level tools (create_sketch / extrude_feature / ...). When in doubt,
+    do NOT use this tool.
+
+    graph: a JSON-string Feature Graph (see cad-planner/contracts/feature-graph.schema.json,
+        v0-exp subset). Covered v0 vocabulary: 'box' (rectangular boss), 'sketch'+'extrude'
+        (boss/cut), and 'hole' on a face with semantic refs (selector 'top', position 'center',
+        depth 'through_all'). All lengths in METERS. The box is built centred on the datum origin.
+    i_understand_this_is_experimental: REQUIRED gate — must be true. Set it ONLY when the user
+        explicitly opted into the IR path.
+    user_request: optional — the user's opt-in phrase, recorded for the logs.
+
+    Returns a per-node report (COMPLETED, or FAILED with how far it got + a feature-level error).
+    CAD ops are not transactional: on failure partial geometry may remain (reported, not hidden);
+    the adapter's state_version is resynced either way so subsequent normal tools keep working."""
+    # Gate layer 1 — operator kill switch (model-independent; off by default).
+    if not ENABLE_EXPERIMENTAL_IR:
+        return ("REFUSED | submit_feature_graph is an EXPERIMENTAL opt-in tool and is DISABLED on "
+                "this server (set SOLIDPILOT_ENABLE_IR=true to enable it for test users). Use the "
+                "low-level tools for all normal CAD work.")
+    # Gate layer 2 — required explicit confirmation.
+    if not i_understand_this_is_experimental:
+        return ("REFUSED | submit_feature_graph not invoked: this is an EXPERIMENTAL path that must "
+                "be explicitly opted into. Only use it when the user explicitly asks for the IR / "
+                "feature-graph path, and set i_understand_this_is_experimental=true.")
+    # Parse the graph (structural validation happens inside the compiler).
+    try:
+        graph_obj = json.loads(graph)
+    except Exception as ex:
+        return f"FAILED | INVALID_JSON | the graph is not valid JSON: {ex}"
+    # Compile + run. NEVER let an exception crash the MCP server; resync state_version regardless.
+    try:
+        result = run_feature_graph(graph_obj)
+    except Exception as ex:
+        sv = _resync_state_version()
+        return f"FAILED | UNEXPECTED | {type(ex).__name__}: {ex} | state_version resynced to {sv}"
+    sv = _resync_state_version()  # first-class resync, success OR failure
+    return result.summary() + f" | state_version={sv}"
 
 
 # ---------------------------------------------------------------------------

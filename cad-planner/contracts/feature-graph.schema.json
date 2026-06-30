@@ -29,9 +29,27 @@
     "position": "string — semantic position on the referenced entity: 'center' | 'corner' | ... (resolved to concrete coords by the resolver)"
   },
 
+  "v0_exp_covered_subset": {
+    "_note": "The EXPERIMENTAL submit_feature_graph tool (P1.4/P1.7, logs-ir.md) compiles ONLY this minimal subset today. Outside it the compiler rejects the graph at structural-validation time (no silent gaps). Grow from real MAT parts, not ahead of them.",
+    "node_types": ["box", "sketch", "extrude", "hole"],
+    "profile_kinds": ["rectangle", "circle"],
+    "datums": ["front", "top", "right"],
+    "face_selectors": ["top"],
+    "positions": ["center"],
+    "hole_depth": ["through_all"],
+    "assumptions": "box is built CENTRED ON THE DATUM ORIGIN (so 'center' on its top face maps to sketch (0,0)); 'top' is bound to global +Y (SolidWorks 'up'); single body. General 3D-point->sketch-2D resolution for arbitrary faces is P1.5."
+  },
+
   "feature_types_v0": {
     "_note": "Profile and operation are SEPARATED on purpose (avoids combinatorial type explosion like 'extruded_circle' + 'extruded_rectangle' + 'revolved_circle'...).",
 
+    "box": {
+      "description": "Rectangular boss convenience node — a single IR node that the compiler lowers to many tool calls (create_sketch on the datum + a centred rectangle + a boss extrude). The clearest demonstration of one feature -> many ops.",
+      "ref": "datum (the base plane the box is built on; default 'top')",
+      "width": "number — meters (along the datum's local X)",
+      "depth": "number — meters (along the datum's local Y)",
+      "height": "number — meters (extrusion distance)"
+    },
     "sketch": {
       "description": "A 2D profile on a plane/face. Entities are profile primitives, not tools.",
       "ref": "datum or node_face (the sketch plane)",
@@ -50,10 +68,10 @@
       "angle": "number — radians (default 6.2832 = 360°)"
     },
     "hole": {
-      "description": "Parametric hole. Encapsulates sketch+cut; the compiler expands it.",
+      "description": "Parametric hole. Encapsulates sketch+cut; the compiler expands it (resolve top face -> create_sketch(on_face, face_index) -> circle at centre -> through cut).",
       "ref": "node_face + position (e.g. top face of n1, center)",
       "diameter": "number — meters",
-      "depth": "number — meters, or 'through'"
+      "depth": "number — meters, or 'through_all' (v0-exp supports 'through_all' only; 'through' accepted as an alias)"
     }
   },
 
@@ -73,6 +91,19 @@
       { "id": "n3", "type": "hole",
         "ref": { "node_face": { "node": "n2", "selector": "top" }, "position": "center" },
         "diameter": 0.02, "depth": "through" }
+    ]
+  },
+
+  "example_v0_exp": {
+    "_intent": "A 50mm box with a 10mm hole centred on the top face, through-all (the canonical submit_feature_graph experiment fixture).",
+    "schema_version": "0.0.1-draft-ir-exp",
+    "units": "meters",
+    "nodes": [
+      { "id": "n1", "type": "box", "ref": { "datum": "top" },
+        "width": 0.05, "depth": 0.05, "height": 0.05 },
+      { "id": "n2", "type": "hole",
+        "ref": { "node_face": { "node": "n1", "selector": "top" }, "position": "center" },
+        "diameter": 0.01, "depth": "through_all" }
     ]
   }
 }

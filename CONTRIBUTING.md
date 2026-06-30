@@ -69,15 +69,17 @@ python server.py
 ### A new low-level tool (execution surface)
 
 1. **Contract** — add the tool to `solidworks-execution/contracts/tool-schemas.json`.
-2. **Execution** — add a `case "tool_name":` in `ToolController.cs` and implement it in `SolidWorksService.cs`.
+2. **Execution** — add a `case "tool_name":` in `ToolController.cs` and implement it in `SolidWorksService.cs`. **Verify any SolidWorks COM API signature by reflecting the interop assembly first — never invent a method name or argument list.** The real API frequently differs from what looks plausible (for example, the model-item insertion API lives on `IDrawingDoc`, not `IView`; `GetLines3` returns empty while `GetPolylines7` is the working geometry getter). Decode unknown return shapes empirically against a live document before writing the parser.
 3. **Adapter** — register the MCP tool in `adapters/claude/server.py`. Model-facing guidance lives here (the client never sees `tool-schemas.json`): use `Literal` enums for discriminators, Pydantic `Field` constraints for units and ranges, and real required parameters.
-4. **Verify** — run the contract test (see below).
+4. **Verify** — run the contract test (see below), then validate against live SolidWorks.
 
 ### A new feature (IR level — the strategic direction)
 
 1. Add the feature type to `cad-planner/contracts/feature-graph.schema.json` (this also registers the capability).
 2. Add its lowering rule and any required reference resolution in `solidworks-compiler`.
 3. It reuses existing low-level tools; usually no new execution tool is needed.
+
+> **Experimental IR tool flag:** the IR entry point `submit_feature_graph` is an experimental **test tool**, gated behind an opt-in kill switch and **disabled by default**. To exercise the IR path, set `SOLIDPILOT_ENABLE_IR=true` in `adapters/claude/.env` (default `false`) and reconnect the adapter; while disabled it stays registered but refuses to run. See `logs-ir.md` (IR-ADR-001).
 
 ---
 
@@ -103,7 +105,7 @@ python server.py
 
   or run it via `pytest`.
 
-- **Live testing (manual by design):** tools are verified against live SolidWorks, with the GUI open, case by case. A cohesive batch of tools is chosen together and tested as a batch. When a tool fails, inspect `execution.log` and report the expected result, the API response, and a hypothesis.
+- **Live testing (manual by design):** tools are verified against live SolidWorks, with the GUI open, case by case. A cohesive batch of tools is chosen together and tested as a batch. When a tool fails, inspect `execution.log` and report the expected result, the API response, and a hypothesis. For drawing tools, the exported **PDF is the ground truth** — some interop counters under-report (e.g. inserted annotations / center marks), so confirm a drawing change by exporting and reading the PDF rather than trusting an in-band count alone.
 
 There is no behavioral/regression test suite yet; the contract test is the only automated test.
 
