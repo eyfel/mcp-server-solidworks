@@ -111,10 +111,52 @@ There is no behavioral/regression test suite yet; the contract test is the only 
 
 ---
 
+## Contributor License Agreement (CLA)
+
+SolidPilot is free and open source under the [GNU AGPL-3.0](LICENSE), while the
+project owner also offers a separate **commercial license** for organizations
+that cannot comply with the AGPL. For this dual-licensing model to work, every
+contribution must come with a clear grant of rights. The full terms live in
+**[CLA.md](CLA.md)**; the summary below restates them. **By submitting a
+contribution (a pull request, patch, or any other work) you agree to the
+following:**
+
+1. **You have the right to contribute it.** The contribution is your original work,
+   or you have the necessary rights to submit it, and submitting it does not violate
+   any third party's rights or any agreement you are bound by.
+2. **License and commercial-use grant.** You grant the project owner a perpetual,
+   worldwide, non-exclusive, royalty-free, irrevocable license to use, reproduce,
+   modify, distribute, sublicense, and **relicense** your contribution — including
+   for **commercial purposes** and as part of a paid or cloud edition — and to
+   include it in the project under the current license or any future license the
+   owner chooses.
+3. **You keep your copyright.** This is a license grant, not an assignment; you
+   retain ownership of your contribution and may use it elsewhere.
+4. **License adjustment.** You agree that the owner may make the project's license
+   more or less permissive as needed, and that your contribution may be distributed
+   under such adjusted terms.
+5. **As-is.** You provide your contribution without warranty of any kind.
+
+**How to accept:** sign off your commits with `git commit -s` (adds a
+`Signed-off-by` line, per [CLA.md](CLA.md)), or include the following line in
+your pull request description:
+
+> I have read and agree to the Contributor License Agreement in CLA.md.
+
+> **Note on significant contributions.** For small fixes, the pull-request
+> acknowledgment above is sufficient. For a substantial contribution, the owner may
+> ask you to also confirm the CLA via a signed document (a wet signature or a secure
+> electronic signature) — this makes the grant robust under Turkish copyright law
+> (FSEK Art. 52, which requires transfers/licenses of economic rights to be in
+> writing and signed). This is not a legal opinion; it is a practical safeguard.
+
+---
+
 ## Commits and Pull Requests
 
 - Write meaningful, focused commits; do not mix several unrelated changes in one commit.
 - If you change the behavior of a tool or feature, keep the relevant contract and tests up to date.
 - In the Pull Request description, state what you changed, why, and how you verified it.
+- Include the CLA acknowledgment line (see [Contributor License Agreement](#contributor-license-agreement-cla) above).
 
 For questions and discussions, feel free to open an issue.

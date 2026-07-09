@@ -27,43 +27,44 @@ SolidPilot solves this by **raising the level of abstraction**:
 
 ```mermaid
 flowchart TD
-    U(["User"])
+    U(["User + AI client<br/>Claude · OpenClaw · OpenAI · local LLM"])
 
-    subgraph PLAN["cad-planner — Planner / Intent · CAD-neutral · Phase 1"]
-        AI["AI client<br/>Claude · OpenClaw · OpenAI · local LLM"]
-        IR["Feature Graph IR<br/>feature-graph.schema.json"]
-        AI --> IR
+    subgraph ADAPT["adapters/* — MCP bridge · MCP BOUNDARY = top"]
+        LOW["~37 low-level tools<br/>sketch · extrude · sheet-metal · drawing · analyze"]
+        RIR["rebuild_from_ir · save_analysis · compare_parts"]
+        SFG["submit_feature_graph<br/>forward single tool"]
     end
 
-    subgraph ADAPT["adapters/* — MCP Bridge · MCP BOUNDARY = top"]
-        AC["adapters/claude<br/>FastMCP · stdio"]
+    IR["Feature Graph IR<br/>feature-graph.schema.json<br/>(cad-planner · CAD-neutral)"]
+
+    subgraph COMP["solidworks-compiler — deterministic compiler · no LLM"]
+        CO["pycompiler<br/>lowering + reference resolver (geometric anchors v0)"]
     end
 
-    subgraph COMP["solidworks-compiler — Deterministic Compiler · no LLM"]
-        CO["Lowering + Reference Resolver"]
+    subgraph EXE["solidworks-execution — C# .NET 4.8 · the ONLY COM-touching layer"]
+        EX["Execution<br/>idempotency · state_version"]
     end
 
-    subgraph EXE["solidworks-execution — Execution · C# .NET 4.8 · the ONLY COM-touching layer"]
-        EX["Low-level tools<br/>idempotency · state_version"]
-    end
+    SW(["SolidWorks · COM"])
 
-    SW(["SolidWorks"])
+    %% Working today (thick)
+    U == "MCP: low-level tools (primary today)" ==> LOW
+    LOW == "REST" ==> EX
+    U == "MCP: rebuild_from_ir (reverse round-trip — WORKS)" ==> RIR
+    IR ==> CO
+    RIR == "REST" ==> CO
+    CO == "REST" ==> EX
+    EX == "COM" ==> SW
 
-    U --> AI
+    %% Reverse discovery step: read an existing part → propose an IR
+    EX -. "analyze_model / analyze_drawing" .-> IR
 
-    %% Target path (planned)
-    IR -. "MCP: submit_feature_graph" .-> AC
-    AC -. "REST" .-> CO
-    CO -. "REST" .-> EX
-
-    %% Current working path (transitional)
-    AI == "MCP: low-level tools" ==> AC
-    AC == "REST" ==> EX
-
-    EX -- "COM" --> SW
+    %% Planned forward collapse (dashed)
+    IR -. "forward: submit_feature_graph" .-> SFG
+    SFG -. "REST" .-> CO
 ```
 
-In the diagram, a dashed line is the target architecture (the planned IR + compiler path) and a thick line is the current working path (the AI calls the low-level tools directly; the compiler is not yet in the loop).
+Read the diagram by line style: a **thick line works today**, a **dashed line is planned**. Two MCP doors are live — the ~37 low-level tools (the primary path today), and **`rebuild_from_ir`**, which drives the **real** deterministic compiler to reproduce a part from its Feature Graph IR. The dotted reverse arrow is the discovery step: `analyze_model`/`analyze_drawing` read an existing part so an IR can be proposed for it. The only dashed (still-planned) piece is the *forward* collapse — a single `submit_feature_graph` tool that would replace the low-level surface for building from scratch; it runs through the same compiler.
 
 The system has four layers:
 
@@ -78,13 +79,13 @@ The system has four layers:
 
 The `adapters/` layer is provider-specific and replaceable. Because the execution and planner layers do not know which client is calling, adding a new AI client (OpenClaw, OpenAI, a local LLM, etc.) means only writing a new adapter — the IR, compiler, and execution layers stay unchanged.
 
-**Target vs. current:** the Feature Graph IR and compiler are designed but not yet built. Today the AI client uses the **low-level MCP tools** directly (the thick path); these tools will collapse into a single `submit_feature_graph` tool once the compiler lands.
+**Current vs. target:** the Feature Graph IR and the deterministic compiler now **exist and work** — the compiler (`solidworks-compiler/pycompiler`, lowering + a v0 reference resolver) has reproduced **real production parts** end-to-end from their IR to a `verified` match (see Project Status). It is reached today through the **`rebuild_from_ir`** tool (the reverse/reproduce direction). What is still ahead is the *forward* collapse: replacing the low-level surface with a single `submit_feature_graph` tool for building from scratch, and a **durable reference resolver** that survives edits (the make-or-break module). Until then the low-level MCP tools remain the primary path for building.
 
 ---
 
 ## Tool List
 
-The execution layer currently exposes roughly **three dozen** low-level **tools** (the set keeps growing); a contract test keeps the adapter and the execution contract in exact sync (see [CONTRIBUTING.md](CONTRIBUTING.md)). All lengths are in meters (SolidWorks internal units).
+The system currently exposes **37 tools** (the set keeps growing); a contract test keeps the adapter and the execution contract in exact sync (see [CONTRIBUTING.md](CONTRIBUTING.md)). Most are low-level CAD operations; a few (`save_analysis`, `rebuild_from_ir`, `compare_parts`) drive the analysis / IR round-trip described below. All lengths are in meters (SolidWorks internal units).
 
 ### Document and lifecycle
 - `ensure_ready` — launches SolidWorks via COM and attaches if it is closed (does not open a document).
@@ -103,10 +104,11 @@ The execution layer currently exposes roughly **three dozen** low-level **tools*
 
 ### Feature and solid modeling
 - `extrude_feature` — boss, cut, revolve, sweep, loft.
-- `add_edge_feature` — fillet or chamfer on a solid edge.
+- `add_edge_feature` — fillet or chamfer on a solid edge (chamfer: distance-angle at any angle, or distance-distance).
+- `create_rib` — rib feature from an open sketch profile.
 - `add_reference_geometry` — reference plane, axis, or point.
 - `create_pattern` — linear or circular pattern.
-- `sheet_metal_feature` — sheet metal: base_flange, edge_flange, flat_pattern.
+- `sheet_metal_feature` — sheet metal: base_flange, edge_flange (incl. custom-profile flanges), sketched_bend, flat_pattern.
 
 ### Editing
 - `modify_dimension` — changes the value of a named dimension (the basis for variants).
@@ -116,9 +118,16 @@ The execution layer currently exposes roughly **three dozen** low-level **tools*
 - `set_part_material` — assigns a material to the part.
 
 ### Analysis and query
-- `analyze_model` — `geometry`, `mass_properties`, `features`, `edges`, `faces`, `sketch` modes.
+- `analyze_model` — `geometry`, `mass_properties`, `features` (a compact feature-level recipe), `edges`, `faces`, `sketch` (one sketch's exact segments on demand), and `feature_map` (per-feature consumed/created topology — the source of the reference-resolver anchors) modes.
 - `get_selection` — reads the geometry the user selected in the SolidWorks GUI and maps it to the analyze index.
 - `verify_state` — returns the current state and feature tree.
+
+### Analysis pipeline & IR round-trip
+These tools implement the reverse-engineering loop — *"the LLM proposes, the round-trip decides"* — that reproduces an existing part from a CAD-neutral Feature Graph IR and objectively verifies the result.
+
+- `save_analysis` — writes an **analysis artifact** for the active part (feature recipe, driving parameters, and an optional Feature Graph IR block) to `<folder>/.solidpilot/`.
+- `rebuild_from_ir` — the mainline IR door: runs an artifact's IR block through the deterministic compiler to rebuild the part in a fresh document (same compiler that the future `submit_feature_graph` will use — two doors, one compiler).
+- `compare_parts` — objective two-part diff (topology, volume, area, center of mass) with the project's `verified` verdict (topology-exact **and** |ΔV| ≤ 1% **and** |ΔA| ≤ 1%).
 
 ### Drawing
 The drawing tools were added after the initial part-modeling set and are now a substantial — though still maturing — capability. They are enough to take a model to a dimensioned multi-view drawing, and to read a drawing back for reverse-engineering.
@@ -202,9 +211,11 @@ SolidPilot is a **working prototype / early alpha**. The low-level tools have be
 
 **Technical drawing:** added later and now a real (if still maturing) capability — multi-view drawings, model-item auto-dimensioning, center marks, hole callouts, sheet-metal flat-pattern views, and a structural drawing reader. The reverse direction (**drawing → model**) has been demonstrated: a part reconstructed from its drawing alone (read via `analyze_drawing(include_geometry)`) matched the original exactly in volume, surface area, and topology. Section views are experimental and not yet reliable under automation.
 
-**Feature Graph IR + compiler (the strategic target):** designed but **not yet built**. The IR schema is drafted (`cad-planner/contracts/feature-graph.schema.json`, DRAFT v0), and an early experimental path exists — a single `submit_feature_graph` tool plus a Python compiler prototype with offline tests — but the **reference resolver** (the critical, make-or-break module) and full lowering are not implemented. This effort is tracked in its own ledger (`logs-ir.md`).
+**Feature Graph IR + compiler (the strategic core):** now the project's spine and **working**. The IR schema (`cad-planner/contracts/feature-graph.schema.json`) and a deterministic Python compiler (`solidworks-compiler/pycompiler`, lowering + a **v0 reference resolver** built on geometric anchors) run every rebuild through one code path, with an offline test suite (no live SolidWorks needed). Via the reverse round-trip — `analyze_model` → an LLM-proposed IR → `rebuild_from_ir` → `compare_parts` — real production parts have been reproduced from their IR to a `verified` match, spanning revolves, circular patterns, both chamfer modes, lofts, and multi-bend sheet-metal forms. Each part is rebuilt in a fresh document and checked against the original by exact topology and mass properties before it counts as verified. Growing the IR vocabulary from real parts is how it advances; this effort has its own ledger (`logs-ir.md`).
 
-> **Enabling the experimental IR tool:** `submit_feature_graph` is an experimental **test tool** and is **disabled by default**. To try it, set `SOLIDPILOT_ENABLE_IR=true` in the adapter's `.env` (default `false`) and reconnect the MCP server. While disabled, the tool is still registered but refuses to run; the matured low-level tools are unaffected either way.
+The open problem — and the project's real research risk — is a **durable reference resolver**: the v0 geometric anchors reproduce a part exactly in a fresh document but do **not** survive upstream edits (a changed dimension moves the anchors). Making semantic references (`top_face`, a specific edge) robust across topology changes is the make-or-break module still ahead.
+
+> **Two IR doors, one compiler.** The mainline door is `rebuild_from_ir` (reproduce from an artifact). A second, *forward* door — `submit_feature_graph`, building from scratch — is scaffolded but intentionally **commented out** in `adapters/claude/server.py` (it collapses the low-level surface into one tool, which is future work); re-enabling it is a one-block uncomment. Both doors execute through the same `pycompiler`, so every replay lesson improves both at once.
 
 **Testing:** a contract test (`adapters/claude/tests/test_schema_contract.py`) fails on any tool/parameter drift between the adapter (`server.py`) and the execution contract (`tool-schemas.json`); it is the only automated test. Behavioral verification is manual against live SolidWorks, by design.
 
@@ -215,16 +226,17 @@ Notes:
 
 ## Roadmap
 
-The project is under active development. The main next goals:
+The project is under active development. The Feature Graph IR and deterministic compiler now work for parts (verified end-to-end on real production parts); the main next goals:
 
-- **Feature Graph IR and deterministic compiler** — collapsing the low-level tools under a single feature-level interface (`submit_feature_graph`).
-- **Reference resolver / persistent naming** — reliable resolution of semantic references (`top_face`, `center`, etc.) against live geometry; the project's critical module.
+- **Durable reference resolver / persistent naming** — the critical module: making semantic references (`top_face`, a specific edge) survive dimension and topology changes, not just fresh-document replay. The current v0 geometric anchors are exact but edit-fragile.
+- **Assembly (V2)** — the next domain: `analyze_assembly` (read-first), an assembly IR sub-vocabulary (components + mates), component insertion and mating, and round-trip verification for assemblies.
+- **Analysis pipeline breadth** — a folder scanner (batch-analyze a directory of parts/drawings into artifacts), an AI pass that generates IR per category with a coverage report, and pattern reuse across verified IRs (parametric rebuilds without an LLM).
+- **Forward IR surface** — collapsing the low-level tools under the single `submit_feature_graph` interface once the vocabulary and resolver are ready.
 
-Support is also being developed in the following areas and is coming soon:
+Coming soon in existing areas:
 
-- **Technical drawing:** the core drawing tools exist; remaining work is reliable section views, GD&T / datums, title blocks, detail views, and a bill of materials (BOM).
-- **Assembly:** component insertion, mates, component management, and BOM — the next domain to tackle.
-- **Analysis:** engineering analysis support.
+- **Technical drawing:** the core tools exist; remaining work is reliable section views, GD&T / datums, title blocks, detail views, and a bill of materials (BOM).
+- **Assembly drawings / BOM** and broader engineering-analysis support.
 
 ---
 
@@ -236,4 +248,26 @@ For contribution guidelines, development environment setup, and the guide to add
 
 ## License
 
-Released under the [MIT License](LICENSE).
+Copyright (c) 2025–2026 Çağatay Bakan.
+
+SolidPilot is free software, licensed under the
+[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0).
+
+You may use, study, modify, and distribute it freely. Because SolidPilot is
+server software, the AGPL's network clause (§13) applies: **if you run a
+modified version and let others interact with it over a network, you must offer
+those users the complete corresponding source of your modified version, under
+the same license.** See the [LICENSE](LICENSE) for the exact terms.
+
+### Commercial / proprietary licensing
+
+The AGPL's copyleft obligations do not suit every organization. If you want to
+embed SolidPilot in a **closed-source or proprietary product**, or otherwise
+cannot comply with the AGPL, a separate **commercial license** is available.
+Contributions are accepted under the project [CLA](CLA.md), which keeps this
+dual-licensing option open.
+
+**Interested in a commercial license, a pilot, or a test/evaluation program?**
+Get in touch and we can arrange the right terms:
+
+Email: **[cagataybkn@gmail.com](mailto:cagataybkn@gmail.com)**

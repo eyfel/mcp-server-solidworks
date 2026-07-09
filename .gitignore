@@ -3,6 +3,7 @@
 *.md
 !README.md
 !CONTRIBUTING.md
+!CLA.md
 
 .vs/
 
@@ -24,6 +25,10 @@ env/
 Thumbs.db
 .DS_Store
 
-test-input/
-test-output/
 drawing-samples/
+
+# Scratch / throwaway dev working files (feature-map dumps, one-off rebuild scripts)
+scratch/
+
+# Private legal documents (evaluation/commercial license drafts) — never publish
+legal/
