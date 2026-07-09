@@ -1,12 +1,14 @@
+import hashlib
 import json
+import os
 import uuid
+from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 from pydantic import Field
 from fastmcp import FastMCP
 from execution_client import call_tool, get_state, ensure_ready as _ensure_ready, ExecutionLayerError
 from response_mapper import map_response
-from config import ENABLE_EXPERIMENTAL_IR
-from ir_execution_port import run_feature_graph
+# from ir_execution_port import run_feature_graph  # only used by the disabled test tool below
 
 # P0.4 MCP hardening: discriminators are `Literal[...]` (invalid values rejected at the
 # MCP schema level, before any REST/COM round-trip) and numeric params carry Pydantic
@@ -167,6 +169,7 @@ def add_sketch_entity(
     distance: float = 0.0,
     direction: float = 1.0,
     points: str = "[]",
+    construction: bool = False,
 ) -> str:
     """Add a sketch entity to the active sketch.
     entity_type='rectangle':  uses x1,y1 (first corner) and x2,y2 (opposite corner).
@@ -189,8 +192,13 @@ def add_sketch_entity(
                sign that yields the intended (usually minor) arc. Ignored by other types.
     points: only for 'spline' — a JSON array string of flat (x,y) through-points, e.g.
             '[-0.2,0.0,-0.18,0.04,-0.14,0.05]'. Ignored by other types.
+    construction: True makes the created entity CONSTRUCTION/reference geometry (centerline,
+            symmetry axis, hole-position scaffolding) — it guides the profile but adds no edge.
+            Mirrors analyze_model's per-segment 'construction' flag, so an analyzed sketch's
+            construction entities can be reproduced faithfully.
     This tool MIRRORS analyze_model: every sketch segment analyze_model emits (line, arc/circle,
-    ellipse, spline, with cx/cy/x1/y1/x2/y2/radius/points) maps 1:1 onto an entity_type here, so an
+    ellipse, spline, with cx/cy/x1/y1/x2/y2/radius/points/construction, partial arcs also 'dir'
+    +1 CCW / -1 CW = arc_center's 'direction') maps 1:1 onto an entity_type here, so an
     analyzed sketch can be rebuilt without dropping/simplifying any curve.
     On COMPLETED the result includes result_geometry: the REAL geometry SolidWorks created (read back,
     not echoed) — use it to self-verify the radius/endpoints match your intent before moving on.
@@ -209,6 +217,7 @@ def add_sketch_entity(
             "distance": distance,
             "direction": direction,
             "points": json.loads(points) if points else [],
+            "construction": construction,
         },
     )
 
@@ -281,6 +290,8 @@ def extrude_feature(
     profiles: str = "[]",
     reverse: bool = False,
     through: bool = False,
+    up_to_face_index: int = -1,
+    mid_plane: bool = False,
 ) -> str:
     """Extrude/feature the active sketch profile.
     feature_type='boss' (default): solid extrusion, requires depth.
@@ -290,7 +301,15 @@ def extrude_feature(
     feature_type='loft': lofts through multiple profiles — requires profiles (JSON array of sketch names, e.g. '[\"Sketch1\",\"Sketch2\"]').
     reverse (boss/cut): flip the feature direction. Needed e.g. for a cut/boss sketched on a part FACE, where the material is on the opposite side from the default.
     through (boss/cut): through-all end condition (depth is ignored). Use for through holes/cuts instead of guessing a depth.
-    depth is required only for a BLIND boss/cut (not for through, revolve, sweep, or loft).
+    up_to_face_index (boss/cut): >= 0 selects the UP-TO-SURFACE end condition — the feature terminates
+        exactly ON that model face (index from analyze_model(analysis_type='faces'), same indexing as
+        create_sketch face_index). depth is ignored, like through. Use when the recipe says
+        extrude end='up_to_surface', or to land a boss/cut precisely on existing geometry without
+        computing a blind depth. -1 (default) = off.
+    mid_plane (boss/cut): True selects the MID-PLANE end condition — the feature extrudes
+        SYMMETRICALLY about the sketch plane; depth is the TOTAL width. Use when the recipe says
+        extrude end='mid_plane'. Conflicts with through/up_to_face_index (pick one).
+    depth is required only for a BLIND or MID-PLANE boss/cut (not for through, up_to_face_index, revolve, sweep, or loft).
     Sheet metal: a 'cut' on a sheet-metal body (incl. holes after a bend) is handled automatically — it
         applies a Normal Cut and inserts before the Flat-Pattern; no special params needed. Use
         analyze_model(analysis_type='edges') to get real edge midpoints for selection.
@@ -309,6 +328,45 @@ def extrude_feature(
             "profiles": profiles,
             "reverse": reverse,
             "through": through,
+            "up_to_face_index": up_to_face_index,
+            "mid_plane": mid_plane,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: create_rib
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def create_rib(
+    thickness: Annotated[float, Field(gt=0, description="Rib thickness in METERS (e.g. 0.005 = 5mm)")],
+    two_sided: bool = True,
+    reverse_thickness_dir: bool = False,
+    reverse_material_dir: bool = False,
+    is_norm_to_sketch: bool = False,
+) -> str:
+    """Create a RIB from the ACTIVE sketch (consumes it, like extrude_feature). The rib profile
+    is OPEN geometry — typically a single line (e.g. the diagonal between an L-bracket's legs);
+    SolidWorks extends it to the surrounding walls and thickens it.
+    thickness: rib thickness in METERS.
+    two_sided: True (default) thickens symmetrically on both sides of the sketch; False = single
+        side (then reverse_thickness_dir picks which side).
+    reverse_material_dir: flip which side of the profile the rib material FILLS toward. Wrong
+        direction is auto-recovered: if no feature results, the tool retries flipped (your
+        explicit value is tried first).
+    is_norm_to_sketch: False (default) = extrusion parallel to the sketch (the classic line-rib
+        on a mid/symmetry plane); True = normal to the sketch.
+    Draft is deliberately not exposed (grow on demand). On COMPLETED the result includes
+    result_geometry {volume, faces, edges} — verify the step from this. Requires an existing
+    solid body for the rib to attach to."""
+    return _call(
+        "create_rib",
+        {
+            "thickness": thickness,
+            "two_sided": two_sided,
+            "reverse_thickness_dir": reverse_thickness_dir,
+            "reverse_material_dir": reverse_material_dir,
+            "is_norm_to_sketch": is_norm_to_sketch,
         },
     )
 
@@ -319,22 +377,31 @@ def extrude_feature(
 @mcp.tool()
 def add_edge_feature(
     feature_type: Literal["fillet", "chamfer"],
-    radius_or_distance: Annotated[float, Field(gt=0, description="Fillet radius / chamfer setback in METERS (e.g. 0.01 = 10mm)")],
+    radius_or_distance: Annotated[float, Field(gt=0, description="Fillet radius / chamfer FIRST-face setback (D1) in METERS (e.g. 0.01 = 10mm)")],
     edge_indices: str = "",
     ex: float = 0.0,
     ey: float = 0.0,
     ez: float = 0.0,
     edges_json: str = "[]",
+    chamfer_type: Literal["distance_angle", "distance_distance"] = "distance_angle",
+    angle: Annotated[float, Field(gt=0, lt=90, description="Chamfer angle in DEGREES (distance_angle mode only; default 45)")] = 45.0,
+    distance2: Annotated[float, Field(ge=0, description="Chamfer SECOND-face setback (D2) in METERS (distance_distance mode only; must be > 0 there)")] = 0.0,
+    chamfer_flip: bool = False,
 ) -> str:
     """Apply a 3D edge modifier to solid body edges (post-extrusion). Distinct from sketch fillet/chamfer.
     feature_type='fillet': rounds selected edge(s) with given radius_or_distance.
-    feature_type='chamfer': cuts a 45° chamfer on selected edge(s) with given radius_or_distance as equal distance.
+    feature_type='chamfer': cuts a chamfer on selected edge(s). Two modes via chamfer_type:
+      - 'distance_angle' (default): radius_or_distance = setback (D1), angle = the chamfer angle in DEGREES
+        (default 45 → the classic equal 45° chamfer). angle is ignored in the other mode.
+      - 'distance_distance': radius_or_distance = first-face setback (D1), distance2 = second-face setback
+        (D2, METERS, required > 0). A distance-distance chamfer is DIRECTIONAL — if D1/D2 land on the wrong
+        faces (the chamfer leans the wrong way), set chamfer_flip=True to swap the sides (FlipDirection).
     PREFERRED edge selection: edge_indices — a JSON array of integer indices from analyze_model(analysis_type='edges'),
     e.g. '[3,5]'. This selects edges directly (no coordinate pick), so it works on crowded or CONCAVE edges
     (inner-corner / small-radius step edges) that a coordinate pick can't disambiguate. Takes priority over
     edges_json / ex-ey-ez.
     Fallback — single edge: ex/ey/ez (3D point on the edge); multiple edges: edges_json e.g. '[{\"ex\":0.05,\"ey\":0.05,\"ez\":0.05}]'.
-    All coordinates in document units (meters). Requires an active part document with an existing solid body."""
+    All coordinates/distances in METERS. Requires an active part document with an existing solid body."""
     params = {
         "feature_type": feature_type,
         "radius_or_distance": radius_or_distance,
@@ -343,6 +410,11 @@ def add_edge_feature(
     }
     if edge_indices:
         params["edge_indices"] = edge_indices
+    if feature_type == "chamfer":
+        params["chamfer_type"] = chamfer_type
+        params["angle"] = angle
+        params["distance2"] = distance2
+        params["chamfer_flip"] = chamfer_flip
     return _call("add_edge_feature", params)
 
 
@@ -623,8 +695,10 @@ def save_document(file_path: str = "") -> str:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def analyze_model(
-    analysis_type: Literal["mass_properties", "geometry", "edges", "faces", "features", "sketch"],
+    analysis_type: Literal["mass_properties", "geometry", "edges", "faces", "features", "sketch", "feature_map"],
     name: str = "",
+    from_feature: str = "",
+    to_feature: str = "",
 ) -> str:
     """Analyze the active SolidWorks part document (read-only, does NOT change state).
     analysis_type='mass_properties': returns volume, surface_area, center of gravity (cx, cy, cz) in document units.
@@ -655,8 +729,20 @@ def analyze_model(
         to 6 decimals) plus its plane. Use this only when you actually need exact sketch geometry (e.g. to reproduce
         an irregular profile); get the sketch name from the 'features' read first. name = the sketch feature name,
         e.g. 'Sketch2'.
+    analysis_type='feature_map': per-feature geometry ATTRIBUTION — deterministically answers "which edges/faces
+        did each feature act on?" (e.g. WHICH edge a fillet/chamfer was applied to — never guess an anchor). Walks
+        the tree base→end with the rollback bar and diffs the topology between stops INSIDE the tool; returns one
+        compact JSON {feature_count, map:[{feature, type, delta:{faces,edges,vertices}, consumed_edges:[{mid,len}],
+        created_faces:[{point, normal?, planar, area}]}]} (6-decimal meters). consumed_edges = edges that existed
+        BEFORE the feature and were consumed by it (both endpoints gone; merely trimmed neighbours excluded) — use
+        a consumed edge's `mid` as the fillet/chamfer anchor `near` point (it references the PRE-feature geometry,
+        exactly what the IR anchor needs). created_faces = genuinely new surfaces (trimmed existing planes excluded).
+        Sketches/planes are listed without a delta; suppressed features are skipped. Optional from_feature/to_feature
+        (tree names) limit the walk to a range. NON-DESTRUCTIVE: the rollback bar is restored to the end, nothing is
+        saved — but it does rebuild the model feature-by-feature, so it is the slowest mode on big trees.
     Does NOT increment state_version."""
-    return _call("analyze_model", {"analysis_type": analysis_type, "name": name})
+    return _call("analyze_model", {"analysis_type": analysis_type, "name": name,
+                                   "from_feature": from_feature, "to_feature": to_feature})
 
 
 # ---------------------------------------------------------------------------
@@ -757,8 +843,8 @@ def add_reference_geometry(
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def create_pattern(
-    pattern_type: Literal["linear", "circular"],
-    feature_name: str,
+    pattern_type: Literal["linear", "circular", "mirror"],
+    feature_name: str = "",
     spacing: Annotated[float, Field(
         gt=0, description="Linear pattern spacing in METERS")] = 0.01,
     count: Annotated[int, Field(
@@ -772,8 +858,11 @@ def create_pattern(
     angle: Annotated[float, Field(
         gt=0, le=360, description="Circular pattern angle in DEGREES")] = 90.0,
     equal_spacing: bool = True,
+    features_json: str = "[]",
+    plane: str = "",
+    geometry_pattern: bool = False,
 ) -> str:
-    """Create a linear or circular feature pattern.
+    """Create a linear, circular, or mirror feature pattern.
     pattern_type='linear': repeats feature_name along direction ('X', 'Y', or 'Z') with spacing (meters) and count instances.
         Optional second direction: count2>1 with spacing2.
         Direction maps to default planes: X→Right Plane normal, Y→Top Plane normal, Z→Front Plane normal.
@@ -789,6 +878,13 @@ def create_pattern(
         use the simpler equivalent full ring: count=distinct_instances, angle=360, equal_spacing=True.
         (Example: a gear analyzed as 30 @ 15° equal_spacing=False has distinct_instances=24 → reproduce as
         either 30 @ 15° False or 24 @ 360° True; both yield the same 24 teeth.)
+    pattern_type='mirror': mirrors one or more FEATURES about a plane. features_json = a JSON array of
+        feature tree names, e.g. '["Edge-Flange1","Sketched Bend2"]' (feature_name works for a single
+        feature). plane = the mirror plane name ('Right Plane' default; canonical English default-plane
+        names work on any localization, or a created reference plane's name). geometry_pattern=True
+        mirrors the geometry without solving each feature (faster; default False = SW default).
+        Round-trip: analyze_model(features) reports a MirrorPattern's mirror:{plane, features} — replay
+        those values verbatim. feature_name/spacing/count/direction/axis params are ignored for mirror.
     On COMPLETED the result includes result_geometry {volume, faces, edges} after the pattern — verify from
         this instead of a separate analyze_model.
     Returns the created pattern feature name."""
@@ -805,6 +901,9 @@ def create_pattern(
             "axis_name": axis_name,
             "angle": angle,
             "equal_spacing": equal_spacing,
+            "features_json": features_json,
+            "plane": plane,
+            "geometry_pattern": geometry_pattern,
         },
     )
 
@@ -830,7 +929,8 @@ def set_part_material(
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def sheet_metal_feature(
-    feature_type: Literal["base_flange", "edge_flange", "flat_pattern"],
+    feature_type: Literal["base_flange", "edge_flange", "edge_flange_sketch", "edge_flange_finish",
+                          "flat_pattern", "sketched_bend"],
     thickness: Annotated[float, Field(
         gt=0, description="Sheet thickness in METERS")] = 0.001,
     bend_radius: Annotated[float, Field(
@@ -843,28 +943,73 @@ def sheet_metal_feature(
     flange_length: Annotated[float, Field(
         gt=0, description="Edge flange length in METERS; use >= 2*thickness+1mm (KNOWN-LIMITATIONS #11)")] = 0.02,
     angle: Annotated[float, Field(
-        gt=0, le=180, description="Edge flange bend angle in DEGREES")] = 90.0,
+        gt=0, le=180, description="Bend angle in DEGREES (edge_flange and sketched_bend; default 90)")] = 90.0,
+    use_default_radius: bool = False,
+    flip: bool = False,
+    bend_position: Literal["centerline", "material_inside", "material_outside", "bend_outside"] = "centerline",
+    fixed_face_index: int = -1,
+    fixed_x: float = 0.0,
+    fixed_y: float = 0.0,
+    fixed_z: float = 0.0,
+    reverse_thickness: bool = False,
+    symmetric_thickness: bool = False,
+    clear_profile: bool = True,
+    edge_index: int = -1,
 ) -> str:
     """Create sheet metal features on the active part.
     feature_type='base_flange': creates a sheet metal base from the active sketch profile.
         thickness: sheet thickness (meters). bend_radius: bend radius (default = thickness). k_factor: default 0.5.
+        reverse_thickness: thicken to the OPPOSITE side of the sketch plane (default False). Direction matters
+        for reproduction — when rebuilding an analyzed part, derive it from which side of the sketch plane the
+        original blank's big faces sit (e.g. feature_map's SMBaseFlange created faces).
+        symmetric_thickness: thicken BOTH ways off the sketch plane (±t/2, mid-plane style; default False).
+        When rebuilding, reproduce the original's own flag (analyze_model(features) reports it on the
+        SMBaseFlange) — the flags also set the intrinsic sheet orientation downstream bends fold against.
         Exits sketch mode automatically.
-    feature_type='edge_flange': adds a flange to an existing sheet metal edge at (ex, ey, ez).
+    feature_type='edge_flange': adds a DEFAULT-profile flange to an existing sheet metal edge at (ex, ey, ez).
         flange_length: flange length (meters). angle: bend angle in degrees (default 90).
+    feature_type='edge_flange_sketch' + 'edge_flange_finish': the CUSTOM-profile edge flange, two calls.
+        edge_flange_sketch selects the attach edge — pass edge_index (from analyze_model(edges),
+        PREFERRED; a coordinate pick can miss a real edge) or ex/ey/ez — generates the edge-linked
+        profile sketch (the flange API accepts ONLY a sketch it generated), clears its default content
+        (clear_profile=True) and leaves it ACTIVE, echoing the sketch's MEASURED frame in the result —
+        express your profile coordinates in THAT frame. Draw the profile with add_sketch_entity, then
+        call edge_flange_finish with the SAME edge_index/coords (+ angle, bend_radius or
+        use_default_radius, bend_position from the original's edge_flange recipe block) to create the
+        flange. The custom profile itself defines the flange outline/length (flange_length is ignored).
+    feature_type='sketched_bend': bends the sheet about the bend LINE(S) in the ACTIVE sketch (draw the
+        line(s) on a sheet face with create_sketch + add_sketch_entity first — the sketch must still be
+        active). The side of the sheet that stays PUT is the fixed face: pass fixed_face_index (from
+        analyze_model(faces), PREFERRED — index-robust) or fixed_x/y/z (a 3D point ON that face, meters).
+        angle: bend angle in DEGREES (default 90). bend_radius: bend radius in meters, or set
+        use_default_radius=True to use the sheet's default (bend_radius is then ignored). flip: reverse
+        the bend direction (up vs down). bend_position: where the bend sits relative to the line —
+        'centerline' (default), 'material_inside', 'material_outside', or 'bend_outside' — matches the
+        `position` value analyze_model(features) reports on an SM3dBend, so a recipe value replays as-is.
+        A sketch with MULTIPLE bend lines creates one feature with one bend per line (like 4-1's Sketch6).
     feature_type='flat_pattern': unfolds all bends to create the flat pattern view.
         No additional parameters required. Requires an existing base_flange feature."""
-    return _call(
-        "sheet_metal_feature",
-        {
-            "feature_type": feature_type,
-            "thickness": thickness,
-            "bend_radius": bend_radius,
-            "k_factor": k_factor,
-            "ex": ex, "ey": ey, "ez": ez,
-            "flange_length": flange_length,
-            "angle": angle,
-        },
-    )
+    params = {
+        "feature_type": feature_type,
+        "thickness": thickness,
+        "bend_radius": bend_radius,
+        "k_factor": k_factor,
+        "ex": ex, "ey": ey, "ez": ez,
+        "flange_length": flange_length,
+        "angle": angle,
+        "use_default_radius": use_default_radius,
+        "flip": flip,
+        "bend_position": bend_position,
+        "fixed_x": fixed_x, "fixed_y": fixed_y, "fixed_z": fixed_z,
+        "reverse_thickness": reverse_thickness,
+        "symmetric_thickness": symmetric_thickness,
+        "clear_profile": clear_profile,
+    }
+    if fixed_face_index >= 0:
+        params["fixed_face_index"] = fixed_face_index
+    if edge_index >= 0:
+        params["edge_index"] = edge_index
+    return _call("sheet_metal_feature", params)
 
 
 # ---------------------------------------------------------------------------
@@ -928,72 +1073,405 @@ def activate_document(title: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool: submit_feature_graph  (EXPERIMENTAL — Feature Graph IR + deterministic compiler)
+# Tool: save_analysis  (Phase A analysis pipeline — ADAPTER-ONLY, no C#; ADR-040)
 # ---------------------------------------------------------------------------
-def _resync_state_version() -> int:
-    """Realign the adapter's local state_version with the authoritative GET /state.
+ANALYSIS_SCHEMA_VERSION = "0.1.0-draft"  # cad-planner/contracts/analysis-artifact.schema.json
 
-    A submit_feature_graph run performs MANY execution ops (each bumping state_version) OUTSIDE the
-    normal _call() path, so afterwards — success OR failure — we resync the local value, or the NEXT
-    normal tool call would fail INVALID_STATE_VERSION (KNOWN-LIMITATIONS #5)."""
+
+def _call_raw(tool_name: str, params: dict) -> dict:
+    """Like _call() but returns the RAW ExecutionResponse dict (no string mapping, no raise).
+
+    Used by adapter-side orchestration (save_analysis) that needs the structured payloads the
+    analyze tools carry in `result_geometry`. Same one-shot resync-retry on INVALID_STATE_VERSION."""
     global _state_version
-    try:
+    response = call_tool(tool_name, _next_operation_id(), _state_version, params)
+    if _is_state_mismatch(response):
         _state_version = get_state()
-    except Exception:
-        pass
-    return _state_version
+        response = call_tool(tool_name, _next_operation_id(), _state_version, params)
+    _update_state_version(response)
+    return response
+
+
+def _analysis_items(response: dict) -> list:
+    """Return the `cadState.features` list an analyze_model call carries its payload in.
+
+    Payload shapes (C#-owned): 'features' mode = ONE item holding the whole recipe as a JSON
+    string; 'mass_properties'/'geometry' modes = 'key=value' strings. Raises RuntimeError on a
+    FAILED response (mirrors map_response's error discipline)."""
+    if response.get("status") != "COMPLETED":
+        err = response.get("error") or {}
+        raise RuntimeError(f"{err.get('code')}: {err.get('message')}")
+    return (response.get("cadState") or {}).get("features") or []
+
+
+def _kv_dict(items: list) -> dict:
+    """Parse ['volume=4,22503E-06', 'faces=12', ...] into a dict with real numbers.
+
+    Numeric values may use a COMMA decimal separator (localized SolidWorks formatting);
+    normalize to float, and to int for plain integer counts."""
+    out = {}
+    for item in items:
+        if not isinstance(item, str) or "=" not in item:
+            continue
+        key, _, raw = item.partition("=")
+        raw = raw.strip()
+        try:
+            num = float(raw.replace(",", "."))
+            is_plain_int = raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit())
+            out[key.strip()] = int(num) if is_plain_int else num
+        except ValueError:
+            out[key.strip()] = raw
+    return out
+
+
+def _collect_parameters(node, out: list, feature_name: str = "") -> None:
+    """Walk the features recipe and lift dimension entries into the flat named-parameter table.
+
+    A dimension entry is a dict whose 'name' is a FULL dimension name (contains '@', e.g.
+    'D1@Boss-Extrude1@Part1.Part' — the modify_dimension target) with a numeric value under
+    'value_si' or 'value'. Tolerant by design: the exact recipe keys are C#-owned; anything that
+    doesn't match the shape is simply not lifted."""
+    if isinstance(node, dict):
+        owner = node.get("name") if node.get("type") else None
+        value = node.get("value_si", node.get("value"))
+        name = node.get("name")
+        if isinstance(name, str) and "@" in name and isinstance(value, (int, float)):
+            out.append({"name": name, "value_si": value, "feature": feature_name})
+            return
+        for child in node.values():
+            _collect_parameters(child, out, owner or feature_name)
+    elif isinstance(node, list):
+        for child in node:
+            _collect_parameters(child, out, feature_name)
 
 
 @mcp.tool()
-def submit_feature_graph(
-    graph: str,
-    i_understand_this_is_experimental: bool = False,
-    user_request: str = "",
-) -> str:
-    """[EXPERIMENTAL — OPT-IN ONLY. Do NOT use for normal CAD work.]
+def save_analysis(file_path: str) -> str:
+    """Analyze a part FILE and persist its analysis ARTIFACT — the entry tool of the analysis
+    pipeline. Opens the part (activates it if already open), runs the standard reads (features
+    recipe + mass_properties + geometry), computes the file's sha256, and writes
+    `<folder>/.solidpilot/<filename>.analysis.json` per
+    cad-planner/contracts/analysis-artifact.schema.json.
 
-    Build a part from a CAD-neutral Feature Graph IR via the deterministic compiler (ONE IR ->
-    MANY low-level tool calls). This is an UNPROVEN test path that may partially build or fail.
+    The artifact is a CACHE of the file's state at analysis time: consumers must compare
+    identity.source_hash against the current file and re-analyze on a mismatch. The `ir` block
+    is left null here (the AI/IR pass fills it later — see cad-planner/recipe.md). The part is
+    left OPEN and ACTIVE for follow-up work.
 
-    NEVER call this tool unless the user has EXPLICITLY asked to use the Feature Graph IR /
-    experimental compiler path (e.g. "use the IR compiler", "submit a feature graph"). For ALL
-    normal modeling use the low-level tools (create_sketch / extrude_feature / ...). When in doubt,
-    do NOT use this tool.
+    file_path: absolute path of the .SLDPRT to analyze (v0 is parts-only; drawing/assembly
+        artifacts arrive with later pipeline steps).
+    Returns a token-frugal summary (artifact path + counts) — the artifact JSON stays on disk;
+    read it from there when the full content is needed."""
+    src = os.path.abspath(file_path)
+    if not os.path.isfile(src):
+        return f"FAILED | FILE_NOT_FOUND | {src}"
+    if not src.lower().endswith(".sldprt"):
+        return ("FAILED | UNSUPPORTED_TYPE | save_analysis v0 analyzes .SLDPRT parts only "
+                "(drawing/assembly artifacts come with later pipeline steps)")
+    with open(src, "rb") as fh:
+        sha = hashlib.sha256(fh.read()).hexdigest()
 
-    graph: a JSON-string Feature Graph (see cad-planner/contracts/feature-graph.schema.json,
-        v0-exp subset). Covered v0 vocabulary: 'box' (rectangular boss), 'sketch'+'extrude'
-        (boss/cut), and 'hole' on a face with semantic refs (selector 'top', position 'center',
-        depth 'through_all'). All lengths in METERS. The box is built centred on the datum origin.
-    i_understand_this_is_experimental: REQUIRED gate — must be true. Set it ONLY when the user
-        explicitly opted into the IR path.
-    user_request: optional — the user's opt-in phrase, recorded for the logs.
+    # Open (or activate, if it is already open under its title).
+    opened = _call_raw("open_document", {"file_path": src})
+    if opened.get("status") == "FAILED":
+        activated = _call_raw("activate_document", {"title": os.path.basename(src)})
+        if activated.get("status") == "FAILED":
+            err = opened.get("error") or {}
+            return f"FAILED | OPEN_FAILED | {err.get('code')}: {err.get('message')}"
 
-    Returns a per-node report (COMPLETED, or FAILED with how far it got + a feature-level error).
-    CAD ops are not transactional: on failure partial geometry may remain (reported, not hidden);
-    the adapter's state_version is resynced either way so subsequent normal tools keep working."""
-    # Gate layer 1 — operator kill switch (model-independent; off by default).
-    if not ENABLE_EXPERIMENTAL_IR:
-        return ("REFUSED | submit_feature_graph is an EXPERIMENTAL opt-in tool and is DISABLED on "
-                "this server (set SOLIDPILOT_ENABLE_IR=true to enable it for test users). Use the "
-                "low-level tools for all normal CAD work.")
-    # Gate layer 2 — required explicit confirmation.
-    if not i_understand_this_is_experimental:
-        return ("REFUSED | submit_feature_graph not invoked: this is an EXPERIMENTAL path that must "
-                "be explicitly opted into. Only use it when the user explicitly asks for the IR / "
-                "feature-graph path, and set i_understand_this_is_experimental=true.")
-    # Parse the graph (structural validation happens inside the compiler).
     try:
-        graph_obj = json.loads(graph)
-    except Exception as ex:
-        return f"FAILED | INVALID_JSON | the graph is not valid JSON: {ex}"
-    # Compile + run. NEVER let an exception crash the MCP server; resync state_version regardless.
+        features_items = _analysis_items(_call_raw("analyze_model", {"analysis_type": "features", "name": ""}))
+        mass_kv = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "mass_properties", "name": ""})))
+        geometry = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "geometry", "name": ""})))
+    except RuntimeError as ex:
+        return f"FAILED | ANALYZE_FAILED | {ex}"
+
+    notes = []
+    if not features_items:
+        return "FAILED | NO_PAYLOAD | analyze_model(features) returned an empty payload"
     try:
-        result = run_feature_graph(graph_obj)
-    except Exception as ex:
-        sv = _resync_state_version()
-        return f"FAILED | UNEXPECTED | {type(ex).__name__}: {ex} | state_version resynced to {sv}"
-    sv = _resync_state_version()  # first-class resync, success OR failure
-    return result.summary() + f" | state_version={sv}"
+        features = json.loads(features_items[0])
+    except (ValueError, TypeError):
+        features = {"raw": features_items}
+        notes.append("features payload was not parseable JSON — stored raw (reader refinement pending)")
+
+    mass = {
+        "volume_m3": mass_kv.get("volume"),
+        "surface_area_m2": mass_kv.get("surface_area"),
+        "cg": {"x": mass_kv.get("cx"), "y": mass_kv.get("cy"), "z": mass_kv.get("cz")},
+    }
+
+    parameters: list = []
+    _collect_parameters(features, parameters)
+
+    # V1 relationships: drawing files next to the part whose stem is the part's stem, optionally
+    # followed by a suffix word (e.g. 'part-1 drawing.SLDDRW' for 'part-1.SLDPRT').
+    folder = os.path.dirname(src)
+    stem = os.path.splitext(os.path.basename(src))[0].lower()
+    drawings = sorted(
+        os.path.join(folder, f) for f in os.listdir(folder)
+        if f.lower().endswith(".slddrw")
+        and (os.path.splitext(f)[0].lower() == stem
+             or os.path.splitext(f)[0].lower().startswith(stem + " "))
+    )
+
+    artifact = {
+        "identity": {
+            "source_path": src,
+            "source_filename": os.path.basename(src),
+            "source_hash": "sha256:" + sha,
+            "source_mtime": datetime.fromtimestamp(os.path.getmtime(src), timezone.utc).isoformat(),
+            "schema_version": ANALYSIS_SCHEMA_VERSION,
+            "analyzed_at": datetime.now(timezone.utc).isoformat(),
+            "generator": {"kind": "deterministic"},
+        },
+        "document_type": "part",
+        "recipe": {
+            "features": features,
+            "mass_properties": mass,
+            "geometry": geometry,
+            "bbox": None,
+            "material": None,
+            "equations": [],
+        },
+        "parameters": parameters,
+        "ir": None,
+        "relationships": {"drawings": drawings, "category": None, "cluster_signals": {}},
+        "notes": notes + ["bbox/material/equations extraction pending refinement (A2 live pass)"],
+    }
+
+    out_dir = os.path.join(folder, ".solidpilot")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, os.path.basename(src) + ".analysis.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(artifact, fh, ensure_ascii=False, indent=2)
+
+    geo = geometry if isinstance(geometry, dict) else {}
+    feature_count = len(features.get("features", [])) if isinstance(features, dict) else "?"
+    return (f"COMPLETED | artifact={out_path} | features={feature_count} | "
+            f"parameters={len(parameters)} | geometry={{bodies:{geo.get('bodies')},"
+            f"faces:{geo.get('faces')},edges:{geo.get('edges')},vertices:{geo.get('vertices')}}} | "
+            f"drawings_linked={len(drawings)} | hash=sha256:{sha[:12]}")
+
+
+# ---------------------------------------------------------------------------
+# Tool: rebuild_from_ir  (adapter-only — the analysis pipeline's IR door, IR-ADR-005)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def rebuild_from_ir(artifact_path: str, fresh_document: bool = True) -> str:
+    """Rebuild a part from its analysis artifact's Feature Graph IR — the verification half of
+    the round-trip ("the LLM proposes, the round-trip decides", IR-ADR-006). Reads
+    `<...>.analysis.json`, takes `ir.graph`, and executes it through the SAME deterministic
+    pycompiler the test tool uses (two doors, ONE compiler — never forked).
+
+    fresh_document (default True): open a NEW blank part first — the normal round-trip flow
+        (rebuild fresh, then compare_parts against the original). Pass False only if you have
+        already prepared the target document yourself.
+
+    The rebuild reproduces the part AS-ANALYZED. If the source file changed since the artifact
+    was written (hash mismatch) the result carries source_stale=true — re-run save_analysis and
+    regenerate the IR rather than trusting a stale graph.
+
+    Returns the compiler's per-node summary (COMPLETED n/n, or the feature-level error and how
+    far it got — partial geometry may remain; CAD ops are not transactional). Afterwards, verify
+    with compare_parts and only then label the artifact's ir.verification."""
+    global _state_version
+    path = os.path.abspath(artifact_path)
+    if not os.path.isfile(path):
+        return f"FAILED | ARTIFACT_NOT_FOUND | {path}"
+    try:
+        # utf-8-sig: tolerate a BOM — artifacts hand-edited or written by other Windows tools
+        # (e.g. PowerShell 5.1 Out-File) may carry one; save_analysis itself writes without.
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            artifact = json.load(fh)
+    except (ValueError, OSError) as ex:
+        return f"FAILED | ARTIFACT_UNREADABLE | {ex}"
+
+    ir = artifact.get("ir") or {}
+    graph = ir.get("graph")
+    if not isinstance(graph, dict) or not graph.get("nodes"):
+        status = (ir.get("verification") or {}).get("status")
+        reason = ((ir.get("verification") or {}).get("detail") or {}).get("reason")
+        return (f"FAILED | NO_IR_GRAPH | the artifact carries no executable ir.graph"
+                f"{f' (verification: {status} | {reason})' if status else ''} — run the AI/IR "
+                f"pass per cad-planner/recipe.md first")
+
+    # Stale-source signal (cache discipline, ADR-040): informative, not blocking — the graph
+    # legitimately rebuilds the part AS-ANALYZED.
+    source_stale = ""
+    src = (artifact.get("identity") or {}).get("source_path")
+    recorded = (artifact.get("identity") or {}).get("source_hash")
+    if src and recorded and os.path.isfile(src):
+        with open(src, "rb") as fh:
+            current = "sha256:" + hashlib.sha256(fh.read()).hexdigest()
+        if current != recorded:
+            source_stale = " | source_stale=true (file changed since analysis — regenerate the artifact)"
+
+    if fresh_document:
+        opened = _call_raw("open_new_part", {})
+        if opened.get("status") != "COMPLETED":
+            err = opened.get("error") or {}
+            return f"FAILED | OPEN_NEW_PART_FAILED | {err.get('code')}: {err.get('message')}"
+
+    # Lazy import: pycompiler lives in the hyphenated solidworks-compiler/ dir; ir_execution_port
+    # wires sys.path + the ExecutionPort. Imported here so a missing compiler tree degrades to a
+    # clean tool error instead of killing the whole MCP server at startup.
+    try:
+        from ir_execution_port import run_feature_graph
+    except Exception as ex:  # noqa: BLE001
+        return f"FAILED | COMPILER_UNAVAILABLE | {ex}"
+
+    try:
+        result = run_feature_graph(graph)
+    finally:
+        # One rebuild performs MANY state-bumping sub-ops outside _call() — resync so the next
+        # normal tool call can't hit INVALID_STATE_VERSION (KNOWN-LIMITATIONS #5).
+        try:
+            _state_version = get_state()
+        except Exception:  # noqa: BLE001
+            pass
+
+    return f"{result.summary()} | artifact={os.path.basename(path)}{source_stale}"
+
+
+# ---------------------------------------------------------------------------
+# Tool: compare_parts  (adapter-only — the objective round-trip verifier, ADR-040/A0)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def compare_parts(doc_a: str, doc_b: str) -> str:
+    """Objectively diff two part documents — the round-trip verifier behind the artifact's
+    `verified` label (and a general-purpose "are these the same part?" check).
+
+    doc_a / doc_b: EITHER an absolute .SLDPRT path (opened/activated from disk) OR the TITLE of
+        an already-open document (e.g. 'Part4' for an unsaved rebuild). doc_a is the REFERENCE
+        (deltas are relative to it — normally the original; doc_b = the rebuild).
+
+    For each doc it runs analyze_model(geometry + mass_properties) and reports topology
+    (bodies/faces/edges/vertices), volume, surface area and CG side by side with deltas, plus
+    the DECIDED verified-criteria verdict (analysis-artifact.schema.json): topology EXACT AND
+    |ΔV| <= 1% AND |ΔA| <= 1%. The verdict is a REPORT — writing ir.verification into the
+    artifact stays the caller's job. Read-only geometry-wise (activation may switch the active
+    document; doc_b is left active). bbox comparison: pending (analyze doesn't expose it yet)."""
+    def _read(doc: str, label: str):
+        if os.path.isfile(doc):
+            r = _call_raw("open_document", {"file_path": os.path.abspath(doc)})
+            if r.get("status") != "COMPLETED":
+                r = _call_raw("activate_document", {"title": os.path.splitext(os.path.basename(doc))[0]})
+        else:
+            r = _call_raw("activate_document", {"title": doc})
+        if r.get("status") != "COMPLETED":
+            err = r.get("error") or {}
+            raise RuntimeError(f"DOC_{label}_UNAVAILABLE | {doc} | {err.get('code')}: {err.get('message')}")
+        geo = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "geometry", "name": ""})))
+        mass = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "mass_properties", "name": ""})))
+        return geo, mass
+
+    try:
+        geo_a, mass_a = _read(doc_a, "A")
+        geo_b, mass_b = _read(doc_b, "B")
+    except RuntimeError as ex:
+        return f"FAILED | {ex}"
+
+    topo_keys = ("bodies", "faces", "edges", "vertices")
+    topo_a = [geo_a.get(k) for k in topo_keys]
+    topo_b = [geo_b.get(k) for k in topo_keys]
+    topology_exact = topo_a == topo_b and None not in topo_a
+
+    def _delta_pct(a, b):
+        if not isinstance(a, (int, float)) or not isinstance(b, (int, float)) or a == 0:
+            return None
+        return (b - a) / a * 100.0
+
+    dv = _delta_pct(mass_a.get("volume"), mass_b.get("volume"))
+    da = _delta_pct(mass_a.get("surface_area"), mass_b.get("surface_area"))
+    cg_dist = None
+    if all(isinstance(mass_x.get(k), (int, float)) for mass_x in (mass_a, mass_b) for k in ("cx", "cy", "cz")):
+        cg_dist = ((mass_a["cx"] - mass_b["cx"]) ** 2 + (mass_a["cy"] - mass_b["cy"]) ** 2
+                   + (mass_a["cz"] - mass_b["cz"]) ** 2) ** 0.5
+
+    verified = (topology_exact and dv is not None and da is not None
+                and abs(dv) <= 1.0 and abs(da) <= 1.0)
+
+    fmt = lambda v, spec=".6g": ("?" if v is None else format(v, spec))  # noqa: E731
+    return (f"COMPLETED | verified_criteria={'PASS' if verified else 'FAIL'} | "
+            f"topology A={'-'.join(str(t) for t in topo_a)} B={'-'.join(str(t) for t in topo_b)} "
+            f"{'EXACT' if topology_exact else 'DIFFER'} | "
+            f"volume A={fmt(mass_a.get('volume'))} B={fmt(mass_b.get('volume'))} dV={fmt(dv, '.4f')}% | "
+            f"area A={fmt(mass_a.get('surface_area'))} B={fmt(mass_b.get('surface_area'))} dA={fmt(da, '.4f')}% | "
+            f"cg_distance={fmt(cg_dist)} m | reference=A ({doc_a})")
+
+
+# ---------------------------------------------------------------------------
+# TEST TOOL (disabled): submit_feature_graph — Feature Graph IR + deterministic compiler
+# ---------------------------------------------------------------------------
+# The mainline IR path is the analysis pipeline's rebuild_from_ir (logs.md ADR-040, Phase A;
+# logs-ir.md IR-ADR-005). This direct-IR entry point is kept as a DEVELOPMENT/TEST tool only and is
+# commented out so it never appears on the MCP surface (zero token cost). The old experimental
+# gates (SOLIDPILOT_ENABLE_IR env switch + i_understand_this_is_experimental param) were DELETED
+# (IR-ADR-005) — the block below is the simplified, gate-free version.
+#
+# TO RE-ENABLE (3 steps):
+#   1. Uncomment this whole block AND the `from ir_execution_port import run_feature_graph`
+#      import at the top of this file.
+#   2. Re-add the following entry to solidworks-execution/contracts/tool-schemas.json (the
+#      contract test tests/test_schema_contract.py fails otherwise):
+#
+#          "submit_feature_graph": {
+#              "description": "[TEST TOOL — P1.4/P1.7] Feature Graph IR + deterministic compiler path. NOT a COM/execution tool: it has NO ToolController/SolidWorksService case. The adapter's pycompiler (solidworks-compiler/pycompiler) lowers a CAD-neutral Feature Graph IR into ordered calls to the EXISTING low-level tools (create_sketch / add_sketch_entity / extrude_feature / analyze_model) and resolves semantic refs (top_face/center) against live geometry. Coexists with the low-level tools WITHOUT changing them. v0-exp vocabulary: box, sketch+extrude (boss/cut), hole-on-face (selector 'top', position 'center', depth 'through_all'). The adapter resyncs its local state_version from GET /state after a run (one submit performs many state-bumping sub-ops).",
+#              "input": {
+#                  "operation_id": "n/a at this level — each lowered sub-op carries its own operation_id (uuid4) and state_version on /api/tool/execute",
+#                  "state_version": "n/a at this level — the adapter resyncs its local state_version from GET /state after the run",
+#                  "params": {
+#                      "graph": "string (required — JSON Feature Graph IR per cad-planner/contracts/feature-graph.schema.json v0-exp; all lengths in meters)",
+#                      "user_request": "string (optional — the user's request phrase, recorded for the logs)"
+#                  }
+#              },
+#              "output": "Per-node report string: COMPLETED (nodes built) or FAILED (feature-level error + how far it got). Partial geometry may remain on failure (CAD ops are not transactional). Not itself in the state_version/idempotency envelope; its sub-ops are."
+#          }
+#
+#   3. Reconnect the MCP server (no hot-reload — KNOWN-LIMITATIONS #4).
+#
+# def _resync_state_version() -> int:
+#     """Realign the adapter's local state_version with the authoritative GET /state.
+#
+#     A submit_feature_graph run performs MANY execution ops (each bumping state_version) OUTSIDE the
+#     normal _call() path, so afterwards — success OR failure — we resync the local value, or the NEXT
+#     normal tool call would fail INVALID_STATE_VERSION (KNOWN-LIMITATIONS #5)."""
+#     global _state_version
+#     try:
+#         _state_version = get_state()
+#     except Exception:
+#         pass
+#     return _state_version
+#
+#
+# @mcp.tool()
+# def submit_feature_graph(graph: str, user_request: str = "") -> str:
+#     """[TEST TOOL] Build a part from a CAD-neutral Feature Graph IR via the deterministic
+#     compiler (ONE IR -> MANY low-level tool calls).
+#
+#     graph: a JSON-string Feature Graph (see cad-planner/contracts/feature-graph.schema.json,
+#         v0-exp subset). Covered v0 vocabulary: 'box' (rectangular boss), 'sketch'+'extrude'
+#         (boss/cut), and 'hole' on a face with semantic refs (selector 'top', position 'center',
+#         depth 'through_all'). All lengths in METERS. The box is built centred on the datum origin.
+#     user_request: optional — the user's request phrase, recorded for the logs.
+#
+#     Returns a per-node report (COMPLETED, or FAILED with how far it got + a feature-level error).
+#     CAD ops are not transactional: on failure partial geometry may remain (reported, not hidden);
+#     the adapter's state_version is resynced either way so subsequent normal tools keep working."""
+#     # Parse the graph (structural validation happens inside the compiler).
+#     try:
+#         graph_obj = json.loads(graph)
+#     except Exception as ex:
+#         return f"FAILED | INVALID_JSON | the graph is not valid JSON: {ex}"
+#     # Compile + run. NEVER let an exception crash the MCP server; resync state_version regardless.
+#     try:
+#         result = run_feature_graph(graph_obj)
+#     except Exception as ex:
+#         sv = _resync_state_version()
+#         return f"FAILED | UNEXPECTED | {type(ex).__name__}: {ex} | state_version resynced to {sv}"
+#     sv = _resync_state_version()  # first-class resync, success OR failure
+#     return result.summary() + f" | state_version={sv}"
 
 
 # ---------------------------------------------------------------------------

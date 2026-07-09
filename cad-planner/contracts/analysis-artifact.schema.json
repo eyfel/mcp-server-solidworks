@@ -1,0 +1,107 @@
+{
+  "_meta": {
+    "name": "analysis-artifact",
+    "version": "0.1.0-draft",
+    "status": "DRAFT — Phase A / A1 (logs.md ADR-040). Field set to be validated on the drawing-samples parts during the A2 vertical slice; do not freeze before then.",
+    "role": "The persistent per-file analysis artifact: what `save_analysis` writes and what the AI reads INSTEAD of re-analyzing a part. Written by the analysis pipeline (deterministic pass, optionally enriched by an AI pass per cad-planner/recipe.md); consumed by any MCP client, by rebuild_from_ir, and by the pattern matcher (A5).",
+    "location": "DECIDED (user, 2026-07-03 — A1 sign-off): one artifact per source file at `<folder>/.solidpilot/<source_filename>.analysis.json`, plus a folder-level `<folder>/.solidpilot/manifest.json` (A3).",
+    "discipline": "ARTIFACTS ARE A CACHE, NEVER TRUTH (source of truth = the CAD file). `identity.source_hash` + `identity.schema_version` are REQUIRED; a consumer MUST treat a hash mismatch as STALE and re-analyze. Schema evolution = REGENERATE the artifact, never migrate it (ADR-040). The `ir` block describes the part AS-ANALYZED — after any manual edit the hash changes and the whole artifact (incl. the IR) is stale."
+  },
+
+  "artifact": {
+    "identity": "object (required — see identity)",
+    "document_type": "string (required — 'part' | 'drawing'; 'assembly' is RESERVED for V2/B2)",
+    "recipe": "object (required — see recipe_part / recipe_drawing by document_type)",
+    "parameters": "array (required for parts, may be empty — see parameters)",
+    "ir": "object | null (OPTIONAL — never mandatory, IR-ADR-006; but the pipeline always ATTEMPTS it and records the outcome, even a failure, so coverage is measurable. See ir.)",
+    "relationships": "object (see relationships_v1 — V1 scope only)",
+    "notes": "array of strings (skipped content, partial reads, pitfalls hit during analysis)"
+  },
+
+  "identity": {
+    "source_path": "string (required — absolute path of the CAD file at analysis time)",
+    "source_filename": "string (required — file name incl. extension)",
+    "source_hash": "string (required — 'sha256:<hex>' of the file BYTES; THE staleness key)",
+    "source_mtime": "string (ISO-8601 — informational only; hash decides staleness)",
+    "schema_version": "string (required — the version of THIS contract the artifact conforms to, e.g. '0.1.0-draft')",
+    "analyzed_at": "string (required — ISO-8601 UTC timestamp of the analysis run)",
+    "generator": "object { kind: 'deterministic' | 'ai', model: 'string (only when kind=ai, e.g. an LLM id)', recipe_version: 'string (cad-planner/recipe.md version used, when an AI pass ran)' }"
+  },
+
+  "recipe_part": {
+    "_note": "The canonical feature-level recipe — the same compact form `analyze_model(features)` returns (tree ORDER preserved — order is significant, never reorder on rebuild; `suppressed` only when true; deduped+rounded driving dims; pattern semantics incl. distinct_instances/wraps; per-sketch summary with plane {ref, offset}; equations). Numbers rounded to 6dp / 1µm, SI meters.",
+    "features": "array (required — the feature tree in EXACT tree order, analyze_model(features) recipe format)",
+    "mass_properties": "object { volume_m3, surface_area_m2, cg: {x,y,z} } (from analyze_model(mass_properties))",
+    "geometry": "object { bodies, faces, edges, vertices } (counts from analyze_model(geometry) — the topology fingerprint used by round-trip verification)",
+    "bbox": "object { dx, dy, dz } (meters — bounding box extents; a category-clustering signal)",
+    "material": "string | null",
+    "equations": "array (SW equations / global variables when present — authored intent, recoverable)"
+  },
+
+  "recipe_drawing": {
+    "_note": "Drawing-side recipe (document_type='drawing'), from analyze_drawing.",
+    "views": "array of { name, type, scale, pos, dims: [{name, value_si}] } (flat-pattern-view dims may read 0.0 — reader limitation; PDF is ground truth)",
+    "referenced_model": "string | null (path of the model the views project — the drawing↔part edge used by relationships)",
+    "sheet": "object { format, scale } (when readable)"
+  },
+
+  "parameters": {
+    "_note": "The LIFTED named-parameter table — the basis for variants, rebinding and pattern recognition ('same pattern, different parameters'). One entry per meaningful driving dimension.",
+    "entry": "{ name: 'string (FULL dimension name, e.g. D1@Boss-Extrude1@Part1.Part — the modify_dimension target)', value_si: 'number (meters or radians)', feature: 'string (owning feature name)', kind: 'linear | diameter | radius | angle | count' }"
+  },
+
+  "ir": {
+    "_note": "OPTIONAL block. Populated by the AI (or later deterministic) pass per cad-planner/recipe.md. Trust model: 'the LLM proposes, the round-trip decides' (IR-ADR-006) — only status='verified' IR may be trusted for rebuilds/patterns.",
+    "ir_schema_version": "string (required — feature-graph.schema.json version the graph targets)",
+    "graph": "object | null (the Feature Graph IR; null when the attempt failed before producing a graph)",
+    "generator": "object { kind: 'deterministic' | 'ai', model: 'string (when ai)', recipe_version: 'string' }",
+    "verification": {
+      "status": "string (required — 'verified' | 'unverified' | 'failed'). unverified = graph produced but round-trip not yet run; failed = round-trip ran and missed, or the attempt could not produce/build a graph.",
+      "method": "string (e.g. 'rebuild_from_ir + compare_parts')",
+      "verified_at": "string (ISO-8601 — when the round-trip ran)",
+      "detail": "object — on verified/failed-mismatch: { topology: {bodies,faces,edges,vertices} for original AND rebuilt, volume_delta_pct, surface_delta_pct, cg_delta_mm }; on failed-attempt: { reason: 'VOCABULARY_GAP | RESOLVER_GAP | BUILD_FAILED | MISMATCH', missing: ['feature types / selectors the vocabulary lacks — feeds P1.2 coverage'] }"
+    }
+  },
+
+  "verified_definition": "DECIDED (user, 2026-07-03 — A1 sign-off): status='verified' requires (a) topology EXACT — bodies, faces, edges, vertices counts ALL equal between original and rebuilt — AND (b) |volume delta| <= 1% AND (c) |surface-area delta| <= 1%. Anything else that built = 'failed' with detail.MISMATCH. Rationale: topology-exact matches the Aşama-2 objective standard; the 1% tolerances absorb rounding (1µm grid) without letting a wrong feature slip through.",
+
+  "relationships_v1": {
+    "_note": "V1 scope is DELIBERATELY limited (ADR-040): drawing↔part matching + category clusters. The mate-based assembly graph arrives in V2/B2 with a schema_version bump (regenerate).",
+    "drawings": "array of paths (for a part: its drawing files, matched by referenced_model or filename)",
+    "model": "string | null (for a drawing: the referenced model path)",
+    "category": "string | null (cluster label from the deterministic pass — derived from bbox/mass ratios + feature distribution, NOT from filenames)",
+    "cluster_signals": "object (the raw signals behind the category, e.g. { aspect: number, revolve_dominant: bool, sheet_metal: bool, hole_count: int })"
+  },
+
+  "example": {
+    "identity": {
+      "source_path": "C:/parts/zorluk seviyesi-1-1.SLDPRT",
+      "source_filename": "zorluk seviyesi-1-1.SLDPRT",
+      "source_hash": "sha256:9f2c…",
+      "source_mtime": "2026-06-23T09:12:00Z",
+      "schema_version": "0.1.0-draft",
+      "analyzed_at": "2026-07-03T14:00:00Z",
+      "generator": { "kind": "deterministic" }
+    },
+    "document_type": "part",
+    "recipe": {
+      "features": ["… analyze_model(features) recipe, tree order …"],
+      "mass_properties": { "volume_m3": 4.225e-6, "surface_area_m2": 3.4276e-3, "cg": { "x": 0.0, "y": 0.0165, "z": 0.004 } },
+      "geometry": { "bodies": 1, "faces": 12, "edges": 27, "vertices": 14 },
+      "bbox": { "dx": 0.026, "dy": 0.0295, "dz": 0.03 },
+      "material": null,
+      "equations": []
+    },
+    "parameters": [
+      { "name": "D1@Sketch1@zorluk seviyesi-1-1.Part", "value_si": 0.003, "feature": "Boss-Extrude1", "kind": "linear" }
+    ],
+    "ir": {
+      "ir_schema_version": "0.0.1-draft",
+      "graph": null,
+      "generator": { "kind": "ai", "model": "claude-fable-5", "recipe_version": "0.1.0" },
+      "verification": { "status": "failed", "method": "structural-validation", "verified_at": "2026-07-03T14:05:00Z", "detail": { "reason": "VOCABULARY_GAP", "missing": ["fillet (edge)", "multi-profile sketch"] } }
+    },
+    "relationships": { "drawings": ["C:/parts/zorluk seviyesi-1-1.SLDDRW"], "category": null, "cluster_signals": {} },
+    "notes": []
+  }
+}

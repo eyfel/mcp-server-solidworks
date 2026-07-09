@@ -291,6 +291,19 @@ namespace SolidworksExecution.Services
                 string typeName = modelDoc is IDrawingDoc ? "DRAWING"
                                 : modelDoc is IAssemblyDoc ? "ASSEMBLY" : "PART";
 
+                // ALREADY-OPEN gotcha (the 2026-07-05 PENDING bug, fixed 2026-07-07): OpenDoc6 on an
+                // already-open file returns its IModelDoc2 but does NOT activate it — the previously
+                // active document silently stays active, so follow-up reads (analyze/save_analysis)
+                // hit the WRONG doc. Explicitly activate what we just opened, then verify.
+                int actErr = 0;
+                _solidWorks.ActivateDoc3(modelDoc.GetTitle(), false, 1 /* swDontRebuildActiveDoc */, ref actErr);
+                var nowActive = _solidWorks.IActiveDoc2 as IModelDoc2;
+                if (nowActive == null || nowActive.GetTitle() != modelDoc.GetTitle())
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "ACTIVATE_FAILED",
+                        $"Opened '{modelDoc.GetTitle()}' but could not make it the ACTIVE document " +
+                        $"(active is '{nowActive?.GetTitle()}').");
+
                 var response = new ExecutionResponse
                 {
                     OperationId = request.OperationId,
@@ -437,6 +450,13 @@ namespace SolidworksExecution.Services
 
                 string activeSketchName = (activeSketch as IFeature)?.Name ?? "Sketch";
 
+                // Echo the NEW sketch's MEASURED plane + frame (same reader analyze uses). The
+                // caller (IR compiler) compares this against the original sketch's recorded frame
+                // and transforms 2D coordinates — the deterministic fix for the support-normal /
+                // in-plane-axis mismatch class (2-1 Sketch5). Best-effort: never fails the create.
+                object sketchPlaneEcho = null;
+                try { sketchPlaneEcho = ReadSketchPlane(activeSketch); } catch { }
+
                 var response = new ExecutionResponse
                 {
                     OperationId = request.OperationId,
@@ -452,6 +472,7 @@ namespace SolidworksExecution.Services
                         Features = new List<string>(),
                         Dimensions = new List<string>()
                     },
+                    ResultGeometry = sketchPlaneEcho,
                     Error = null
                 };
 
@@ -507,6 +528,16 @@ namespace SolidworksExecution.Services
                 // drift is visible. createdSeg = single-segment types; createdSegs = rectangle (4 lines).
                 ISketchSegment createdSeg = null;
                 object[] createdSegs = null;
+                // AddToDB for the WHOLE create (generalizes ADR-022's arc_center-only toggle): all
+                // coordinates arrive frozen-exact (analyze round-trip / IR lowering), so SW's input
+                // inference/snapping must never touch them. Found live on the 1-2 flange rebuild: a
+                // 1.59mm line (raised-face step) built fine in one document, then CreateLine returned
+                // NULL for the same coords in the next — the pixel-based snap tolerance depends on the
+                // window's zoom, so short segments nondeterministically collapse without AddToDB.
+                bool prevAddToDbAll = modelDoc.SketchManager.AddToDB;
+                modelDoc.SketchManager.AddToDB = true;
+                try
+                {
                 switch (entityType.ToLowerInvariant())
                 {
                     case "rectangle":
@@ -712,10 +743,41 @@ namespace SolidworksExecution.Services
                             "UNSUPPORTED_ENTITY_TYPE",
                             $"entity_type '{entityType}' is not supported. Supported: rectangle, circle, line, arc, arc_center, ellipse, spline, fillet, chamfer.");
                 }
+                }
+                finally
+                {
+                    modelDoc.SketchManager.AddToDB = prevAddToDbAll;
+                }
 
                 if (!created)
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "ENTITY_CREATION_FAILED", $"Failed to create sketch entity of type '{entityType}'.");
+
+                // construction=true converts the created segment(s) to construction/reference geometry
+                // (centerlines, symmetry axes, hole-position scaffolding). Closes the "analyze ⊆ create"
+                // gap: ReadSegment already REPORTS the flag, this lets a rebuild REPRODUCE it. Applied
+                // post-create because SketchManager has no construction-aware create calls; the
+                // result_geometry echo below reads the segment back AFTER the flip, so the caller sees it.
+                bool asConstruction = p?.Value<bool?>("construction") ?? false;
+                if (asConstruction)
+                {
+                    try
+                    {
+                        if (createdSeg != null) createdSeg.ConstructionGeometry = true;
+                        if (createdSegs != null)
+                            foreach (var o in createdSegs)
+                            {
+                                var s = o as ISketchSegment;
+                                if (s != null) s.ConstructionGeometry = true;
+                            }
+                    }
+                    catch (Exception ex)
+                    {
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "CONSTRUCTION_FLAG_FAILED",
+                            $"Entity created but could not be converted to construction geometry: {ex.Message}");
+                    }
+                }
 
                 string activeSketchName = (activeSketch as IFeature)?.Name ?? "Sketch";
 
@@ -921,9 +983,26 @@ namespace SolidworksExecution.Services
                 // depth (> 0) is required ONLY for a BLIND boss/cut. A through-all (through=true) ignores
                 // depth, and revolve/sweep/loft don't use it — so don't demand it there (KNOWN-LIMITATIONS #13).
                 bool throughAll = p?.Value<bool?>("through") ?? false;
-                if ((featureType == "boss" || featureType == "cut") && !throughAll && (depth == null || depth.Value <= 0))
+                // up_to_face_index >= 0 ⇒ up-to-surface end condition: the extrude/cut terminates ON that
+                // face (index from analyze_model(faces), same enumeration create_sketch(on_face) walks).
+                // Depth is ignored, like through-all.
+                int upToFaceIndex = p?.Value<int?>("up_to_face_index") ?? -1;
+                bool upToSurface = upToFaceIndex >= 0;
+                // mid_plane=true ⇒ swEndCondMidPlane: the feature extrudes SYMMETRICALLY about the
+                // sketch plane; depth = the TOTAL width (SolidWorks midplane semantics).
+                bool midPlane = p?.Value<bool?>("mid_plane") ?? false;
+                if (upToSurface && featureType != "boss" && featureType != "cut")
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                        "MISSING_PARAMETER", "depth (> 0 meters) is required for a blind boss/cut. Pass through=true for a through-all instead.");
+                        "INVALID_PARAMETER", "up_to_face_index is only valid for feature_type 'boss' or 'cut'.");
+                if (midPlane && featureType != "boss" && featureType != "cut")
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "INVALID_PARAMETER", "mid_plane is only valid for feature_type 'boss' or 'cut'.");
+                if (midPlane && (throughAll || upToSurface))
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "INVALID_PARAMETER", "mid_plane conflicts with through/up_to_face_index — pick ONE end condition.");
+                if ((featureType == "boss" || featureType == "cut") && !throughAll && !upToSurface && (depth == null || depth.Value <= 0))
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "MISSING_PARAMETER", "depth (> 0 meters) is required for a blind or mid-plane boss/cut. Pass through=true for a through-all instead.");
 
                 var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
                 if (modelDoc == null)
@@ -934,9 +1013,13 @@ namespace SolidworksExecution.Services
                 // (needed e.g. for a cut sketched on a part FACE, where "into the body" is the opposite
                 // side from a cut sketched on a boundary plane). through = through-all (depth ignored).
                 bool reverse = p?.Value<bool?>("reverse") ?? false;
-                int endCond = throughAll
-                    ? (int)swEndConditions_e.swEndCondThroughAll
-                    : (int)swEndConditions_e.swEndCondBlind;
+                int endCond = upToSurface
+                    ? (int)swEndConditions_e.swEndCondUpToSurface
+                    : midPlane
+                        ? (int)swEndConditions_e.swEndCondMidPlane
+                        : throughAll
+                            ? (int)swEndConditions_e.swEndCondThroughAll
+                            : (int)swEndConditions_e.swEndCondBlind;
                 // Through-all ignores depth; a blind boss/cut already validated depth > 0 above.
                 // Default a missing depth to 0 so the API call is safe (e.g. a REST through-cut with no depth).
                 double depthVal = depth ?? 0.0;
@@ -1096,6 +1179,10 @@ namespace SolidworksExecution.Services
                     modelDoc.ClearSelection2(true);
                     if (!string.IsNullOrEmpty(activeProfileSketchName))
                         modelDoc.Extension.SelectByID2(activeProfileSketchName, "SKETCH", 0, 0, 0, false, 0, null, 0);
+                    if (upToSurface && !SelectFaceByIndexAppend(modelDoc, upToFaceIndex, 1))
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "FACE_NOT_FOUND",
+                            $"up_to_face_index {upToFaceIndex} could not be selected. Call analyze_model(faces) for valid indices.");
 
                     // Dir (3rd arg) controls cut direction. Default true = INTO the body (opposite the
                     // sketch plane's outward normal) — correct for a cut on a boundary plane. For a cut
@@ -1124,6 +1211,10 @@ namespace SolidworksExecution.Services
                         modelDoc.ClearSelection2(true);
                         if (!string.IsNullOrEmpty(activeProfileSketchName))
                             modelDoc.Extension.SelectByID2(activeProfileSketchName, "SKETCH", 0, 0, 0, false, 0, null, 0);
+                        if (upToSurface && !SelectFaceByIndexAppend(modelDoc, upToFaceIndex, 1))
+                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                                "FACE_NOT_FOUND",
+                                $"up_to_face_index {upToFaceIndex} could not be re-selected for the flipped-direction retry.");
                         feature = FeatureCutOnce(featureMgr, !dir, endCond, depthVal, normalCut);
                         ExecLog.Write($"cut: flipped-direction retry (sheetMetal={isSheetMetal}) → feature={(feature != null)}");
                     }
@@ -1142,6 +1233,10 @@ namespace SolidworksExecution.Services
                     modelDoc.ClearSelection2(true);
                     if (!string.IsNullOrEmpty(activeProfileSketchName))
                         modelDoc.Extension.SelectByID2(activeProfileSketchName, "SKETCH", 0, 0, 0, false, 0, null, 0);
+                    if (upToSurface && !SelectFaceByIndexAppend(modelDoc, upToFaceIndex, 1))
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "FACE_NOT_FOUND",
+                            $"up_to_face_index {upToFaceIndex} could not be selected. Call analyze_model(faces) for valid indices.");
 
                     feature = featureMgr.FeatureExtrusion3(
                         true, false, reverse,
@@ -1192,6 +1287,132 @@ namespace SolidworksExecution.Services
                 return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                     "UNEXPECTED_ERROR", ex.Message);
             }
+        }
+
+        public ExecutionResponse CreateRib(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                double? thickness = p?.Value<double?>("thickness");
+                if (thickness == null || thickness.Value <= 0)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "MISSING_PARAMETER", "thickness (> 0 meters) is required.");
+                bool twoSided = p?.Value<bool?>("two_sided") ?? true;
+                bool reverseThicknessDir = p?.Value<bool?>("reverse_thickness_dir") ?? false;
+                bool reverseMaterialDir = p?.Value<bool?>("reverse_material_dir") ?? false;
+                bool isNormToSketch = p?.Value<bool?>("is_norm_to_sketch") ?? false;
+
+                var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                if (modelDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+
+                // The ACTIVE sketch is the rib profile (an OPEN sketch — typically a single line;
+                // SolidWorks extends it to the surrounding walls). Same consume-the-active-sketch
+                // contract as extrude_feature.
+                var activeSketchFeat = modelDoc.SketchManager.ActiveSketch as IFeature;
+                if (activeSketchFeat == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "SKETCH_NOT_ACTIVE", "No active sketch — the rib profile sketch must be active. Call create_sketch + add_sketch_entity first.");
+                string profileName = activeSketchFeat.Name;
+
+                // Snapshot the last feature so the void-returning InsertRib can be verified from
+                // the tree afterwards (no return value to check — unlike FeatureExtrusion3).
+                string lastBefore = LastFeatureName(modelDoc);
+
+                modelDoc.SketchManager.InsertSketch(true);  // exit the sketch
+                modelDoc.ClearSelection2(true);
+                modelDoc.Extension.SelectByID2(profileName, "SKETCH", 0, 0, 0, false, 0, null, 0);
+
+                // InsertRib(Is2Sided, ReverseThicknessDir, Thickness, ReferenceEdgeIndex,
+                //           ReverseMaterialDir, IsDrafted, DraftOutward, DraftAngle,
+                //           IsNormToSketch, IsDraftedFromWall) — signature + parameter semantics
+                // verified against the LOCAL sldworksapi.chm + interop reflection (ADR-035).
+                // Draft deliberately not exposed in v1 (2-1's rib is undrafted; grow on demand).
+                modelDoc.FeatureManager.InsertRib(
+                    twoSided, reverseThicknessDir, thickness.Value, 0,
+                    reverseMaterialDir, false, false, 0.0,
+                    isNormToSketch, false);
+                modelDoc.EditRebuild3();
+
+                string lastAfter = LastFeatureName(modelDoc);
+                if (lastAfter == lastBefore)
+                {
+                    // Most likely the WRONG material direction (nothing to fill on that side) —
+                    // retry flipped, mirroring the cut path's flipped-direction recovery. The
+                    // caller's explicit reverse_material_dir is still tried FIRST.
+                    modelDoc.ClearSelection2(true);
+                    modelDoc.Extension.SelectByID2(profileName, "SKETCH", 0, 0, 0, false, 0, null, 0);
+                    modelDoc.FeatureManager.InsertRib(
+                        twoSided, reverseThicknessDir, thickness.Value, 0,
+                        !reverseMaterialDir, false, false, 0.0,
+                        isNormToSketch, false);
+                    modelDoc.EditRebuild3();
+                    lastAfter = LastFeatureName(modelDoc);
+                    ExecLog.Write($"create_rib: flipped-material retry → created={(lastAfter != lastBefore)}");
+                }
+                if (lastAfter == lastBefore)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "RIB_FAILED",
+                        "InsertRib created no feature (tried both material directions). Check the profile sketch is open geometry whose extensions hit existing walls, and thickness is sensible.");
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "PART",
+                        ActiveSketch = null,
+                        Features = new List<string> { lastAfter },
+                        Dimensions = new List<string>()
+                    },
+                    ResultGeometry = BuildBodySummary(modelDoc),
+                    Error = null
+                };
+
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
+        // Name of the LAST feature in the tree (creation-order detection for void-returning
+        // feature APIs like InsertRib). Null-safe.
+        private static string LastFeatureName(IModelDoc2 modelDoc)
+        {
+            try
+            {
+                object[] all = modelDoc.FeatureManager.GetFeatures(true) as object[];
+                if (all == null || all.Length == 0) return null;
+                return (all[all.Length - 1] as IFeature)?.Name;
+            }
+            catch { return null; }
         }
 
         public ExecutionResponse VerifyState(ToolRequest request)
@@ -2981,17 +3202,44 @@ namespace SolidworksExecution.Services
                 }
                 else // chamfer
                 {
-                    // Was InsertFeatureChamfer(1, 1, dist, 0, …): Options=1 is actually
-                    // swFeatureChamferFlipDirection, and ChamferType=1 (AngleDistance) was given Angle=0 →
-                    // degenerate → null on SW2026. Use a proper 45° distance-angle chamfer (equal setback).
-                    double chamferAngle = 45.0 * Math.PI / 180.0;
-                    feature = modelDoc.FeatureManager.InsertFeatureChamfer(
-                        0,                                               // Options: none
-                        (int)swChamferType_e.swChamferAngleDistance,     // distance + angle
-                        radiusOrDist.Value,                              // Width (setback distance)
-                        chamferAngle,                                    // 45°
-                        0.0, 0.0, 0.0, 0.0) as IFeature;
-                    ExecLog.Write($"add_edge_feature chamfer: dist={radiusOrDist.Value} angle=45 -> {(feature == null ? "NULL" : feature.Name)}");
+                    // Two chamfer modes (grown for level-2-2: Chamfer1 dist-angle @45°, Chamfer2 dist-dist 3×5).
+                    // InsertFeatureChamfer(Options, ChamferType, Width, Angle, OtherDist, VC1, VC2, VC3):
+                    //   Width = D1 (first-face setback), Angle = radians (AngleDistance), OtherDist = D2
+                    //   (second-face setback, DistanceDistance). Enum values are compile-time constants,
+                    //   inlined by the C# compiler -> no runtime swconst load (ADR-018):
+                    //   swChamferAngleDistance=1, swChamferDistanceDistance=2, swFeatureChamferFlipDirection=1.
+                    // A DistanceDistance chamfer is directional (which face gets D1 vs D2) — a wrong side is
+                    // corrected by chamfer_flip (the FlipDirection option), same idea as rib/extrude reverse.
+                    string chamferType = (p?.Value<string>("chamfer_type") ?? "distance_angle").ToLowerInvariant();
+                    bool chamferFlip = p?.Value<bool?>("chamfer_flip") ?? false;
+                    int chamferOpts = chamferFlip ? (int)swFeatureChamferOption_e.swFeatureChamferFlipDirection : 0;
+                    if (chamferType == "distance_distance")
+                    {
+                        double? dist2 = p?.Value<double?>("distance2");
+                        if (dist2 == null || dist2.Value <= 0)
+                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                                "MISSING_PARAMETER", "chamfer_type 'distance_distance' requires distance2 > 0 (the second-face setback, meters).");
+                        feature = modelDoc.FeatureManager.InsertFeatureChamfer(
+                            chamferOpts,
+                            (int)swChamferType_e.swChamferDistanceDistance,
+                            radiusOrDist.Value,                          // D1 (Width — first-face setback)
+                            0.0,                                         // Angle unused
+                            dist2.Value,                                 // D2 (OtherDist — second-face setback)
+                            0.0, 0.0, 0.0) as IFeature;
+                        ExecLog.Write($"add_edge_feature chamfer(dist-dist): d1={radiusOrDist.Value} d2={dist2.Value} flip={chamferFlip} -> {(feature == null ? "NULL" : feature.Name)}");
+                    }
+                    else // distance_angle (default; angle in DEGREES at the tool boundary, default 45)
+                    {
+                        double angleDeg = p?.Value<double?>("angle") ?? 45.0;
+                        double chamferAngle = angleDeg * Math.PI / 180.0;
+                        feature = modelDoc.FeatureManager.InsertFeatureChamfer(
+                            chamferOpts,
+                            (int)swChamferType_e.swChamferAngleDistance,
+                            radiusOrDist.Value,                          // Width (setback distance, D1)
+                            chamferAngle,                                // angle in radians
+                            0.0, 0.0, 0.0, 0.0) as IFeature;
+                        ExecLog.Write($"add_edge_feature chamfer(dist-angle): dist={radiusOrDist.Value} angle={angleDeg} flip={chamferFlip} -> {(feature == null ? "NULL" : feature.Name)}");
+                    }
                 }
 
                 if (feature == null)
@@ -3298,11 +3546,35 @@ namespace SolidworksExecution.Services
                     if (pl != null) sObj["plane"] = pl;
                     results.Add(sObj.ToString(Newtonsoft.Json.Formatting.None));
                 }
+                else if (analysisType == "feature_map")
+                {
+                    // Per-feature geometry ATTRIBUTION via the rollback bar: walk the tree base→end and
+                    // for each solid-affecting feature diff the topology against the previous stop — all
+                    // INSIDE this call (one compact JSON out, no per-stop raw dumps to the host).
+                    // consumed_edges = the deterministic fillet/chamfer edge anchors (they reference the
+                    // PRE-feature geometry, exactly IR-ADR-008's provenance rule). Non-destructive: the
+                    // bar is restored to the END in finally; nothing is saved; no state_version bump.
+                    var partDoc = modelDoc as IPartDoc;
+                    if (partDoc == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "WRONG_DOCUMENT_TYPE",
+                            "analysis_type='feature_map' requires a part document.");
+
+                    string fromFeature = p?.Value<string>("from_feature");
+                    string toFeature = p?.Value<string>("to_feature");
+                    string errCode, errMsg;
+                    JObject mapResult = BuildFeatureMap(modelDoc, partDoc, fromFeature, toFeature,
+                        out errCode, out errMsg);
+                    if (mapResult == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            errCode ?? "FEATURE_MAP_FAILED", errMsg ?? "feature_map failed.");
+                    results.Add(mapResult.ToString(Newtonsoft.Json.Formatting.None));
+                }
                 else
                 {
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "UNSUPPORTED_ANALYSIS_TYPE",
-                        $"analysis_type '{analysisType}' is not supported. Supported: mass_properties, geometry, edges, faces, features, sketch.");
+                        $"analysis_type '{analysisType}' is not supported. Supported: mass_properties, geometry, edges, faces, features, sketch, feature_map.");
                 }
 
                 // AnalyzeModel does NOT increment state_version — read-only, same pattern as VerifyState
@@ -3692,9 +3964,15 @@ namespace SolidworksExecution.Services
                         return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                             "PLANE_NOT_FOUND", $"Plane '{refPlaneName}' not found.");
 
+                    // InsertRefPlane's Distance is UNSIGNED — a negative value is silently NOT
+                    // applied (found live on 2-1: a -0.007 'offset plane' landed ON its parent at
+                    // y=0; the earlier 1-2 'proof' was masked by through-all symmetry). The minus
+                    // side needs the OptionFlip constraint bit + the absolute distance.
+                    int planeConstraint = (int)swRefPlaneReferenceConstraints_e.swRefPlaneReferenceConstraint_Distance;
+                    if (offset < 0)
+                        planeConstraint |= (int)swRefPlaneReferenceConstraints_e.swRefPlaneReferenceConstraint_OptionFlip;
                     feature = featureMgr.InsertRefPlane(
-                        (int)swRefPlaneReferenceConstraints_e.swRefPlaneReferenceConstraint_Distance,
-                        offset, 0, 0, 0, 0) as IFeature;
+                        planeConstraint, Math.Abs(offset), 0, 0, 0, 0) as IFeature;
                 }
                 else if (geoType == "axis")
                 {
@@ -3766,6 +4044,23 @@ namespace SolidworksExecution.Services
                         "REFERENCE_GEOMETRY_FAILED",
                         $"Failed to create reference {geoType}. Verify the referenced entities are valid and the document has no active sketch.");
 
+                // Hide the created plane/axis immediately (user rule 2026-07-05): reference geometry
+                // is scaffolding for downstream features (offset sketches, pattern axes) and must not
+                // clutter the modeling view. Selection by NAME still works on hidden ref geometry
+                // (SelectByID2 / SelectPlaneFlexible), so downstream consumers are unaffected.
+                // Best-effort: a hide failure never fails the create.
+                if (geoType == "plane" || geoType == "axis")
+                {
+                    try
+                    {
+                        modelDoc.ClearSelection2(true);
+                        if (feature.Select2(false, 0))
+                            modelDoc.BlankRefGeom();
+                        modelDoc.ClearSelection2(true);
+                    }
+                    catch { }
+                }
+
                 var response = new ExecutionResponse
                 {
                     OperationId = request.OperationId,
@@ -3821,11 +4116,11 @@ namespace SolidworksExecution.Services
                 string patternType = (p?.Value<string>("pattern_type") ?? "").ToLowerInvariant();
                 string featureName = p?.Value<string>("feature_name");
 
-                if (patternType != "linear" && patternType != "circular")
+                if (patternType != "linear" && patternType != "circular" && patternType != "mirror")
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "MISSING_PARAMETER",
-                        "pattern_type is required: 'linear' or 'circular'.");
-                if (string.IsNullOrEmpty(featureName))
+                        "pattern_type is required: 'linear', 'circular', or 'mirror'.");
+                if (string.IsNullOrEmpty(featureName) && patternType != "mirror")
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "MISSING_PARAMETER",
                         "feature_name is required (name of the feature to pattern, e.g. 'Boss-Extrude1').");
@@ -3879,6 +4174,90 @@ namespace SolidworksExecution.Services
                         false, false,
                         null, null,
                         false, false) as IFeature; // geometryPattern=false (SW default). NOTE: disjoint instances warn & are skipped — see KNOWN-LIMITATIONS.md; geometryPattern=true returns null here, not a safe blanket default.
+                }
+                else if (patternType == "mirror")
+                {
+                    // Mirror pattern (grown for 4-1's Mirror1): mirrors FEATURES about a plane.
+                    // InsertMirrorFeature2 selection marks read from the local CHM (ADR-035):
+                    // features to mirror = mark 1, mirror plane / planar face = mark 2.
+                    string planeName = p?.Value<string>("plane");
+                    if (string.IsNullOrEmpty(planeName)) planeName = "Right Plane";
+                    bool geometryPattern = p?.Value<bool?>("geometry_pattern") ?? false;
+
+                    var mirrorNames = new List<string>();
+                    string featuresJson = p?.Value<string>("features_json");
+                    if (!string.IsNullOrEmpty(featuresJson) && featuresJson != "[]")
+                    {
+                        try
+                        {
+                            var arr = JArray.Parse(featuresJson);
+                            foreach (var t in arr) mirrorNames.Add(t.ToString());
+                        }
+                        catch (Exception ex)
+                        {
+                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                                "INVALID_PARAMETER",
+                                $"features_json must be a JSON array of feature tree names: {ex.Message}");
+                        }
+                    }
+                    else if (!string.IsNullOrEmpty(featureName))
+                        mirrorNames.Add(featureName);
+                    if (mirrorNames.Count == 0)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "MISSING_PARAMETER",
+                            "mirror requires features_json (JSON array of feature tree names, e.g. '[\"Edge-Flange1\",\"Sketched Bend2\"]') or feature_name.");
+
+                    // Sheet-metal parts keep a (suppressed) Flat-Pattern as the LAST feature with the
+                    // rollback bar AFTER it; the generic InsertMirrorFeature2 would insert after
+                    // Flat-Pattern (illegal → null; live-caught on the scratch test — the sheet-metal-
+                    // aware bend API handles this itself). Same fix as the sheet-metal cut (ADR-026):
+                    // roll the bar before Flat-Pattern, insert, restore.
+                    IFeature mirrorFlatPat = FindFlatPattern(modelDoc);
+                    bool mirrorRolled = false;
+                    if (mirrorFlatPat != null)
+                    {
+                        try
+                        {
+                            mirrorRolled = modelDoc.FeatureManager.EditRollback(
+                                (int)swMoveRollbackBarTo_e.swMoveRollbackBarToBeforeFeature, mirrorFlatPat.Name);
+                        }
+                        catch { mirrorRolled = false; }
+                    }
+                    try
+                    {
+                        modelDoc.ClearSelection2(true);
+                        foreach (var nm in mirrorNames)
+                        {
+                            bool sel = modelDoc.Extension.SelectByID2(nm, "BODYFEATURE", 0, 0, 0, true, 1, null, 0);
+                            if (!sel)
+                            {
+                                // Fallback for feature types BODYFEATURE won't match: the same tree walk
+                                // analyze uses + IFeature.Select2 with the mark.
+                                var mf = FindFeatureByName(modelDoc, nm, null);
+                                sel = mf != null && mf.Select2(true, 1);
+                            }
+                            if (!sel)
+                                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                                    "FEATURE_NOT_FOUND",
+                                    $"Feature '{nm}' not found for mirror. Names must match the feature tree exactly.");
+                        }
+
+                        if (!SelectPlaneFlexible(modelDoc, planeName, true, 2))
+                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                                "PLANE_NOT_FOUND",
+                                $"Mirror plane '{planeName}' not found. Use a default plane name or a created reference plane's name.");
+
+                        feature = featureMgr.InsertMirrorFeature2(false, geometryPattern, false, false, 0) as IFeature;
+                        ExecLog.Write($"mirror: features=[{string.Join(",", mirrorNames)}] plane={planeName} rolled={mirrorRolled} -> {(feature == null ? "NULL" : feature.Name)}");
+                    }
+                    finally
+                    {
+                        if (mirrorRolled)
+                        {
+                            try { modelDoc.FeatureManager.EditRollback((int)swMoveRollbackBarTo_e.swMoveRollbackBarToEnd, ""); }
+                            catch { }
+                        }
+                    }
                 }
                 else // circular
                 {
@@ -4066,10 +4445,12 @@ namespace SolidworksExecution.Services
                 var p = request.Params as JObject;
                 string featureType = (p?.Value<string>("feature_type") ?? "").ToLowerInvariant();
 
-                if (featureType != "base_flange" && featureType != "edge_flange" && featureType != "flat_pattern")
+                if (featureType != "base_flange" && featureType != "edge_flange" && featureType != "flat_pattern"
+                    && featureType != "sketched_bend" && featureType != "edge_flange_sketch"
+                    && featureType != "edge_flange_finish")
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "MISSING_PARAMETER",
-                        "feature_type is required: 'base_flange', 'edge_flange', or 'flat_pattern'.");
+                        "feature_type is required: 'base_flange', 'edge_flange', 'edge_flange_sketch', 'edge_flange_finish', 'flat_pattern', or 'sketched_bend'.");
 
                 var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
                 if (modelDoc == null)
@@ -4116,7 +4497,23 @@ namespace SolidworksExecution.Services
 
                     bfData.OverrideThickness = true;
                     bfData.Thickness = thickness;
-                    bfData.ReverseThickness = false;
+                    // Thickness DIRECTION matters for reproduction: a wrong side puts every downstream
+                    // bend-sketch plane off the sheet — and the flags also define the intrinsic sheet
+                    // orientation bend directions fold against, so REPRODUCE THE ORIGINAL'S OWN FLAGS
+                    // (the base_flange reader reports them) rather than deriving from face positions
+                    // alone (4-1's symmetric blank was B-rep-identical to a reversed t/2 one, but bends
+                    // folded mirrored). Empirically (probe 2026-07-07): ReverseThickness alone had NO
+                    // effect on a CLOSED profile — the blank is an extrusion there and ReverseDirection
+                    // flips its side; set both so open profiles follow too.
+                    bool revThick = p?.Value<bool?>("reverse_thickness") ?? false;
+                    bfData.ReverseThickness = revThick;
+                    bfData.ReverseDirection = revThick;
+                    // Symmetric = material grows BOTH ways off the sketch plane (±t/2), like a mid-plane
+                    // extrude. 4-1's original blank is symmetric (sheet z ∈ [−t/2, +t/2]) with NO reverse
+                    // flags — and the intrinsic sheet orientation those flags define is what downstream
+                    // bend directions are measured against, so reproduce the ORIGINAL's exact config.
+                    if (p?.Value<bool?>("symmetric_thickness") == true)
+                        bfData.SymmetricThickness = true;
                     bfData.OverrideRadius = true;
                     bfData.BendRadius = bendRadius;
                     bfData.OverrideKFactor = true;
@@ -4206,6 +4603,235 @@ namespace SolidworksExecution.Services
                         }
 
                         // Commit the geometry so analyze_model/verify_state read the rebuilt body.
+                        modelDoc.EditRebuild3();
+                    }
+                }
+                else if (featureType == "edge_flange_sketch")
+                {
+                    // STEP 1 of the CUSTOM-PROFILE edge flange (SW's documented flow: generate the
+                    // edge-linked profile sketch, EDIT it, create the flange from it — an arbitrary
+                    // user sketch is NOT accepted by the flange API). Selects the attach edge, calls
+                    // InsertSketchForEdgeFlange, optionally CLEARS the generated default profile, and
+                    // leaves the sketch ACTIVE, echoing its MEASURED frame exactly like create_sketch:
+                    // the generated sketch's frame is unpredictable, so the caller (IR compiler)
+                    // MUST transform the original profile's 2D coordinates into it (IR-ADR-010).
+                    double? esx = p?.Value<double?>("ex");
+                    double? esy = p?.Value<double?>("ey");
+                    double? esz = p?.Value<double?>("ez");
+                    double esAngleDeg = p?.Value<double?>("angle") ?? 90.0;
+                    bool esFlip = p?.Value<bool?>("flip") ?? false;
+                    bool esClear = p?.Value<bool?>("clear_profile") ?? true;
+                    var esEdge = SelectFlangeEdge(modelDoc, p, esx, esy, esz, out string esEdgeErr);
+                    if (esEdge == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "EDGE_NOT_FOUND", esEdgeErr);
+
+                    var genSketch = modelDoc.InsertSketchForEdgeFlange(esEdge, esAngleDeg * Math.PI / 180.0, esFlip) as IFeature;
+                    var esActive = modelDoc.SketchManager.ActiveSketch;
+                    ExecLog.Write($"edge_flange_sketch: InsertSketchForEdgeFlange -> {(genSketch == null ? "NULL" : genSketch.Name)} flip={esFlip} active={(esActive != null)}");
+                    if (genSketch == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "SHEET_METAL_FAILED",
+                            "InsertSketchForEdgeFlange returned null. Verify the edge is a straight sheet-metal edge (a LONG boundary edge of a sheet face, not a thickness edge).");
+                    if (esActive == null)
+                    {
+                        // InsertSketchForEdgeFlange creates the sketch but (live-proven 2026-07-07)
+                        // does NOT leave it in edit mode — open it explicitly so the caller can draw.
+                        modelDoc.ClearSelection2(true);
+                        modelDoc.Extension.SelectByID2(genSketch.Name, "SKETCH", 0, 0, 0, false, 0, null, 0);
+                        modelDoc.EditSketch();
+                        esActive = modelDoc.SketchManager.ActiveSketch;
+                        ExecLog.Write($"edge_flange_sketch: EditSketch({genSketch.Name}) -> active={(esActive != null)}");
+                    }
+                    if (esActive == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "SHEET_METAL_FAILED",
+                            $"Generated profile sketch '{genSketch.Name}' could not be opened for edit.");
+
+                    if (esClear)
+                    {
+                        // Wipe the generated default profile (a rectangle spanning the edge) so the
+                        // caller can draw the ORIGINAL's custom profile via add_sketch_entity.
+                        var esSegs = esActive.GetSketchSegments() as object[];
+                        modelDoc.ClearSelection2(true);
+                        int marked = 0;
+                        if (esSegs != null)
+                            foreach (var o in esSegs)
+                            {
+                                var ss = o as ISketchSegment;
+                                if (ss != null && ss.Select4(true, null)) marked++;
+                            }
+                        if (marked > 0) modelDoc.EditDelete();
+                        ExecLog.Write($"edge_flange_sketch: cleared {marked} generated segments");
+                    }
+
+                    object esFrameEcho = null;
+                    try { esFrameEcho = ReadSketchPlane(esActive); } catch { }
+                    var esResp = new ExecutionResponse
+                    {
+                        OperationId = request.OperationId,
+                        Status = "COMPLETED",
+                        Verified = true,
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        CadState = new CadState
+                        {
+                            StateVersion = _guard.GetCurrentStateVersion() + 1,
+                            ActiveDocument = modelDoc.GetTitle(),
+                            DocumentType = "PART",
+                            ActiveSketch = genSketch.Name,
+                            Features = new List<string>(),
+                            Dimensions = new List<string>()
+                        },
+                        ResultGeometry = esFrameEcho,
+                        Error = null
+                    };
+                    _guard.RegisterCompleted(request.OperationId, esResp);
+                    return esResp;
+                }
+                else if (featureType == "edge_flange_finish")
+                {
+                    // STEP 2: the ACTIVE (edited) profile sketch + the SAME edge -> InsertSheetMetalEdgeFlange2.
+                    // The custom profile itself defines the flange outline and length, so unlike the
+                    // default-profile path there is NO OffsetDistance override afterwards. Radius and
+                    // position replay the ORIGINAL's values (the analyze_model(features) edge_flange block).
+                    double? efx = p?.Value<double?>("ex");
+                    double? efy = p?.Value<double?>("ey");
+                    double? efz = p?.Value<double?>("ez");
+                    double efAngleDeg = p?.Value<double?>("angle") ?? 90.0;
+                    bool efUseDefaultRadius = p?.Value<bool?>("use_default_radius") ?? false;
+                    double efRadius = p?.Value<double?>("bend_radius") ?? 0.001;
+                    string efPosStr = (p?.Value<string>("bend_position") ?? "material_inside").ToLowerInvariant();
+                    // swFlangePositionTypes_e (same encoding the readers report): 1=material_inside,
+                    // 2=material_outside, 3=bend_outside, 4=centerline, 5=bend_sharp.
+                    int efPos;
+                    switch (efPosStr)
+                    {
+                        case "material_outside": efPos = 2; break;
+                        case "bend_outside": efPos = 3; break;
+                        case "centerline": efPos = 4; break;
+                        case "bend_sharp": efPos = 5; break;
+                        default: efPos = 1; break; // material_inside
+                    }
+                    var profFeat = modelDoc.SketchManager.ActiveSketch as IFeature;
+                    if (profFeat == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "SKETCH_NOT_ACTIVE",
+                            "edge_flange_finish requires the generated profile sketch to be ACTIVE (run edge_flange_sketch, then draw the profile).");
+                    modelDoc.SketchManager.InsertSketch(true);
+
+                    var efEdge2 = SelectFlangeEdge(modelDoc, p, efx, efy, efz, out string efEdgeErr);
+                    if (efEdge2 == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "EDGE_NOT_FOUND", efEdgeErr);
+
+                    int efOpts = (int)(swInsertEdgeFlangeOptions_e.swInsertEdgeFlangeUseReliefRatio
+                                     | swInsertEdgeFlangeOptions_e.swInsertEdgeFlangeUseDefaultRelief);
+                    if (efUseDefaultRadius)
+                        efOpts |= (int)swInsertEdgeFlangeOptions_e.swInsertEdgeFlangeUseDefaultRadius;
+
+                    feature = featureMgr.InsertSheetMetalEdgeFlange2(
+                        new Edge[] { efEdge2 }, new Feature[] { (Feature)profFeat },
+                        efOpts, efAngleDeg * Math.PI / 180.0, efRadius, efPos, 0.0,
+                        (int)swSheetMetalReliefTypes_e.swSheetMetalReliefRectangular,
+                        0.5, 0.001, 0.001, 0, null) as IFeature;
+                    ExecLog.Write($"edge_flange_finish: InsertSheetMetalEdgeFlange2 sketch={profFeat.Name} pos={efPos} defRad={efUseDefaultRadius} -> {(feature == null ? "NULL" : feature.Name)}");
+                    if (feature != null)
+                        modelDoc.EditRebuild3();
+                }
+                else if (featureType == "sketched_bend")
+                {
+                    // Sketched bend (SM3dBend): bends the sheet about the bend LINE(S) in the ACTIVE
+                    // sketch; the FIXED side is the pre-selected face (grown for 4-1). Signature +
+                    // BendPos encoding (0=centerline 1=material-inside 2=material-outside 3=bend-outside)
+                    // read from the local sldworksapi.chm (ADR-035 discipline); NOTE this encoding
+                    // DIFFERS from ISketchedBendFeatureData.PositionType (swFlangePositionTypes_e,
+                    // where 4=centerline) — the reader maps both to the same canonical string.
+                    double sbAngleDeg = p?.Value<double?>("angle") ?? 90.0;
+                    double sbAngleRad = sbAngleDeg * Math.PI / 180.0;
+                    bool useDefaultRadius = p?.Value<bool?>("use_default_radius") ?? false;
+                    double sbRadius = p?.Value<double?>("bend_radius") ?? 0.001;
+                    bool sbFlip = p?.Value<bool?>("flip") ?? false;
+                    string posStr = (p?.Value<string>("bend_position") ?? "centerline").ToLowerInvariant();
+                    short bendPos;
+                    switch (posStr)
+                    {
+                        case "material_inside": bendPos = 1; break;
+                        case "material_outside": bendPos = 2; break;
+                        case "bend_outside": bendPos = 3; break;
+                        default: bendPos = 0; break; // centerline
+                    }
+
+                    var bendSketchFeat = modelDoc.SketchManager.ActiveSketch as IFeature;
+                    if (bendSketchFeat == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "SKETCH_NOT_ACTIVE",
+                            "sketched_bend requires the bend-line sketch to be ACTIVE (create_sketch on the sheet face + add_sketch_entity line first).");
+
+                    int? fixedFaceIndex = p?.Value<int?>("fixed_face_index");
+                    double? fx = p?.Value<double?>("fixed_x");
+                    double? fy = p?.Value<double?>("fixed_y");
+                    double? fz = p?.Value<double?>("fixed_z");
+
+                    // Attempt 0: fixed face selected while the bend sketch is still ACTIVE (the UI flow —
+                    // the command is invoked from inside the sketch). Attempt 1: exit the sketch,
+                    // re-select the bend sketch by name + the face (append) — the recorded-macro flow.
+                    for (int attempt = 0; attempt < 2 && feature == null; attempt++)
+                    {
+                        bool append = attempt == 1;
+                        if (attempt == 1)
+                        {
+                            if (modelDoc.SketchManager.ActiveSketch != null)
+                                modelDoc.SketchManager.InsertSketch(true);
+                            modelDoc.ClearSelection2(true);
+                            modelDoc.Extension.SelectByID2(bendSketchFeat.Name, "SKETCH", 0, 0, 0, false, 0, null, 0);
+                        }
+                        bool faceSel = false;
+                        if (fixedFaceIndex != null && fixedFaceIndex.Value >= 0)
+                        {
+                            var allFaces = FlattenFaces(modelDoc as IPartDoc);
+                            if (fixedFaceIndex.Value < allFaces.Count)
+                                faceSel = (allFaces[fixedFaceIndex.Value] as IEntity).Select4(append, null);
+                        }
+                        else
+                        {
+                            faceSel = modelDoc.Extension.SelectByID2("", "FACE",
+                                fx ?? 0.0, fy ?? 0.0, fz ?? 0.0, append, 0, null, 0);
+                        }
+                        if (!faceSel)
+                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                                "FACE_NOT_FOUND",
+                                "sketched_bend could not select the FIXED face — pass fixed_face_index (from analyze_model(faces)) or fixed_x/y/z, a point ON the face that must stay put.");
+                        feature = featureMgr.InsertSheetMetal3dBend(sbAngleRad, useDefaultRadius, sbRadius, sbFlip, bendPos, null) as IFeature;
+                        ExecLog.Write($"sketched_bend: attempt={attempt} fixedFace={(fixedFaceIndex != null ? fixedFaceIndex.ToString() : "coord")} pos={bendPos} -> {(feature == null ? "NULL" : feature.Name)}");
+                    }
+                    if (feature != null)
+                    {
+                        // InsertSheetMetal3dBend IGNORES its Flip argument (proven live on 4-1 Bend1:
+                        // flip true/false produced IDENTICAL folds, z-mirrored from the original, and
+                        // the created feature read back ReverseDirection=false either way). Enforce the
+                        // requested direction post-insert through the feature data + ModifyDefinition.
+                        var bdef = feature.GetDefinition() as ISketchedBendFeatureData;
+                        if (bdef != null && bdef.ReverseDirection != sbFlip)
+                        {
+                            bool bacc = false;
+                            try { bacc = bdef.AccessSelections(modelDoc, null); } catch { }
+                            bool modified = false;
+                            try
+                            {
+                                bdef.ReverseDirection = sbFlip;
+                                modified = feature.ModifyDefinition(bdef, modelDoc, null);
+                                ExecLog.Write($"sketched_bend: post-insert flip enforce -> {sbFlip} (modify={modified})");
+                            }
+                            finally
+                            {
+                                // ModifyDefinition consumes the selection access; release only if it didn't run.
+                                if (bacc && !modified) { try { bdef.ReleaseSelectionAccess(); } catch { } }
+                            }
+                            if (!modified)
+                                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                                    "BEND_FLIP_FAILED",
+                                    "sketched_bend created the bend but could not enforce the requested flip (ModifyDefinition failed).");
+                        }
                         modelDoc.EditRebuild3();
                     }
                 }
@@ -4584,7 +5210,10 @@ namespace SolidworksExecution.Services
             // the feature list (8 of the gear's 25 "features" were these). Equations have their own
             // section (ReadEquations), so the EqnFolder entry is redundant too.
             "SelectionSetFolder", "NotesAreaFtrFolder", "SurfaceBodyFolder", "SolidBodyFolder",
-            "EnvFolder", "InkMarkupFolder", "EqnFolder"
+            "EnvFolder", "InkMarkupFolder", "EqnFolder",
+            // Sheet-metal cut-list folder ("Sheet<1>" under Solid Bodies) — a UI container, no design
+            // intent (it also broke feature_map's baseline: rolling before it no-ops, 4-1 live).
+            "CutListFolder"
         };
 
         private JObject BuildFeatureTreeAnalysis(IModelDoc2 modelDoc)
@@ -4673,12 +5302,256 @@ namespace SolidworksExecution.Services
 
             if (type == "CirPattern" || type == "LPattern")
                 TryReadPattern(feat, type, fj);
+            else if (type == "SM3dBend")
+                TryReadSketchedBend(feat, modelDoc, fj);
+            else if (type == "SMBaseFlange")
+                TryReadBaseFlange(feat, fj);
+            else if (type == "EdgeFlange")
+                TryReadEdgeFlange(feat, modelDoc, fj);
+            else if (type == "MirrorPattern")
+                TryReadMirror(feat, modelDoc, fj);
 
             // Extrude/cut end-condition + depth (blind) + reverse flag, so a rebuild knows HOW it was made.
             var ex = ReadExtrude(feat);
             if (ex != null) fj["extrude"] = ex;
 
             return fj;
+        }
+
+        // Attach-edge selection for the edge-flange ops. Priority: edge_index (robust — matches
+        // analyze_model(edges)'s stable `i`, the same FlattenEdges enumeration; bypasses the
+        // coordinate-pick fragility, KNOWN-LIMITATIONS #6 — live on 4-1: EF2's slanted attach edge
+        // existed EXACTLY at the pick point yet SelectByID2 missed it) → ex/ey/ez coordinate pick.
+        private Edge SelectFlangeEdge(IModelDoc2 modelDoc, JObject p, double? ex, double? ey, double? ez, out string error)
+        {
+            error = null;
+            int? edgeIndex = p?.Value<int?>("edge_index");
+            modelDoc.ClearSelection2(true);
+            if (edgeIndex != null && edgeIndex.Value >= 0)
+            {
+                var all = FlattenEdges(modelDoc as IPartDoc);
+                if (edgeIndex.Value >= all.Count)
+                {
+                    error = $"edge_index {edgeIndex.Value} out of range (part has {all.Count} edges).";
+                    return null;
+                }
+                var ent = all[edgeIndex.Value] as IEntity;
+                if (ent == null || !ent.Select4(false, null))
+                {
+                    error = $"edge_index {edgeIndex.Value}: selection failed.";
+                    return null;
+                }
+                return all[edgeIndex.Value] as Edge;
+            }
+            if (ex == null || ey == null || ez == null)
+            {
+                error = "provide edge_index (from analyze_model(edges), PREFERRED) or ex/ey/ez (a point on the attach edge).";
+                return null;
+            }
+            if (!modelDoc.Extension.SelectByID2("", "EDGE", ex.Value, ey.Value, ez.Value, false, 0, null, 0))
+            {
+                error = $"No edge found at ({ex.Value}, {ey.Value}, {ez.Value}). Prefer edge_index from analyze_model(edges).";
+                return null;
+            }
+            var selMgr = modelDoc.SelectionManager as ISelectionMgr;
+            var edge = selMgr?.GetSelectedObject6(1, -1) as Edge;
+            if (edge == null)
+                error = $"Entity at ({ex.Value}, {ey.Value}, {ez.Value}) is not an edge.";
+            return edge;
+        }
+
+        // EdgeFlange — angle/radius/position/gap are plain properties; the ATTACH edge(s) sit
+        // behind AccessSelections (released in finally — TryReadMirror discipline) and are emitted
+        // with the shared BuildEdgeJson, so each edge's `mid` replays directly as the tool's
+        // ex/ey/ez. `profile_sketch` names the flange's ProfileFeature subfeature — the (possibly
+        // custom-edited) profile, read fully via analyze_model(sketch, name=...). Ground-truth
+        // readback (IR-ADR-014): a rebuild replays these values, it never derives them.
+        private void TryReadEdgeFlange(IFeature feat, IModelDoc2 modelDoc, JObject fj)
+        {
+            try
+            {
+                var def = feat.GetDefinition() as IEdgeFlangeFeatureData;
+                if (def == null) return;
+                var ej = new JObject();
+                ej["angle"] = R6(def.BendAngle); // radians
+                if (!def.UseDefaultBendRadius) ej["radius"] = R6(def.BendRadius);
+                string pos;
+                switch (def.PositionType)
+                {
+                    case 1: pos = "material_inside"; break;
+                    case 2: pos = "material_outside"; break;
+                    case 3: pos = "bend_outside"; break;
+                    case 4: pos = "centerline"; break;
+                    default: pos = "bend_sharp"; break; // 5
+                }
+                ej["position"] = pos;
+                try { if (def.GapDistance > 0) ej["gap"] = R6(def.GapDistance); } catch { }
+                try
+                {
+                    var sub = feat.GetFirstSubFeature() as IFeature;
+                    while (sub != null)
+                    {
+                        if (sub.GetTypeName2() == "ProfileFeature") { ej["profile_sketch"] = sub.Name; break; }
+                        sub = sub.GetNextSubFeature() as IFeature;
+                    }
+                }
+                catch { }
+                bool acc = false;
+                try { acc = def.AccessSelections(modelDoc, null); } catch { }
+                if (acc)
+                {
+                    try
+                    {
+                        var edges = def.Edges as object[];
+                        if (edges != null)
+                        {
+                            var arr = new JArray();
+                            foreach (var o in edges)
+                            {
+                                var e = o as IEdge;
+                                if (e != null) arr.Add(BuildEdgeJson(e, -1));
+                            }
+                            if (arr.Count > 0) ej["edges"] = arr;
+                        }
+                    }
+                    finally
+                    {
+                        try { def.ReleaseSelectionAccess(); } catch { }
+                    }
+                }
+                fj["edge_flange"] = ej;
+            }
+            catch { }
+        }
+
+        // SMBaseFlange — thickness/radius/k-factor + the two direction flags, all plain properties
+        // (no AccessSelections). The flags matter beyond documentation: identical blank B-reps can
+        // carry OPPOSITE intrinsic sheet orientations (ReverseThickness vs ReverseDirection routes),
+        // and downstream bend directions are defined relative to that orientation (the 4-1 Bend1
+        // mirror-fold lesson).
+        private void TryReadBaseFlange(IFeature feat, JObject fj)
+        {
+            try
+            {
+                var def = feat.GetDefinition() as IBaseFlangeFeatureData;
+                if (def == null) return;
+                var bj = new JObject();
+                bj["thickness"] = R6(def.Thickness);
+                bj["bend_radius"] = R6(def.BendRadius);
+                if (!def.UseGaugeTable) bj["k_factor"] = R6(def.KFactor);
+                if (def.ReverseThickness) bj["reverse_thickness"] = true;
+                if (def.ReverseDirection) bj["reverse_direction"] = true;
+                if (def.SymmetricThickness) bj["symmetric_thickness"] = true;
+                fj["base_flange"] = bj;
+            }
+            catch { }
+        }
+
+        // SM3dBend (sketched bend) parameters — angle/radius/position/direction read straight off
+        // ISketchedBendFeatureData. `position` maps swFlangePositionTypes_e (4=centerline!) to the
+        // canonical string sheet_metal_feature(sketched_bend, bend_position) accepts back, so the
+        // recipe value is replayable as-is (the INSERT API's BendPos uses a different 0-based
+        // encoding — the tool owns that mapping). `radius` omitted when the bend uses the sheet
+        // default. The FIXED-face pick sits behind AccessSelections (temporarily rolls the model
+        // back; released in finally — same discipline as TryReadMirror): `fixed_pick` is the stored
+        // pick point (reflection-verified: object GetFixedFace(out x, out y, out z)); the returned
+        // face's normal + bounding box are emitted too, so a rebuild can pick a model-space point on
+        // the SAME side without guessing (the 4-1 Bend1 lesson: a derived pick chose the wrong region).
+        private void TryReadSketchedBend(IFeature feat, IModelDoc2 modelDoc, JObject fj)
+        {
+            try
+            {
+                var def = feat.GetDefinition() as ISketchedBendFeatureData;
+                if (def == null) return;
+                var bj = new JObject();
+                bj["angle"] = R6(def.BendAngle); // radians
+                if (!def.UseDefaultBendRadius) bj["radius"] = R6(def.BendRadius);
+                string pos;
+                switch (def.PositionType)
+                {
+                    case 1: pos = "material_inside"; break;
+                    case 2: pos = "material_outside"; break;
+                    case 3: pos = "bend_outside"; break;
+                    case 5: pos = "bend_sharp"; break;
+                    default: pos = "centerline"; break; // 4 = swFlangePositionTypeBendCenterLine
+                }
+                bj["position"] = pos;
+                if (def.ReverseDirection) bj["flip"] = true;
+                bool acc = false;
+                try { acc = def.AccessSelections(modelDoc, null); } catch { }
+                if (acc)
+                {
+                    try
+                    {
+                        double px, py, pz;
+                        object faceObj = def.GetFixedFace(out px, out py, out pz);
+                        bj["fixed_pick"] = new JArray { R6(px), R6(py), R6(pz) };
+                        var face = faceObj as IFace2;
+                        if (face != null)
+                        {
+                            try
+                            {
+                                var n = face.Normal as double[];
+                                if (n != null) bj["fixed_face_normal"] = new JArray { R6(n[0]), R6(n[1]), R6(n[2]) };
+                            }
+                            catch { }
+                            try
+                            {
+                                var box = face.GetBox() as double[];
+                                if (box != null && box.Length >= 6)
+                                    bj["fixed_face_box"] = new JArray { R6(box[0]), R6(box[1]), R6(box[2]), R6(box[3]), R6(box[4]), R6(box[5]) };
+                            }
+                            catch { }
+                        }
+                    }
+                    finally
+                    {
+                        try { def.ReleaseSelectionAccess(); } catch { }
+                    }
+                }
+                fj["sketched_bend"] = bj;
+            }
+            catch { }
+        }
+
+        // MirrorPattern — the mirror PLANE name + the mirrored (seed) feature names, so a mirror is
+        // reproducible without guessing what it mirrors. Plane/PatternFeatureArray sit behind
+        // AccessSelections (temporarily rolls the model back); always released in finally — same
+        // non-destructive discipline as feature_map. Best-effort: a failure just omits the block.
+        private void TryReadMirror(IFeature feat, IModelDoc2 modelDoc, JObject fj)
+        {
+            try
+            {
+                var def = feat.GetDefinition() as IMirrorPatternFeatureData;
+                if (def == null) return;
+                var mj = new JObject();
+                bool acc = false;
+                try { acc = def.AccessSelections(modelDoc, null); } catch { }
+                try
+                {
+                    var planeObj = def.Plane;
+                    string planeName = (planeObj as IFeature)?.Name;
+                    if (planeName != null) mj["plane"] = planeName;
+                    else if (planeObj is IFace2) mj["plane_is_face"] = true;
+                    var feats = def.PatternFeatureArray as object[];
+                    if (feats != null)
+                    {
+                        var arr = new JArray();
+                        foreach (var o in feats)
+                        {
+                            var f = o as IFeature;
+                            if (f != null) arr.Add(f.Name);
+                        }
+                        if (arr.Count > 0) mj["features"] = arr;
+                    }
+                }
+                finally
+                {
+                    if (acc) { try { def.ReleaseSelectionAccess(); } catch { } }
+                }
+                if (mj.Count > 0) fj["mirror"] = mj;
+            }
+            catch { }
         }
 
         // Read an extrude/cut feature's end-condition + depth (blind only) + the raw ReverseDirection flag.
@@ -4698,7 +5571,18 @@ namespace SolidworksExecution.Services
                 ej["end"] = EndConditionName(endc);
                 if (endc == (int)swEndConditions_e.swEndCondBlind)
                     ej["depth"] = R6(ed.GetDepth(true));
-                if (ed.ReverseDirection) ej["reversed"] = true;
+                // `reversed` is normalized against the CANONICAL plane axis, not the raw flag: the
+                // real extrude direction = profile-sketch normal ⊕ ReverseDirection, and a sketch's
+                // OWN normal depends on how it was authored (a Front-Plane sketch drawn "from behind"
+                // carries a -Z normal). Found live on 1-1: Boss-Extrude2 read "not reversed" (raw
+                // flag false) yet the wall is built toward -Z — a recipe replay via create_sketch
+                // (which always sketches with the canonical +axis normal) then extruded the mirror.
+                // After normalization, reversed=true ⇔ the feature's material lies toward the
+                // canonical -axis ⇔ replay with extrude_feature(reverse=true). Non-axis-aligned
+                // sketch planes (sign unknown) keep the raw flag unchanged.
+                bool rev = ed.ReverseDirection;
+                if (ProfileSketchNormalSign(feat) < 0) rev = !rev;
+                if (rev) ej["reversed"] = true;
                 return ej;
             }
             catch { return null; }
@@ -4722,6 +5606,35 @@ namespace SolidworksExecution.Services
         // Sketch plane/face in MODEL space — origin + normal — so a rebuild knows WHICH plane/face a
         // sketch sits on (e.g. Front Plane z=0 vs a part face at z=0.02). Derived from the sketch
         // transform's inverse (sketch→model): translation = origin, mapped Z-axis = normal. Best-effort.
+        // Signed principal-axis direction of an extrude's PROFILE-SKETCH normal: +1 along the
+        // canonical +axis (+Z Front / +Y Top / +X Right), -1 opposite, 0 unknown (no sketch parent
+        // or a non-axis-aligned plane — in which case the caller must not flip anything). The
+        // profile sketch is the extrude feature's ProfileFeature parent.
+        private static int ProfileSketchNormalSign(IFeature feat)
+        {
+            try
+            {
+                object[] parents = feat.GetParents() as object[];
+                if (parents == null) return 0;
+                foreach (var p in parents)
+                {
+                    var pf = p as IFeature;
+                    if (pf == null || pf.GetTypeName2() != "ProfileFeature") continue;
+                    var sk = pf.GetSpecificFeature2() as ISketch;
+                    var s2m = sk?.ModelToSketchTransform?.IInverse();
+                    double[] d = s2m?.ArrayData as double[];
+                    if (d == null || d.Length < 12) return 0;
+                    double nx = d[2], ny = d[5], nz = d[8];
+                    double ax = Math.Abs(nx), ay = Math.Abs(ny), az = Math.Abs(nz);
+                    double dom = (az >= ax && az >= ay) ? nz : (ay >= ax ? ny : nx);
+                    if (Math.Abs(dom) < 0.999) return 0;  // angled plane — don't guess
+                    return dom >= 0 ? 1 : -1;
+                }
+            }
+            catch { }
+            return 0;
+        }
+
         private JObject ReadSketchPlane(ISketch sketch)
         {
             try
@@ -4735,7 +5648,26 @@ namespace SolidworksExecution.Services
                 double ox = d[9], oy = d[10], oz = d[11];
                 double nx = d[2], ny = d[5], nz = d[8];
                 var pj = new JObject();
-                string refName = DefaultPlaneForAxis(PrincipalAxis(nx, ny, nz));
+                // The FULL sketch frame (in-plane axes + origin in model space, columns of the
+                // sketch→model rotation). {ref, offset} alone is LOSSY: it drops the support's
+                // normal SIGN and the in-plane axis orientation — a sketch on a -Y-normal face is
+                // the MIRROR of one on a +Y-normal plane at the same height, so replaying its 2D
+                // coordinates without the frame builds the pockets in the wrong place (found live
+                // on 2-1's Sketch5). The compiler compares this recorded frame against the frame
+                // create_sketch MEASURES on the rebuild and transforms coordinates — no assumptions.
+                // ArrayData layout is COLUMN-major w.r.t. sketch axes (proven empirically on the
+                // 2-1 rebuild: its Right-plane sketch builds toward -Z, and only the d[0..2]
+                // reading yields xdir=(0,0,-1) to match): sketch x-axis = d[0..2], y = d[3..5],
+                // normal = d[6..8]. (The legacy nx/ny/nz=(d[2],d[5],d[8]) classification above is
+                // abs-based and live-proven — deliberately left untouched.)
+                pj["frame"] = new JObject
+                {
+                    ["origin"] = new JArray { R6(ox), R6(oy), R6(oz) },
+                    ["xdir"] = new JArray { R6(d[0]), R6(d[1]), R6(d[2]) },
+                    ["ydir"] = new JArray { R6(d[3]), R6(d[4]), R6(d[5]) },
+                };
+                string axisName = PrincipalAxis(nx, ny, nz);
+                string refName = DefaultPlaneForAxis(axisName);
                 if (refName != null)
                 {
                     // Canonical English default-plane name, computed from the NORMAL — never read from the
@@ -4744,7 +5676,14 @@ namespace SolidworksExecution.Services
                     // signed perpendicular distance from the global origin: 0 ⇒ the default plane itself;
                     // ≠0 ⇒ a parallel surface at that height (sketch on the face there, or an offset plane).
                     pj["ref"] = refName;
-                    double off = R6(ox * nx + oy * ny + oz * nz);
+                    // Offset along the CANONICAL +axis (X/Y/Z), NOT the legacy nx/ny/nz pseudo-normal:
+                    // that vector is (xdir.z, ydir.z, normal.z) — fine for the ABS-based axis classification
+                    // above, but its SIGN flips with the sketch's in-plane orientation. Live-caught on
+                    // level-2-2's Sketch2 (+y face, ydir (0,0,-1)): legacy read offset -0.052444, and the
+                    // rebuild resolved the face on the OPPOSITE side — a silently mirrored hole that the
+                    // topology/volume verified-criteria cannot catch. The consumers (resolve_face_on_plane,
+                    // InsertRefPlane lowering) interpret offset as the coordinate along the datum's +normal.
+                    double off = R6(axisName == "X" ? ox : axisName == "Y" ? oy : oz);
                     if (Math.Abs(off) > 1e-9) pj["offset"] = off;
                 }
                 else
@@ -4935,6 +5874,10 @@ namespace SolidworksExecution.Services
                         {
                             if (asp != null) { ej["x1"] = R6(asp.X); ej["y1"] = R6(asp.Y); }
                             if (aep != null) { ej["x2"] = R6(aep.X); ej["y2"] = R6(aep.Y); }
+                            // Sweep sense (+1 CCW / -1 CW w.r.t. the sketch-plane normal): without it,
+                            // center+start+end describe TWO arcs (minor/major), so a deterministic
+                            // rebuild via add_sketch_entity(arc_center, direction=dir) needs the sign.
+                            try { ej["dir"] = ((ISketchArc)seg).GetRotationDir(); } catch { }
                         }
                         break;
                     case 2:
@@ -5070,6 +6013,35 @@ namespace SolidworksExecution.Services
         // never has to guess where an edge is or reverse-derive the extrude direction. Best-effort per edge.
         // One FeatureCut4 invocation with the full (verbose) parameter list factored out, so the cut path
         // can try a direction / normalCut combination cleanly and retry the flipped direction.
+        // APPEND-select the i-th solid-body face with a selection Mark — the up-to-surface end-condition
+        // reference for FeatureExtrusion3/FeatureCut4. Same GetBodies2(swSolidBody,true) → GetFaces()
+        // enumeration analyze_model(faces) reports and create_sketch(on_face, face_index) walks, so the
+        // caller's face index means the same thing everywhere. Mark: per the FeatureExtrusion3 remarks
+        // (local sldworksapi.chm) "End condition reference entity = Mark 1" (profile 0, direction edge 16,
+        // start reference 32, bodies 8) — matches CodeStack's working up-to-surface example.
+        private bool SelectFaceByIndexAppend(IModelDoc2 modelDoc, int faceIndex, int mark)
+        {
+            var partDoc = modelDoc as IPartDoc;
+            var allFaces = new List<IFace2>();
+            object[] bodies = partDoc?.GetBodies2((int)swBodyType_e.swSolidBody, true) as object[];
+            if (bodies != null)
+                foreach (var b in bodies)
+                {
+                    var body = b as IBody2;
+                    if (body == null) continue;
+                    object[] fs = body.GetFaces() as object[];
+                    if (fs == null) continue;
+                    foreach (var f in fs) { var fa = f as IFace2; if (fa != null) allFaces.Add(fa); }
+                }
+            if (faceIndex < 0 || faceIndex >= allFaces.Count) return false;
+            var ent = allFaces[faceIndex] as IEntity;
+            if (ent == null) return false;
+            var selData = (modelDoc.SelectionManager as ISelectionMgr)?.CreateSelectData();
+            if (selData == null) return false;
+            selData.Mark = mark;
+            return ent.Select4(true, selData);
+        }
+
         private IFeature FeatureCutOnce(IFeatureManager featureMgr, bool dir, int endCond, double depthVal, bool normalCut)
         {
             return featureMgr.FeatureCut4(
@@ -5314,6 +6286,344 @@ namespace SolidworksExecution.Services
             ExecLog.Write($"ReadFaces: faces={facesArr.Count}");
             root["face_count"] = facesArr.Count;
             root["faces"] = facesArr;
+            return root;
+        }
+
+        // ------------------------------------------------------------------
+        // feature_map — rollback-bar geometry attribution (analysis_type='feature_map')
+        // ------------------------------------------------------------------
+
+        // Feature types that can never alter SOLID geometry: they appear in the map for tree coverage
+        // but get no rollback stop / snapshot (a full topology snapshot per sketch or ref plane would
+        // pay real COM cost for a guaranteed-empty delta).
+        private static readonly HashSet<string> NonSolidFeatureTypes = new HashSet<string>
+        {
+            "ProfileFeature", "3DProfileFeature", "RefPlane", "RefAxis", "RefPoint", "CoordSys",
+            "OriginProfileFeature",
+            // The SheetMetal DEFINITION feature (thickness/radius container): it builds no geometry
+            // itself, and live on 4-1 EditRollback(ToAfterFeature, "Sheet-Metal1") JUMPED THE BAR TO
+            // THE END (the stop showed the full final body and Base-Flange1 then diffed NEGATIVE).
+            // Skipping it attributes the blank correctly to SMBaseFlange.
+            "SheetMetal"
+        };
+
+        // 1µm — a rollback stop REPLAYS the same history, so surviving geometry matches to double
+        // precision; the tolerance only needs to sit far below feature scale (same grid as R6).
+        private const double MapTol = 1e-6;
+
+        private sealed class EdgeSnap
+        {
+            public double[] Start, End, Mid;
+            public double Len;      // chord (open) / circumference (closed) — identity + size hint
+            public bool Matched;
+        }
+
+        private sealed class FaceSnap
+        {
+            public bool Planar;
+            public double[] Normal; // planar faces only
+            public double[] Point;  // representative on-surface point (UV mid)
+            public double Area;
+            public bool Matched;
+        }
+
+        private static bool PtEq(double[] a, double[] b)
+        {
+            return a != null && b != null
+                && Math.Abs(a[0] - b[0]) <= MapTol
+                && Math.Abs(a[1] - b[1]) <= MapTol
+                && Math.Abs(a[2] - b[2]) <= MapTol;
+        }
+
+        private static JArray Pt6(double[] a) { return new JArray { R6(a[0]), R6(a[1]), R6(a[2]) }; }
+
+        // Snapshot every solid body's edges/faces at the CURRENT rollback stop. Same enumeration the
+        // shared readers walk (GetBodies2(swSolidBody,true) → GetEdges()/GetFaces()); open-edge midpoints
+        // stay off the IGetCurve path (ADR-030). counts = {faces, edges, vertices} (authoritative, from
+        // the body counters, so the delta is right even if an exotic face yields no representative point).
+        private void SnapshotTopology(IPartDoc partDoc, List<EdgeSnap> edges, List<FaceSnap> faces, int[] counts)
+        {
+            object[] bodies = partDoc?.GetBodies2((int)swBodyType_e.swSolidBody, true) as object[];
+            if (bodies == null) return;
+            foreach (var b in bodies)
+            {
+                var body = b as IBody2;
+                if (body == null) continue;
+                counts[0] += body.GetFaceCount();
+                counts[1] += body.GetEdgeCount();
+                counts[2] += body.GetVertexCount();
+
+                object[] es = body.GetEdges() as object[];
+                if (es != null)
+                    foreach (var e in es)
+                    {
+                        var edge = e as IEdge;
+                        if (edge == null) continue;
+                        var cp = edge.GetCurveParams2() as double[];
+                        if (cp == null || cp.Length < 8) continue;
+                        var snap = new EdgeSnap
+                        {
+                            Start = new[] { cp[0], cp[1], cp[2] },
+                            End = new[] { cp[3], cp[4], cp[5] }
+                        };
+                        double dx = cp[0] - cp[3], dy = cp[1] - cp[4], dz = cp[2] - cp[5];
+                        double chord = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+                        if (chord > 1e-9)
+                        {
+                            snap.Mid = new[] { (cp[0] + cp[3]) / 2.0, (cp[1] + cp[4]) / 2.0, (cp[2] + cp[5]) / 2.0 };
+                            snap.Len = chord;
+                        }
+                        else
+                        {
+                            // Closed edge (full circle): on-edge midpoint via the curve (rare — same
+                            // trade BuildEdgeJson makes).
+                            var curve = edge.IGetCurve();
+                            if (curve != null)
+                            {
+                                var mid = curve.Evaluate2((cp[6] + cp[7]) / 2.0, 0) as double[];
+                                if (mid != null && mid.Length >= 3) snap.Mid = new[] { mid[0], mid[1], mid[2] };
+                                try { snap.Len = curve.GetLength3(cp[6], cp[7]); } catch { }
+                            }
+                            if (snap.Mid == null) snap.Mid = snap.Start;
+                        }
+                        edges.Add(snap);
+                    }
+
+                object[] fs = body.GetFaces() as object[];
+                if (fs != null)
+                    foreach (var f in fs)
+                    {
+                        var face = f as IFace2;
+                        if (face == null) continue;
+                        var fsnap = new FaceSnap();
+                        try
+                        {
+                            var surf = face.IGetSurface();
+                            fsnap.Planar = surf != null && surf.IsPlane();
+                            try { fsnap.Area = face.GetArea(); } catch { }
+                            if (fsnap.Planar)
+                            {
+                                var n = face.Normal as double[];
+                                if (n != null && n.Length >= 3) fsnap.Normal = new[] { n[0], n[1], n[2] };
+                            }
+                            var uv = face.GetUVBounds() as double[];
+                            if (surf != null && uv != null && uv.Length >= 4)
+                            {
+                                var pt = surf.Evaluate((uv[0] + uv[1]) / 2.0, (uv[2] + uv[3]) / 2.0, 0, 0) as double[];
+                                if (pt != null && pt.Length >= 3) fsnap.Point = new[] { pt[0], pt[1], pt[2] };
+                            }
+                        }
+                        catch { }
+                        if (fsnap.Point != null) faces.Add(fsnap);
+                    }
+            }
+        }
+
+        // Geometric diff between two rollback stops — matching is by GEOMETRY (midpoints / planes),
+        // never by index: SolidWorks renumbers faces/edges at every stop. Adds consumed_edges /
+        // created_faces to the entry (only when non-empty — keeps the map compact).
+        private void DiffTopology(List<EdgeSnap> prevE, List<FaceSnap> prevF,
+            List<EdgeSnap> curE, List<FaceSnap> curF, JObject entry)
+        {
+            // The prev snapshot was the CUR snapshot of the previous diff, so its Matched flags are
+            // stale — an edge that survived step N would silently skip the consumed check at step N+1
+            // (live-caught: both of level-2-2's chamfers reported no consumed edge). Reset them all.
+            foreach (var pe in prevE) pe.Matched = false;
+            foreach (var pf in prevF) pf.Matched = false;
+
+            // Edge pass 1 — identical edges (same midpoint AND length) survive unchanged.
+            foreach (var pe in prevE)
+                foreach (var ce in curE)
+                {
+                    if (ce.Matched) continue;
+                    if (PtEq(pe.Mid, ce.Mid) && Math.Abs(pe.Len - ce.Len) <= MapTol)
+                    { pe.Matched = ce.Matched = true; break; }
+                }
+
+            // An unmatched previous edge whose BOTH endpoints are gone was CONSUMED (the fillet/chamfer
+            // target). If an endpoint survives, the feature merely TRIMMED/extended the edge (e.g. the
+            // neighbours of a filleted corner — their midpoints move by r/2, far beyond tolerance) and
+            // it is NOT reported: that separation is what keeps consumed_edges a clean anchor list.
+            var consumed = new JArray();
+            foreach (var pe in prevE)
+            {
+                if (pe.Matched) continue;
+                bool startSurvives = false, endSurvives = false;
+                foreach (var ce in curE)
+                {
+                    if (!startSurvives && (PtEq(pe.Start, ce.Start) || PtEq(pe.Start, ce.End))) startSurvives = true;
+                    if (!endSurvives && (PtEq(pe.End, ce.Start) || PtEq(pe.End, ce.End))) endSurvives = true;
+                    if (startSurvives && endSurvives) break;
+                }
+                if (!startSurvives && !endSurvives)
+                    consumed.Add(new JObject { ["mid"] = Pt6(pe.Mid), ["len"] = R6(pe.Len) });
+            }
+            if (consumed.Count > 0) entry["consumed_edges"] = consumed;
+
+            // Face pass 1 — identical faces (same representative point AND area).
+            foreach (var pf in prevF)
+                foreach (var cf in curF)
+                {
+                    if (cf.Matched) continue;
+                    if (PtEq(pf.Point, cf.Point)
+                        && Math.Abs(pf.Area - cf.Area) <= 1e-9 + 1e-6 * Math.Max(pf.Area, cf.Area))
+                    { pf.Matched = cf.Matched = true; break; }
+                }
+
+            // Face pass 2 — surviving PLANES: an unmatched current planar face lying on a plane that
+            // already existed is a TRIMMED/extended face (its UV-mid representative point moves with the
+            // trim), not a new surface. Only genuinely NEW surfaces are reported as created. (A trimmed
+            // NON-planar face can still reappear here — known noise, the anchors come from consumed_edges.)
+            var created = new JArray();
+            foreach (var cf in curF)
+            {
+                if (cf.Matched) continue;
+                bool onExistingPlane = false;
+                if (cf.Planar && cf.Normal != null)
+                {
+                    foreach (var pf in prevF)
+                    {
+                        if (!pf.Planar || pf.Normal == null) continue;
+                        double dot = pf.Normal[0] * cf.Normal[0] + pf.Normal[1] * cf.Normal[1] + pf.Normal[2] * cf.Normal[2];
+                        if (dot < 1.0 - 1e-6) continue; // must be parallel, SAME sign
+                        double d = (pf.Point[0] - cf.Point[0]) * cf.Normal[0]
+                                 + (pf.Point[1] - cf.Point[1]) * cf.Normal[1]
+                                 + (pf.Point[2] - cf.Point[2]) * cf.Normal[2];
+                        if (Math.Abs(d) <= MapTol) { onExistingPlane = true; break; }
+                    }
+                }
+                if (onExistingPlane) continue;
+                var cj = new JObject { ["point"] = Pt6(cf.Point), ["planar"] = cf.Planar };
+                if (cf.Normal != null) cj["normal"] = Pt6(cf.Normal);
+                cj["area"] = R6(cf.Area);
+                created.Add(cj);
+            }
+            if (created.Count > 0) entry["created_faces"] = created;
+        }
+
+        private JObject BuildFeatureMap(IModelDoc2 modelDoc, IPartDoc partDoc, string fromFeature, string toFeature,
+            out string errCode, out string errMsg)
+        {
+            errCode = null; errMsg = null;
+
+            // Cache the walk UP FRONT, at the fully-rolled-forward state: features BEHIND a rolled-back
+            // bar report IsSuppressed()==true, so name/type/suppression must be read before the bar moves.
+            var names = new List<string>(); var types = new List<string>(); var supp = new List<bool>();
+            var feat = modelDoc.FirstFeature() as IFeature;
+            int guard = 0;
+            while (feat != null && guard++ < 5000)
+            {
+                string t = feat.GetTypeName2() ?? "";
+                if (!NoiseFeatureTypes.Contains(t))
+                {
+                    names.Add(feat.Name); types.Add(t);
+                    bool s = false; try { s = feat.IsSuppressed(); } catch { }
+                    supp.Add(s);
+                }
+                feat = feat.GetNextFeature() as IFeature;
+            }
+            if (names.Count == 0)
+            {
+                errCode = "FEATURE_MAP_FAILED"; errMsg = "The feature tree is empty.";
+                return null;
+            }
+
+            int startIdx = 0, endIdx = names.Count - 1;
+            if (!string.IsNullOrEmpty(fromFeature))
+            {
+                startIdx = names.IndexOf(fromFeature);
+                if (startIdx < 0)
+                {
+                    errCode = "FEATURE_NOT_FOUND";
+                    errMsg = $"from_feature '{fromFeature}' not found. Available: {string.Join(", ", names)}";
+                    return null;
+                }
+            }
+            if (!string.IsNullOrEmpty(toFeature))
+            {
+                endIdx = names.IndexOf(toFeature);
+                if (endIdx < 0)
+                {
+                    errCode = "FEATURE_NOT_FOUND";
+                    errMsg = $"to_feature '{toFeature}' not found. Available: {string.Join(", ", names)}";
+                    return null;
+                }
+            }
+            if (endIdx < startIdx)
+            {
+                errCode = "INVALID_RANGE";
+                errMsg = $"to_feature '{toFeature}' precedes from_feature '{fromFeature}' in the tree.";
+                return null;
+            }
+
+            // First rollback stop = the first unsuppressed solid-affecting feature in range; the baseline
+            // snapshot is taken just BEFORE it.
+            int firstStop = -1;
+            for (int i = startIdx; i <= endIdx; i++)
+                if (!supp[i] && !NonSolidFeatureTypes.Contains(types[i])) { firstStop = i; break; }
+
+            var mapArr = new JArray();
+            bool rolled = false;
+            var swTotal = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                var prevEdges = new List<EdgeSnap>(); var prevFaces = new List<FaceSnap>(); var prevCounts = new int[3];
+                if (firstStop >= 0)
+                {
+                    rolled = true;
+                    bool okBase = modelDoc.FeatureManager.EditRollback(
+                        (int)swMoveRollbackBarTo_e.swMoveRollbackBarToBeforeFeature, names[firstStop]);
+                    if (!okBase)
+                    {
+                        errCode = "ROLLBACK_FAILED";
+                        errMsg = $"Could not move the rollback bar before '{names[firstStop]}' (is a sketch being edited?).";
+                        return null;
+                    }
+                    SnapshotTopology(partDoc, prevEdges, prevFaces, prevCounts);
+                }
+
+                for (int i = startIdx; i <= endIdx; i++)
+                {
+                    var entry = new JObject { ["feature"] = names[i], ["type"] = types[i] };
+                    if (supp[i]) { entry["suppressed"] = true; mapArr.Add(entry); continue; }
+                    if (NonSolidFeatureTypes.Contains(types[i])) { mapArr.Add(entry); continue; }
+
+                    bool ok = modelDoc.FeatureManager.EditRollback(
+                        (int)swMoveRollbackBarTo_e.swMoveRollbackBarToAfterFeature, names[i]);
+                    if (!ok)
+                    {
+                        // Bar did not move — this feature's changes FOLD INTO the next stop's delta.
+                        entry["error"] = "ROLLBACK_FAILED (delta folds into the next feature)";
+                        mapArr.Add(entry);
+                        continue;
+                    }
+
+                    var curEdges = new List<EdgeSnap>(); var curFaces = new List<FaceSnap>(); var curCounts = new int[3];
+                    SnapshotTopology(partDoc, curEdges, curFaces, curCounts);
+                    entry["delta"] = new JObject
+                    {
+                        ["faces"] = curCounts[0] - prevCounts[0],
+                        ["edges"] = curCounts[1] - prevCounts[1],
+                        ["vertices"] = curCounts[2] - prevCounts[2]
+                    };
+                    DiffTopology(prevEdges, prevFaces, curEdges, curFaces, entry);
+                    prevEdges = curEdges; prevFaces = curFaces; prevCounts = curCounts;
+                    mapArr.Add(entry);
+                }
+            }
+            finally
+            {
+                // Non-destructive guarantee: whatever happened, put the bar back at the END so the
+                // original document is left exactly as found (nothing is saved either way).
+                if (rolled)
+                    try { modelDoc.FeatureManager.EditRollback((int)swMoveRollbackBarTo_e.swMoveRollbackBarToEnd, ""); } catch { }
+            }
+            swTotal.Stop();
+            ExecLog.Write($"FeatureMap: entries={mapArr.Count} range=[{names[startIdx]}..{names[endIdx]}] total={swTotal.ElapsedMilliseconds}ms");
+
+            var root = new JObject();
+            root["feature_count"] = mapArr.Count;
+            root["map"] = mapArr;
             return root;
         }
 

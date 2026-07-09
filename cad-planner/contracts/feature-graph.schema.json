@@ -1,8 +1,8 @@
 {
   "_meta": {
     "name": "feature-graph",
-    "version": "0.0.1-draft",
-    "status": "DRAFT — vocabulary to be derived/expanded from real production SLDPRT files (see project-context). Do NOT freeze before validating against real designs.",
+    "version": "0.5.6-draft",
+    "status": "DRAFT — v0.5 vocabulary grown from the REAL production parts in drawing-samples/ (IR-ADR-007): the 1-1 bracket's recorded VOCABULARY_GAP list (path sketch profile, offset datum plane, up_to_surface end condition, edge fillet + edge reference model, construction geometry); v0.5.1 adds the 1-2 flange's gap list (revolve with in-sketch axis, circular_pattern with datum-intersection axis + runtime seed-feature reference). Do NOT freeze before the MAT v1 validation set arrives.",
     "role": "CAD-NEUTRAL intermediate representation (IR). The host AI (Planner) emits this; the deterministic solidworks-compiler lowers it to tool calls. The model NEVER emits raw tool sequences.",
     "doubles_as": "Capability registry — the set of supported feature node types + params IS the capability list. The Planner validates intent against this single artifact (no separate chatty discovery protocol)."
   },
@@ -10,7 +10,8 @@
   "graph": {
     "schema_version": "string (required — IR schema version this graph targets)",
     "units": "string (fixed: 'meters' — all lengths are SI meters, matching execution layer)",
-    "nodes": "array of feature nodes (ordered; order defines build sequence)"
+    "nodes": "array of feature nodes (ordered; order defines build sequence — tree order is law, recipe.md C1)",
+    "_params": "object (optional, additive, IGNORED by the compiler — the lifted parameter map {param_name: {node, field, value_si}} per recipe.md C3)"
   },
 
   "node_common": {
@@ -20,27 +21,39 @@
   },
 
   "reference_model": {
-    "_note": "OPEN DESIGN QUESTION — this is the make-or-break part of the IR (persistent/topological naming). v0 supports only the cases below; expand from real designs.",
+    "_note": "Still the make-or-break part of the IR (persistent/topological naming, P1.3). v0.5 adds GEOMETRIC ANCHORS (decided with the user 2026-07-04, HYBRID form): a 3D point recorded from the ORIGINAL part's analyze_model read, resolved DETERMINISTICALLY against the rebuilt geometry at compile time, plus an optional semantic 'hint' that the compiler NEVER reads — it collects design data for the future semantic reference model (P1.3). Anchors are exact for fresh-doc replay but NOT durable across edits — that honest limitation is the P1.3 forcing function.",
     "datum": "string — canonical datum plane: 'front' | 'top' | 'right'",
+    "offset": "number (optional, on a datum ref — SIGNED offset in meters along the datum normal; != 0 means the sketch sits on a parallel reference plane the compiler creates via add_reference_geometry, e.g. the recipe's plane {ref:'Front Plane', offset:0.003})",
     "node_face": {
       "node": "string — id of an earlier node",
-      "selector": "string — semantic face selector resolved at compile time by the reference resolver: 'top' | 'bottom' | 'side' | ..."
+      "selector": "string — semantic face selector resolved at compile time by the reference resolver: 'top' (v0.5: only 'top')"
     },
-    "position": "string — semantic position on the referenced entity: 'center' | 'corner' | ... (resolved to concrete coords by the resolver)"
+    "position": "string — semantic position on the referenced entity: 'center' (v0.5: only 'center')",
+    "face_anchor": {
+      "near": "[x, y, z] — a 3D point (meters) ON the target face's plane, from the ORIGINAL part's analyze_model(faces) representative point. Resolved by plane-containment match (|(near-point)·normal| <= tol) with nearest-representative-point tiebreak among coplanar faces.",
+      "hint": "string (optional — semantic description for P1.3 data collection, e.g. 'top of the 3mm base plate'; NOT read by the compiler)"
+    },
+    "edge_anchor": {
+      "near": "[x, y, z] — a 3D point (meters) at the target edge's MIDPOINT, from the ORIGINAL part's analyze_model(edges) mid. Resolved by nearest-mid within a tolerance ball; >1 edge in the ball = REFERENCE_AMBIGUOUS, 0 = REFERENCE_UNRESOLVED.",
+      "hint": "string (optional — semantic description for P1.3 data collection, e.g. 'slot inner corner'; NOT read by the compiler)"
+    }
   },
 
-  "v0_exp_covered_subset": {
-    "_note": "The EXPERIMENTAL submit_feature_graph tool (P1.4/P1.7, logs-ir.md) compiles ONLY this minimal subset today. Outside it the compiler rejects the graph at structural-validation time (no silent gaps). Grow from real MAT parts, not ahead of them.",
-    "node_types": ["box", "sketch", "extrude", "hole"],
-    "profile_kinds": ["rectangle", "circle"],
+  "v05_covered_subset": {
+    "_note": "The subset pycompiler compiles today. Outside it the compiler rejects the graph at structural-validation time (no silent gaps). Superset of the v0-exp subset (box+hole fixture still compiles unchanged).",
+    "node_types": ["box", "sketch", "extrude", "revolve", "rib", "hole", "fillet", "chamfer", "loft", "circular_pattern", "sheet_metal", "sketched_bend", "mirror"],
+    "profile_kinds": ["rectangle", "circle", "line", "arc"],
+    "profile_flags": ["construction"],
     "datums": ["front", "top", "right"],
+    "datum_offset": "any signed number of meters (0/omitted = the datum plane itself)",
     "face_selectors": ["top"],
     "positions": ["center"],
     "hole_depth": ["through_all"],
-    "assumptions": "box is built CENTRED ON THE DATUM ORIGIN (so 'center' on its top face maps to sketch (0,0)); 'top' is bound to global +Y (SolidWorks 'up'); single body. General 3D-point->sketch-2D resolution for arbitrary faces is P1.5."
+    "extrude_ends": ["blind", "through_all", "up_to_surface", "mid_plane"],
+    "assumptions": "box centred on the datum origin ('center' -> sketch (0,0)); 'top' bound to global +Y; single body. Path-profile sketches carry EXACT 2D coordinates (from analyze_model(sketch)) — the sketch plane's 2D frame is assumed identical between original and rebuild (same datum/offset => same frame). General 3D-point->sketch-2D resolution for arbitrary faces remains P1.5 option B."
   },
 
-  "feature_types_v0": {
+  "feature_types_v05": {
     "_note": "Profile and operation are SEPARATED on purpose (avoids combinatorial type explosion like 'extruded_circle' + 'extruded_rectangle' + 'revolved_circle'...).",
 
     "box": {
@@ -51,38 +64,114 @@
       "height": "number — meters (extrusion distance)"
     },
     "sketch": {
-      "description": "A 2D profile on a plane/face. Entities are profile primitives, not tools.",
-      "ref": "datum or node_face (the sketch plane)",
-      "profile": "array of profile primitives: { kind:'rectangle', width, height } | { kind:'circle', diameter } | { kind:'polygon', sides, diameter } ..."
+      "description": "A 2D profile on a plane. Entities are profile primitives, not tools. v0.5 adds PATH profiles: free line/arc chains with exact coordinates (the recipe's 7-line+2-arc bracket outline), plus construction scaffolding. Primitives sharing identical endpoint coordinates close the contour — do NOT add constraints (frozen-coordinate rebuild, see add_sketch_entity guidance).",
+      "ref": "datum + optional offset (the sketch plane; offset != 0 => the compiler prefers an existing face on that plane, else creates a parallel reference plane) OR — since v0.5.5, for sketches on NON-axis-aligned support (a bent flange's face, 4-1's Sketch13/16) — { face: face_anchor }: the compiler resolves the anchor via analyze_model(faces) plane-containment (resolve_face_by_anchor) and sketches ON that face (create_sketch on_face). Record the ORIGINAL sketch's `frame` — the frame transform (IR-ADR-010) makes the 2D coordinates support-independent.",
+      "profile": "array of profile primitives:",
+      "profile_primitives": {
+        "rectangle": { "kind": "rectangle", "width": "number (m)", "height": "number (m)", "_note": "centred on the sketch origin" },
+        "circle": { "kind": "circle", "diameter": "number (m)", "cx": "number (optional, default 0 — centre X)", "cy": "number (optional, default 0 — centre Y)" },
+        "line": { "kind": "line", "x1": "number", "y1": "number", "x2": "number", "y2": "number", "_note": "exact 2D sketch coords in meters (from analyze_model(sketch))" },
+        "arc": { "kind": "arc", "cx": "number (centre X)", "cy": "number (centre Y)", "x1": "number (start X)", "y1": "number (start Y)", "x2": "number (end X)", "y2": "number (end Y)", "dir": "1 (CCW) | -1 (CW) — sweep sense, REQUIRED (centre+start+end alone describe two arcs); mirrors analyze_model(sketch)'s 'dir' and add_sketch_entity(arc_center)'s 'direction'" },
+        "_common_flag": "any primitive may carry construction: true — created as CONSTRUCTION/reference geometry (mirrors analyze_model's per-segment flag)"
+      }
     },
     "extrude": {
-      "description": "Solid extrusion of a referenced sketch node.",
-      "sketch": "string — id of a sketch node",
+      "description": "Solid extrusion of a referenced sketch node. v0.5 adds explicit end conditions.",
+      "sketch": "string — id of a sketch node (must be the immediately preceding node — the extrude consumes the ACTIVE sketch)",
       "operation": "string — 'boss' (add material) | 'cut' (remove material)",
-      "depth": "number — meters"
+      "end": "string (optional) — 'blind' (default; requires depth) | 'through_all' | 'up_to_surface' (requires up_to) | 'mid_plane' (requires depth = the TOTAL width; extrudes symmetrically about the sketch plane). Back-compat: depth:'through_all'/'through' or through:true still mean through_all.",
+      "depth": "number — meters (blind: the one-sided depth; mid_plane: the TOTAL symmetric width)",
+      "up_to": "object (up_to_surface only) — { face: face_anchor } : the face the feature terminates on, as a geometric anchor (+ optional hint)"
     },
     "revolve": {
-      "description": "Solid of revolution of a referenced sketch node about an axis.",
-      "sketch": "string — id of a sketch node",
-      "axis": "reference — axis definition (datum or sketch centerline)",
-      "angle": "number — radians (default 6.2832 = 360°)"
+      "description": "Solid of revolution of the referenced sketch node (COVERED since v0.5.1 — grown for the 1-2 flange). The profile sketch should contain the axis segment (typically the construction centerline of the half-section, the classic revolve idiom); the compiler passes the axis segment's 2D coordinates and the tool selects it in the active sketch and treats it as the centerline.",
+      "sketch": "string — id of a sketch node (must be the immediately preceding node — the revolve consumes the ACTIVE sketch)",
+      "axis": "{ x1, y1, x2, y2 } — the axis SEGMENT's exact 2D sketch coordinates (meters), from analyze_model(sketch); normally the sketch's construction centerline",
+      "angle": "number — RADIANS (default 6.283185 = 360°, matching the recipe's SI dimension; the compiler converts to the tool boundary's degrees, C4)"
+    },
+    "rib": {
+      "description": "Rib feature from an OPEN profile sketch (COVERED since v0.5.2 — grown for the 2-1 angle bracket; required the NEW create_rib execution tool). The profile is typically a single line whose extensions hit existing walls (e.g. the diagonal between an L-bracket's legs); SolidWorks extends and thickens it.",
+      "sketch": "string — id of a sketch node (must be the immediately preceding node — the rib consumes the ACTIVE sketch)",
+      "thickness": "number — meters (> 0)",
+      "two_sided": "boolean (optional, default true — thicken symmetrically about the sketch)",
+      "reverse_material_dir": "boolean (optional, default false — which side the rib fills toward; a wrong value is auto-recovered by the tool's flipped retry)",
+      "is_norm_to_sketch": "boolean (optional, default false — false = extrusion parallel to the sketch, the classic line rib)"
+    },
+    "circular_pattern": {
+      "description": "Circular feature pattern (COVERED since v0.5.1). References an EARLIER feature-producing node as the seed — the compiler substitutes that node's RUNTIME-created feature name (localization-proof, same principle as the offset-plane name) — and creates the pattern axis from two datum planes' intersection.",
+      "feature": "string — id of an earlier feature-producing node (box | extrude | revolve | hole | fillet): the pattern seed",
+      "axis": "{ datums: [d1, d2] } — two DISTINCT canonical datums ('front'|'top'|'right') whose intersection is the pattern axis (front∩right = the Y axis, etc.); the compiler creates the reference axis and threads its runtime name",
+      "count": "integer >= 2 — total instances incl. the seed",
+      "angle_deg": "number — DEGREES; with equal_spacing=true the TOTAL spread (360 = full ring), else the spacing BETWEEN instances (reproduce the recipe's CirPattern verbatim: count=instances, angle_deg=spacing_deg, equal_spacing as reported — see create_pattern's round-trip guidance)",
+      "equal_spacing": "boolean (default true)"
     },
     "hole": {
       "description": "Parametric hole. Encapsulates sketch+cut; the compiler expands it (resolve top face -> create_sketch(on_face, face_index) -> circle at centre -> through cut).",
       "ref": "node_face + position (e.g. top face of n1, center)",
       "diameter": "number — meters",
-      "depth": "number — meters, or 'through_all' (v0-exp supports 'through_all' only; 'through' accepted as an alias)"
+      "depth": "number — meters, or 'through_all' (v0.5 supports 'through_all' only; 'through' accepted as an alias)"
+    },
+    "fillet": {
+      "description": "3D edge fillet (post-solid, NOT a sketch fillet). Lowers to add_edge_feature(fillet, edge_indices) after the resolver matches each edge anchor against live analyze_model(edges) midpoints. THE reference-model testbed — every lesson here feeds P1.3.",
+      "radius": "number — meters (> 0)",
+      "edges": "array of edge_anchor objects (>= 1): [{ near: [x,y,z], hint?: string }] — one per filleted edge, midpoints from the ORIGINAL part's analyze_model(edges)"
+    },
+    "chamfer": {
+      "description": "3D edge chamfer (post-solid; COVERED since v0.5.3 — grown for level-2-2). Same HYBRID edge-anchor reference model as fillet (IR-ADR-008): each anchor's `near` is the target edge's midpoint from the PRE-chamfer geometry (the chamfer consumes those edges), matched against live analyze_model(edges) on the rebuild. Lowers to add_edge_feature(chamfer, edge_indices).",
+      "chamfer_type": "string — 'distance_angle' (default) | 'distance_distance'",
+      "distance": "number — meters (> 0): the first-face setback (D1), always required",
+      "angle": "number — RADIANS (distance_angle only; default 0.785398 = 45°; the compiler converts to the tool boundary's degrees, C4)",
+      "distance2": "number — meters (> 0; distance_distance only, required there): the second-face setback (D2)",
+      "flip": "boolean (optional, default false; distance_distance is directional — flip swaps which face gets D1 vs D2, auto-recoverable like rib's reverse)",
+      "edges": "array of edge_anchor objects (>= 1): [{ near: [x,y,z], hint?: string }] — one per chamfered edge, midpoints from the PRE-chamfer state's analyze_model(edges)"
+    },
+    "loft": {
+      "description": "Multi-profile boss loft / blend (COVERED since v0.5.4 — grown for level-2-2's Loft2 frustum). Lowers to extrude_feature(loft, profiles=[...]). UNLIKE extrude/revolve/rib, the loft selects its profile sketches BY NAME (not the active sketch), so the profile sketch nodes need NOT immediately precede the loft — they are ordinary earlier sketch nodes (each on its own plane/offset) that the loft references by id. The compiler threads each referenced sketch's RUNTIME name (recorded from create_sketch's activeSketch — localization/numbering-proof, same principle as circular_pattern's seed). v0.5.4 = a simple boss blend (no guide curves / start-end tangency); those are future growth.",
+      "profiles": "array of >= 2 sketch node ids, IN LOFT ORDER — the profiles the loft blends through (e.g. [\"n10\",\"n11\"] for a two-circle frustum). Each must reference an EARLIER sketch node."
+    },
+    "sheet_metal": {
+      "description": "Sheet-metal BASE FLANGE (COVERED since v0.5.5 — grown for 4-1). Converts the referenced sketch profile into the sheet blank and establishes the sheet definition (thickness / default bend radius / K-factor). Lowers to sheet_metal_feature(base_flange). The tree's SheetMetal definition feature and Flat-Pattern are byproducts — they are NOT separate IR nodes.",
+      "sketch": "string — id of a sketch node (must be the immediately preceding node — the base flange consumes the ACTIVE sketch)",
+      "thickness": "number — meters (> 0)",
+      "bend_radius": "number (optional — default bend radius in meters; omitted = thickness)",
+      "k_factor": "number (optional, 0..1 — neutral-axis factor, default 0.5)",
+      "reverse_thickness": "boolean (optional, default false — thicken to the OPPOSITE side of the sketch plane. A wrong side puts every downstream bend-sketch plane off the sheet. PREFER reproducing the original's own flag (analyze_model(features) reports it on the SMBaseFlange) over deriving from face positions — see symmetric_thickness for why)",
+      "symmetric_thickness": "boolean (optional, default false — thicken BOTH ways off the sketch plane, ±t/2 mid-plane style. Reproduce the ORIGINAL's own flag (analyze_model(features) reports it on the SMBaseFlange): the thickness-direction flags also define the intrinsic sheet orientation that downstream bend directions fold against — an identical blank B-rep built via reverse flags folded 4-1's Bend1 the MIRRORED way)"
+    },
+    "sketched_bend": {
+      "description": "Sketched bend (SM3dBend; COVERED since v0.5.5 — grown for 4-1's five bends). Bends the sheet about the bend LINE(S) in the referenced sketch — a sketch with N bend lines yields ONE feature with N bends (4-1's Sketch6). Lowers to sheet_metal_feature(sketched_bend). The FIXED side is a 3D pick point: SolidWorks derives which half stays put from the POINT, so this anchor carries side semantics, not just face identity.",
+      "sketch": "string — id of a sketch node holding the bend line(s) (must be the immediately preceding node — the bend consumes the ACTIVE sketch)",
+      "angle": "number — RADIANS (default 1.570796 = 90°, the recipe's SI dimension; the compiler converts to the tool boundary's degrees, C4)",
+      "radius": "number (optional — bend radius in meters; OMITTED = the sheet's default radius, matching a recipe sketched_bend block with no radius)",
+      "position": "string (optional — 'centerline' (default) | 'material_inside' | 'material_outside' | 'bend_outside'; replay the recipe's `position` verbatim)",
+      "flip": "boolean (optional, default false — reverse the bend direction; replay the recipe's `flip`)",
+      "fixed": "{ near: [x,y,z], hint?: string } — a 3D point (meters) ON the sheet face, on the SIDE that must stay put, in the PRE-bend geometry (the state the rebuild is in when the bend executes). Passed straight through as the tool's fixed_x/y/z coordinate pick (no index resolution — the point IS the side selector)."
+    },
+    "mirror": {
+      "description": "Feature mirror about a canonical datum plane (MirrorPattern; COVERED since v0.5.5 — grown for 4-1's Mirror1, which mirrors its two edge flanges about Right Plane). Lowers to create_pattern(mirror) with the referenced nodes' RUNTIME feature names (node_feature mechanism, localization-proof). NOTE (live-verified): SolidWorks refuses to mirror a bare SM3dBend sketched bend — mirror flanges/cuts/bosses; 4-1 mirrors edge flanges.",
+      "plane": "{ datum: 'front' | 'top' | 'right' } — the mirror plane (canonical; the compiler passes the canonical English name, resolved language-independently)",
+      "features": "array of >= 1 earlier feature-producing node ids — the features to mirror, in tree order"
+    },
+    "edge_flange": {
+      "description": "Edge flange with a CUSTOM profile (EdgeFlange; COVERED since v0.5.6 — 4-1's last vocabulary gap). SELF-CONTAINED node: no preceding sketch node — the flange API only accepts a profile sketch IT generated (InsertSketchForEdgeFlange), so the compiler generates it, CLEARS the default rectangle, redraws `profile`, then creates the flange (sheet_metal_feature edge_flange_sketch → add_sketch_entity* → edge_flange_finish). The generated sketch's frame is UNPREDICTABLE, hence `frame` is REQUIRED (IR-ADR-010 transform).",
+      "edge": "{ near: [x,y,z], hint?: string } — a 3D point (meters) ON the attach edge, in the geometry state when this node executes (the reader's edge_flange.edges[].mid — ground-truth readback, IR-ADR-014)",
+      "angle": "number — RADIANS (default 1.570796 = 90°; the compiler converts to the tool boundary's degrees, C4)",
+      "radius": "number (optional — bend radius in meters; OMITTED = the sheet's default radius)",
+      "position": "string (optional — 'material_inside' (tool default) | 'material_outside' | 'bend_outside' | 'centerline' | 'bend_sharp'; replay the recipe edge_flange block's `position` verbatim — 4-1's Edge-Flange1 is bend_outside)",
+      "flip": "boolean (optional, default false — InsertSketchForEdgeFlange's FlipDir; at 90° the flange plane is flip-invariant and the frame transform absorbs the orientation, but replay it when read)",
+      "frame": "{ origin, xdir, ydir } — the ORIGINAL profile sketch's frame (REQUIRED)",
+      "profile": "array of profile primitives — the ORIGINAL profile sketch's segments, original 2D coords (line/arc/circle + construction flags, same grammar as sketch.profile)"
     }
   },
 
   "validation_split": {
-    "plan_time_planner": "Structural + schema only: type is registered, required params present, node references (sketch/node ids) structurally resolvable, units correct.",
-    "compile_exec_time": "Geometric validity: referenced face actually exists after prior features, hole fits within the face, selectors resolve to exactly one entity. Owned by compiler + reference resolver + execution — NOT the Planner."
+    "plan_time_planner": "Structural + schema only: type is registered, required params present, node references (sketch/node ids) structurally resolvable, units correct, anchors well-formed ([x,y,z] numbers), arc dir in {1,-1}.",
+    "compile_exec_time": "Geometric validity: referenced face/edge actually exists after prior features, anchors resolve to exactly one entity (tolerance ball), hole fits within the face. Owned by compiler + reference resolver + execution — NOT the Planner."
   },
 
   "example": {
     "_intent": "Create a 20mm hole at the center of the top face of a 100x100x20mm block.",
-    "schema_version": "0.0.1-draft",
+    "schema_version": "0.5.0-draft",
     "units": "meters",
     "nodes": [
       { "id": "n1", "type": "sketch", "ref": { "datum": "top" },
@@ -94,16 +183,23 @@
     ]
   },
 
-  "example_v0_exp": {
-    "_intent": "A 50mm box with a 10mm hole centred on the top face, through-all (the canonical submit_feature_graph experiment fixture).",
-    "schema_version": "0.0.1-draft-ir-exp",
+  "example_v05_new_vocabulary": {
+    "_intent": "Fragment showing every v0.5 addition at once: a path-profile sketch (line+arc+construction) on an OFFSET plane, a cut terminating up-to-surface, and an anchored edge fillet.",
+    "schema_version": "0.5.0-draft",
     "units": "meters",
     "nodes": [
-      { "id": "n1", "type": "box", "ref": { "datum": "top" },
-        "width": 0.05, "depth": 0.05, "height": 0.05 },
-      { "id": "n2", "type": "hole",
-        "ref": { "node_face": { "node": "n1", "selector": "top" }, "position": "center" },
-        "diameter": 0.01, "depth": "through_all" }
+      { "id": "n1", "type": "sketch", "ref": { "datum": "front", "offset": 0.003 },
+        "profile": [
+          { "kind": "line", "x1": -0.004, "y1": 0.0, "x2": 0.004, "y2": 0.0 },
+          { "kind": "arc", "cx": 0.0, "cy": 0.0, "x1": 0.004, "y1": 0.0, "x2": -0.004, "y2": 0.0, "dir": 1 },
+          { "kind": "line", "x1": 0.0, "y1": -0.006, "x2": 0.0, "y2": 0.006, "construction": true }
+        ] },
+      { "id": "n2", "type": "extrude", "sketch": "n1", "operation": "cut",
+        "end": "up_to_surface",
+        "up_to": { "face": { "near": [0.0, -0.00153, 0.003], "hint": "top face of the 3mm base plate" } } },
+      { "id": "n3", "type": "fillet", "radius": 0.00035,
+        "edges": [ { "near": [0.0065, 0.0, -0.0015], "hint": "left slot edge" },
+                    { "near": [-0.0065, 0.0, -0.0015], "hint": "right slot edge" } ] }
     ]
   }
 }
