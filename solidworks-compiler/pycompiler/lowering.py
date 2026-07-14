@@ -14,7 +14,7 @@ Conventions reused from the low-level tools:
     sharing identical endpoints already close the contour (add_sketch_entity guidance).
 
 Runtime-value placeholder: an offset-datum sketch first creates a reference plane whose NAME only
-exists in that op's RESPONSE (localized, e.g. 'Düzlem1' on a Turkish install — always use the
+exists in that op's RESPONSE (and is localized, e.g. 'Düzlem1' — always use the
 returned name, never a guessed one). Such a param carries the FROM_PREV_FEATURE sentinel and the
 compiler substitutes it with the previous response's cadState.features[0] before executing.
 """

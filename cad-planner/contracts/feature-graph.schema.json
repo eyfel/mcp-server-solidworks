@@ -356,7 +356,7 @@
    "transform": "REQUIRED — 13 numbers: 3x3 rotation row-major + translation xyz (meters) + scale — exactly analyze_assembly(components)' reported layout"
   },
   "mate": {
-   "description": "One mate between two component occurrences. Lowers to add_mate (AddMate5) with INDEX-first entity selection: each side's COMPONENT-LOCAL anchor resolves to a face/edge index via analyze_assembly(faces|edges, component) (KNOWN-LIMITATIONS #6). Read the original's type/alignment/value from the ENUMS verbatim (C7) — live SW is Turkish, display names lie; never derive them from resulting positions.",
+   "description": "One mate between two component occurrences. Lowers to add_mate (AddMate5) with INDEX-first entity selection: each side's COMPONENT-LOCAL anchor resolves to a face/edge index via analyze_assembly(faces|edges, component) (KNOWN-LIMITATIONS #6). Read the original's type/alignment/value from the ENUMS verbatim (C7) — display names are localized and unreliable; never derive them from resulting positions.",
    "mate_type": "'coincident' | 'concentric' | 'perpendicular' | 'parallel' | 'tangent' | 'distance' | 'angle' | 'lock'",
    "alignment": "'aligned' | 'anti_aligned' | 'closest' (optional; record the reader's RESOLVED alignment verbatim)",
    "value": "number (SI: meters for distance, RADIANS for angle — C4; the compiler converts to the tool boundary) — required for distance/angle",

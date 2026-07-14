@@ -946,7 +946,7 @@ namespace SolidworksExecution.Services
 
         /// <summary>
         /// Language-independent default-plane selection. SolidWorks localizes the default
-        /// plane names (e.g. Turkish "Ön Düzlem", Italian "Piano frontale"), so SelectByID2
+        /// plane names (e.g. "Piano frontale" on an Italian install), so SelectByID2
         /// by the English name fails on non-English installs. We first try the given name
         /// (English installs keep working), then fall back to mapping Front/Top/Right to the
         /// first three RefPlane features in tree order (the default planes), selecting the

@@ -880,7 +880,7 @@ namespace SolidworksExecution.Services
                 if (refName != null)
                 {
                     // Canonical English default-plane name, computed from the NORMAL — never read from the
-                    // localized plane name, so it's correct on a Turkish/any-language SW (create_sketch maps
+                    // localized plane name, so it's correct on any SW localization (create_sketch maps
                     // the English name language-independently via SelectPlaneFlexible, ADR-007). offset =
                     // signed perpendicular distance from the global origin: 0 ⇒ the default plane itself;
                     // ≠0 ⇒ a parallel surface at that height (sketch on the face there, or an offset plane).

@@ -17,8 +17,8 @@ namespace SolidworksExecution.Services
         // ==================================================================
         // ASSEMBLY SURFACE (Phase B, ADR-047) — readers first (B1), builders (B3).
         // Signatures reflection-verified 2026-07-09 (scratch/b1_reflection_notes.md).
-        // Mate types/alignments come from the ENUMS — live SW is Turkish, display
-        // names are never trusted. Enum ints inlined per ADR-018 (values reflected
+        // Mate types/alignments come from the ENUMS — display names are localized
+        // and never trusted. Enum ints inlined per ADR-018 (values reflected
         // from swconst 2026-07-09).
         // ==================================================================
 
@@ -255,7 +255,7 @@ namespace SolidworksExecution.Services
         }
 
         // Mate read (B1) — walks the MateGroup's subfeatures, which IS creation order (the IR's
-        // mate grammar: creation order is law). Type/alignment from the ENUMS (never the Turkish
+        // mate grammar: creation order is law). Type/alignment from the ENUMS (never the localized
         // display name); distance/angle value in SI from the mate's own dimension (C7 verbatim);
         // per entity: owning component (null = the assembly's own datum), geometry KIND, and
         // EntityParams (location + direction + radii, assembly space) as the geometric anchor.

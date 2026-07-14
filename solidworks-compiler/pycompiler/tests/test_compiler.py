@@ -48,7 +48,7 @@ EXAMPLE = {
 class FakePort(ExecutionPort):
     """Records calls, bumps state_version on writes, returns canned payloads for analyze_model
     (per analysis_type: faces / edges). add_reference_geometry returns a LOCALIZED created-plane
-    name ('Düzlem1' — the Turkish install) so the FROM_PREV_FEATURE substitution is proven
+    name ('Düzlem1') so the FROM_PREV_FEATURE substitution is proven
     localization-independent. fail_on=(tool, nth) injects a FAILED response on the nth call."""
 
     def __init__(self, faces=_BOX_FACES, edges=None, fail_on=None, sketch_frame=None,
