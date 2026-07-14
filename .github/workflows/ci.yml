@@ -1,0 +1,31 @@
+# Offline test suites only — no SolidWorks needed (the whole point of the ExecutionPort
+# design). The C# execution layer is NOT built here: it references the SolidWorks interop
+# assemblies from a licensed local install, which GitHub runners don't have. Behavioral
+# verification of CAD operations stays manual against live SolidWorks, by design.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install adapter dependencies
+        run: pip install -r adapters/claude/requirements.txt
+
+      - name: Contract test (server.py <-> tool-schemas.json drift)
+        working-directory: adapters/claude
+        run: python tests/test_schema_contract.py
+
+      - name: pycompiler offline suite (lowering/resolver against a fake port)
+        working-directory: solidworks-compiler
+        run: python -m pycompiler.tests.test_compiler

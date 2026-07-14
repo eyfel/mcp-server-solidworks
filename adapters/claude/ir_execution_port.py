@@ -1,8 +1,10 @@
 """Adapter-side bridge from the deterministic pycompiler to the LIVE execution layer.
 
 This is the only place that wires the two together. It:
-  - puts solidworks-compiler/ on sys.path (the dir is hyphenated, so it can't be imported by name)
-    and imports the pure pycompiler package;
+  - imports the pure pycompiler package — preferring an installed copy (the package is
+    pip-installable via solidworks-compiler/pyproject.toml, ideally `pip install -e` so the
+    installed copy IS the repo copy), falling back to a sys.path insert of the repo tree
+    (the dir is hyphenated, so it can't be imported by path name alone);
   - implements pycompiler's ExecutionPort over the EXISTING execution_client — the SAME
     /api/tool/execute + /state endpoints and the SAME idempotency / state_version machinery the
     low-level tools use (nothing forked, per the additive constraint).
@@ -14,13 +16,16 @@ import os
 import sys
 import uuid
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_COMPILER_ROOT = os.path.normpath(os.path.join(_HERE, "..", "..", "solidworks-compiler"))
-if _COMPILER_ROOT not in sys.path:
-    sys.path.insert(0, _COMPILER_ROOT)
-
-from pycompiler.compiler import compile_and_run          # noqa: E402
-from pycompiler.execution_port import ExecutionPort       # noqa: E402
+try:
+    from pycompiler.compiler import compile_and_run
+    from pycompiler.execution_port import ExecutionPort
+except ImportError:
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    _COMPILER_ROOT = os.path.normpath(os.path.join(_HERE, "..", "..", "solidworks-compiler"))
+    if _COMPILER_ROOT not in sys.path:
+        sys.path.insert(0, _COMPILER_ROOT)
+    from pycompiler.compiler import compile_and_run
+    from pycompiler.execution_port import ExecutionPort
 
 from execution_client import call_tool, get_state          # noqa: E402
 

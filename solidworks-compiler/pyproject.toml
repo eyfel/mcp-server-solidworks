@@ -1,0 +1,18 @@
+# Packaging for the deterministic IR compiler. Installing this (pip install -e .) lets
+# `import pycompiler` resolve without the adapter's sys.path fallback and makes IDEs /
+# type checkers see the package. The adapter still works uninstalled — ir_execution_port
+# falls back to inserting this directory on sys.path (the dir name is hyphenated, so the
+# package cannot be imported by path name alone).
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "solidpilot-pycompiler"
+version = "0.6.0"
+description = "SolidPilot: deterministic Feature Graph IR -> SolidWorks tool-call compiler (no LLM below MCP)"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0-only" }
+
+[tool.setuptools]
+packages = ["pycompiler", "pycompiler.tests"]
