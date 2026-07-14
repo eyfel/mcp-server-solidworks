@@ -1,6 +1,6 @@
 # recipe-usage.md — The IR Generation Recipe (usage edition)
 
-**Version: 0.7.1** · Owner: cad-planner · Served to the model section-by-section via the
+**Version: 0.7.2** · Owner: cad-planner · Served to the model section-by-section via the
 `get_recipe` MCP tool. This is the operational rule set for turning an analysis artifact's
 recipe into a Feature Graph IR (and for producing reconstructable drawings). Sections are
 addressed by the slug in each `##` header.
@@ -202,6 +202,28 @@ Per PART (never per batch):
    `RESOLVER_GAP` and specifics.
 5. Write the whole outcome into `ir.verification`. **Only `verified` IR may ever be used for
    rebuilds, variants, or pattern matching.**
+
+### Reverse reconstruction (drawing → part) — reading discipline (added 0.7.2)
+
+When rebuilding a part from ONLY its drawing (original never opened during the build):
+
+- **Dimension NAMES are not feature-location truth.** A dim labelled `@Chamfer2` may be a block
+  CORNER chamfer, not a hole chamfer; `@Fillet2` may sit on a feature-INTERSECTION edge (hole ∩
+  slot), not a rim. When a fillet/chamfer target is ambiguous, let the round-trip topology delta
+  pin it — never infer the target face/edge from the dimension name alone.
+- **Through-vs-blind: trust dimension OWNERSHIP.** A hole/slot whose POSITION dims are owned by
+  the base sketch (`@Sketch1`) is a loop IN that sketch → it goes THROUGH the base extrude. Do not
+  override this from an ambiguous section-view "looks blind" read. One-datum confirmation: the
+  feature's hidden outline spans the FULL depth in an ortho view.
+- **Extract all profile detail from the FIRST vector read.** Corner counts (e.g. a slot with 3
+  rounded + 1 SHARP corner), sharp-vs-filleted vertices, exact rectangles are all in the first
+  `analyze_drawing(include_geometry)` polylines — count arcs by radius/region BEFORE sketching, so
+  the miss isn't discovered later via the round-trip.
+- **PDF export+crop is a LAST-RESORT orientation aid, not the primary read.** Use it only when a
+  specific 2D→3D orientation or corner is genuinely ambiguous from vectors; a cluttered section
+  can mislead (it "looks blind").
+- **Deterministic readback of the original (`feature_map`/rollback) is allowed ONLY in the
+  verification phase**, to pin a topology delta — never during the build.
 
 ## coverage — Coverage reporting
 
