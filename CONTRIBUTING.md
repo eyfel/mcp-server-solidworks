@@ -153,9 +153,8 @@ your pull request description:
 > **Note on significant contributions.** For small fixes, the pull-request
 > acknowledgment above is sufficient. For a substantial contribution, the owner may
 > ask you to also confirm the CLA via a signed document (a wet signature or a secure
-> electronic signature) — this makes the grant robust under Turkish copyright law
-> (FSEK Art. 52, which requires transfers/licenses of economic rights to be in
-> writing and signed). This is not a legal opinion; it is a practical safeguard.
+> electronic signature) — this makes the grant robust under copyright law.
+> This is not a legal opinion; it is a practical safeguard.
 
 ---
 
