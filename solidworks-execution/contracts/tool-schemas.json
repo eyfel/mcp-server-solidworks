@@ -501,8 +501,19 @@
   },
   "output": "→ see execution-response.json — CadState.ActiveDocument holds the now-active document title"
  },
+ "get_recipe": {
+  "description": "[ADAPTER-ONLY — no COM, no REST, no state_version] Serves the IR-generation recipe (cad-planner/recipe-usage.md) to the model section-by-section, plus the two cad-planner contract JSONs (feature-graph.schema.json = the capability registry; analysis-artifact.schema.json). The model calls this BEFORE writing an ir.graph or producing a reconstruction-grade drawing — token cost stays proportional to the task (index → only the needed sections). Read-only file serving from the repo; no SolidWorks interaction.",
+  "input": {
+   "operation_id": "n/a — pure file read, no execution call",
+   "state_version": "n/a — pure file read, no execution call",
+   "params": {
+    "section": "string enum (default 'index' — TOC + version header): 'contract' | 'canonicalization' | 'mapping' | 'mapping_part' | 'mapping_sheet_metal' | 'mapping_assembly' | 'verification' | 'coverage' | 'drawing' | 'feature_graph_schema' (IR schema JSON) | 'analysis_artifact_schema' (artifact contract JSON)"
+   }
+  },
+  "output": "The requested recipe section as markdown (or the raw contract JSON for the two schema sections)."
+ },
  "save_analysis": {
-  "description": "[ADAPTER-ONLY — Phase A analysis pipeline, ADR-040] NOT a COM/execution tool: it has NO ToolController/SolidWorksService case. The adapter orchestrates EXISTING reads (open_document/activate_document + analyze_model features/mass_properties/geometry), computes the file's sha256, and writes the persistent analysis artifact <folder>/.solidpilot/<filename>.analysis.json per cad-planner/contracts/analysis-artifact.schema.json. Artifacts are a CACHE, never truth: identity.source_hash mismatch against the current file = stale, re-analyze. The ir block is left null (the AI/IR pass per cad-planner/recipe.md fills it later). Leaves the part open and active.",
+  "description": "[ADAPTER-ONLY — Phase A analysis pipeline, ADR-040] NOT a COM/execution tool: it has NO ToolController/SolidWorksService case. The adapter orchestrates EXISTING reads (open_document/activate_document + analyze_model features/mass_properties/geometry), computes the file's sha256, and writes the persistent analysis artifact <folder>/.solidpilot/<filename>.analysis.json per cad-planner/contracts/analysis-artifact.schema.json. Artifacts are a CACHE, never truth: identity.source_hash mismatch against the current file = stale, re-analyze. The ir block is left null (the AI/IR pass fills it later — the model gets the mapping rules from the get_recipe tool). Leaves the part open and active.",
   "input": {
    "operation_id": "n/a at this level — each underlying read carries its own operation_id (uuid4) on /api/tool/execute",
    "state_version": "n/a at this level — the underlying calls thread the adapter's tracked state_version (one-shot resync-retry on INVALID_STATE_VERSION)",

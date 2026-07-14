@@ -1,9 +1,14 @@
 .claude/
 
+# Dev ledgers (logs/sessions/AGENTS/KNOWN-LIMITATIONS/recipe.md full edition) stay PRIVATE —
+# the project's competitive knowledge base. Public docs are explicitly un-ignored below.
 *.md
 !README.md
 !CONTRIBUTING.md
 !CLA.md
+!master-architecture.md
+!architecture.md
+!recipe-usage.md
 
 .vs/
 

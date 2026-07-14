@@ -85,7 +85,7 @@ The `adapters/` layer is provider-specific and replaceable. Because the executio
 
 ## Tool List
 
-The system currently exposes **43 tools** (the set keeps growing); a contract test keeps the adapter and the execution contract in exact sync (see [CONTRIBUTING.md](CONTRIBUTING.md)). Most are low-level CAD operations; a few (`save_analysis`, `rebuild_from_ir`, `compare_parts`, `compare_assemblies`) drive the analysis / IR round-trip described below. All lengths are in meters (SolidWorks internal units).
+The system currently exposes **44 tools** (the set keeps growing); a contract test keeps the adapter and the execution contract in exact sync (see [CONTRIBUTING.md](CONTRIBUTING.md)). Most are low-level CAD operations; a few (`save_analysis`, `rebuild_from_ir`, `compare_parts`, `compare_assemblies`) drive the analysis / IR round-trip described below. All lengths are in meters (SolidWorks internal units).
 
 ### Document and lifecycle
 - `ensure_ready` — launches SolidWorks via COM and attaches if it is closed (does not open a document).
@@ -133,6 +133,7 @@ The system currently exposes **43 tools** (the set keeps growing); a contract te
 ### Analysis pipeline & IR round-trip
 These tools implement the reverse-engineering loop — *"the LLM proposes, the round-trip decides"* — that reproduces an existing part from a CAD-neutral Feature Graph IR and objectively verifies the result.
 
+- `get_recipe` — serves the IR-generation recipe to the model section-by-section (mapping/canonicalization rules, the Feature Graph schema, the artifact contract) — the model calls it before writing an IR.
 - `save_analysis` — writes an **analysis artifact** for a part or assembly file (feature recipe / component + mate tree, driving parameters, and an optional Feature Graph IR block) to `<folder>/.solidpilot/`.
 - `rebuild_from_ir` — the mainline IR door: runs an artifact's IR block through the deterministic compiler to rebuild the part — or assembly — in a fresh document (same compiler that the future `submit_feature_graph` will use — two doors, one compiler).
 - `compare_parts` — objective two-part diff (topology, volume, area, center of mass) with the project's `verified` verdict (topology-exact **and** |ΔV| ≤ 1% **and** |ΔA| ≤ 1%).

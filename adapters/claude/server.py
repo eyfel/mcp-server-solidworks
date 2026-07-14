@@ -1217,6 +1217,72 @@ def activate_document(title: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool: get_recipe  (adapter-only — serves the IR-generation rules to the model)
+# ---------------------------------------------------------------------------
+_CAD_PLANNER_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "cad-planner"))
+
+
+def _recipe_sections():
+    """Parse cad-planner/recipe-usage.md into its version header + {slug: (title, body)} by the
+    '## slug — title' section headers. Read fresh on every call — the file ships with the server
+    and is small; no caching keeps edits live without a reconnect."""
+    path = os.path.join(_CAD_PLANNER_DIR, "recipe-usage.md")
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        text = fh.read()
+    sections = {}
+    current = None
+    for line in text.splitlines():
+        if line.startswith("## ") and " — " in line:
+            slug, _, title = line[3:].partition(" — ")
+            current = slug.strip()
+            sections[current] = [title.strip(), []]
+        elif current is not None:
+            sections[current][1].append(line)
+    header = text.split("\n## ", 1)[0]  # the version/preamble block above the first section
+    return header, {k: (t, "\n".join(body).strip()) for k, (t, body) in sections.items()}
+
+
+@mcp.tool()
+def get_recipe(
+    section: Literal["index", "contract", "canonicalization", "mapping", "mapping_part",
+                     "mapping_sheet_metal", "mapping_assembly", "verification", "coverage",
+                     "drawing", "feature_graph_schema", "analysis_artifact_schema"] = "index",
+) -> str:
+    """The IR-generation recipe — REQUIRED READING before writing any Feature Graph IR
+    (an artifact's `ir.graph`) or producing a drawing meant for reconstruction. Serves the
+    rules section-by-section so token cost stays proportional to the task.
+
+    Call order for the IR flow: 'contract' + 'canonicalization' + 'mapping' first, then the
+    vocabulary section matching the document ('mapping_part' / 'mapping_sheet_metal' /
+    'mapping_assembly'), then 'verification' before labeling anything. 'drawing' holds the
+    model→drawing rules (section coverage, HLV convention, model_path sourcing).
+
+    section='index' (default): the version header + a one-line table of contents.
+    section='feature_graph_schema': the Feature Graph IR schema / capability registry JSON —
+        the node types and params the compiler accepts (what is NOT in it cannot be built).
+    section='analysis_artifact_schema': the persistent analysis-artifact contract JSON
+        (identity/hash, recipe, parameters, ir block + the formal 'verified' definition).
+    Read-only; does NOT touch SolidWorks or state_version."""
+    if section == "feature_graph_schema":
+        with open(os.path.join(_CAD_PLANNER_DIR, "contracts", "feature-graph.schema.json"),
+                  "r", encoding="utf-8-sig") as fh:
+            return fh.read()
+    if section == "analysis_artifact_schema":
+        with open(os.path.join(_CAD_PLANNER_DIR, "contracts", "analysis-artifact.schema.json"),
+                  "r", encoding="utf-8-sig") as fh:
+            return fh.read()
+    header, sections = _recipe_sections()
+    if section == "index":
+        toc = "\n".join(f"- {slug} — {title}" for slug, (title, _b) in sections.items())
+        return (f"{header.strip()}\n\nSections (pass as `section`):\n{toc}\n"
+                "- feature_graph_schema — the IR schema / capability registry (JSON)\n"
+                "- analysis_artifact_schema — the analysis-artifact contract (JSON)")
+    title, body = sections[section]
+    return f"## {section} — {title}\n\n{body}"
+
+
+# ---------------------------------------------------------------------------
 # Tool: save_analysis  (Phase A analysis pipeline — ADAPTER-ONLY, no C#; ADR-040)
 # ---------------------------------------------------------------------------
 ANALYSIS_SCHEMA_VERSION = "0.1.0-draft"  # cad-planner/contracts/analysis-artifact.schema.json
@@ -1299,8 +1365,9 @@ def save_analysis(file_path: str) -> str:
 
     The artifact is a CACHE of the file's state at analysis time: consumers must compare
     identity.source_hash against the current file and re-analyze on a mismatch. The `ir` block
-    is left null here (the AI/IR pass fills it later — see cad-planner/recipe.md). The part is
-    left OPEN and ACTIVE for follow-up work.
+    is left null here — the AI/IR pass fills it later: BEFORE writing an ir.graph, call
+    get_recipe (start with section='index') for the mapping rules. The part is left OPEN and
+    ACTIVE for follow-up work.
 
     file_path: absolute path of the .SLDPRT part OR .SLDASM assembly to analyze (drawing
         artifacts arrive with later pipeline steps). An assembly artifact's recipe holds the
@@ -1492,7 +1559,9 @@ def rebuild_from_ir(artifact_path: str, fresh_document: bool = True) -> str:
 
     Returns the compiler's per-node summary (COMPLETED n/n, or the feature-level error and how
     far it got — partial geometry may remain; CAD ops are not transactional). Afterwards, verify
-    with compare_parts and only then label the artifact's ir.verification."""
+    with compare_parts and only then label the artifact's ir.verification. If you are GENERATING
+    the ir.graph yourself, call get_recipe first (start with section='index') — it holds the
+    mapping/canonicalization rules the compiler expects."""
     global _state_version
     path = os.path.abspath(artifact_path)
     if not os.path.isfile(path):
