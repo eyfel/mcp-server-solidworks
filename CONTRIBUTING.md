@@ -69,7 +69,7 @@ python server.py
 ### A new low-level tool (execution surface)
 
 1. **Contract** — add the tool to `solidworks-execution/contracts/tool-schemas.json`.
-2. **Execution** — add a `case "tool_name":` in `ToolController.cs` and implement it in `SolidWorksService.cs`. **Verify any SolidWorks COM API signature by reflecting the interop assembly first — never invent a method name or argument list.** The real API frequently differs from what looks plausible (for example, the model-item insertion API lives on `IDrawingDoc`, not `IView`; `GetLines3` returns empty while `GetPolylines7` is the working geometry getter). Decode unknown return shapes empirically against a live document before writing the parser.
+2. **Execution** — add a `case "tool_name":` in `ToolController.cs` and implement it in the matching `SolidWorksService.<Family>.cs` **partial class** under `Services/` (one class split by tool family: core / Sketch / Features / SheetMetal / Drawing / Analyze / Assembly; a new file also needs a `<Compile Include>` entry in the csproj). **Verify any SolidWorks COM API signature by reflecting the interop assembly first — never invent a method name or argument list.** The real API frequently differs from what looks plausible (for example, the model-item insertion API lives on `IDrawingDoc`, not `IView`; `GetLines3` returns empty while `GetPolylines7` is the working geometry getter). Decode unknown return shapes empirically against a live document before writing the parser.
 3. **Adapter** — register the MCP tool in `adapters/claude/server.py`. Model-facing guidance lives here (the client never sees `tool-schemas.json`): use `Literal` enums for discriminators, Pydantic `Field` constraints for units and ranges, and real required parameters.
 4. **Verify** — run the contract test (see below), then validate against live SolidWorks.
 
@@ -79,7 +79,7 @@ python server.py
 2. Add its lowering rule and any required reference resolution in `solidworks-compiler`.
 3. It reuses existing low-level tools; usually no new execution tool is needed.
 
-> **Experimental IR tool flag:** the IR entry point `submit_feature_graph` is an experimental **test tool**, gated behind an opt-in kill switch and **disabled by default**. To exercise the IR path, set `SOLIDPILOT_ENABLE_IR=true` in `adapters/claude/.env` (default `false`) and reconnect the adapter; while disabled it stays registered but refuses to run. See `logs-ir.md` (IR-ADR-001).
+> **The two IR doors:** the mainline IR entry point is the `rebuild_from_ir` tool (rebuilds a part/assembly from its analysis artifact's IR block). A second, direct-IR **test tool** — `submit_feature_graph` — is kept fully **commented out** in `adapters/claude/server.py` (zero MCP token cost); its comment block contains self-contained re-enable instructions. Both doors run through the same `pycompiler` — never fork the compiler.
 
 ---
 
@@ -107,7 +107,14 @@ python server.py
 
 - **Live testing (manual by design):** tools are verified against live SolidWorks, with the GUI open, case by case. A cohesive batch of tools is chosen together and tested as a batch. When a tool fails, inspect `execution.log` and report the expected result, the API response, and a hypothesis. For drawing tools, the exported **PDF is the ground truth** — some interop counters under-report (e.g. inserted annotations / center marks), so confirm a drawing change by exporting and reading the PDF rather than trusting an in-band count alone.
 
-There is no behavioral/regression test suite yet; the contract test is the only automated test.
+- **Compiler suite:** `solidworks-compiler/pycompiler/tests/` exercises IR validation, lowering, and reference resolution against a fake execution port — fully offline.
+
+  ```
+  cd solidworks-compiler
+  python -m pycompiler.tests.test_compiler
+  ```
+
+Both offline suites run in **CI on every push/PR** (`.github/workflows/ci.yml`). The C# layer is not built in CI — it requires the licensed SolidWorks interop assemblies; C# behavior is verified live instead.
 
 ---
 
