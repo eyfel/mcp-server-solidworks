@@ -91,6 +91,12 @@
     <Compile Include="Models\ToolRequest.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Services\SolidWorksService.cs" />
+    <Compile Include="Services\SolidWorksService.Sketch.cs" />
+    <Compile Include="Services\SolidWorksService.Features.cs" />
+    <Compile Include="Services\SolidWorksService.SheetMetal.cs" />
+    <Compile Include="Services\SolidWorksService.Drawing.cs" />
+    <Compile Include="Services\SolidWorksService.Analyze.cs" />
+    <Compile Include="Services\SolidWorksService.Assembly.cs" />
     <Compile Include="Startup.cs" />
   </ItemGroup>
   <ItemGroup>
