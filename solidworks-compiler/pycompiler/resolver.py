@@ -196,6 +196,153 @@ def resolve_face_on_plane(port, state_version, datum, offset, node_id=None):
     return best[1] if best else None
 
 
+def _analyze_assembly_payload(port, state_version, analysis_type, component, node_id, step):
+    """Run read-only analyze_assembly(analysis_type, component) and parse its JSON payload."""
+    resp = port.execute("analyze_assembly",
+                        {"analysis_type": analysis_type, "component": component}, state_version)
+    if resp.get("status") != "COMPLETED":
+        err = resp.get("error") or {}
+        raise FeatureError("analyze_assembly(%s, %s) failed: %s"
+                           % (analysis_type, component, err.get("message")),
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+    feats = (resp.get("cadState") or {}).get("features") or []
+    if not feats:
+        raise FeatureError("analyze_assembly(%s, %s) returned no data" % (analysis_type, component),
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+    try:
+        return json.loads(feats[0])
+    except Exception as ex:
+        raise FeatureError("could not parse analyze_assembly(%s) payload: %s" % (analysis_type, ex),
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+
+
+_FACE_ANCHOR_KINDS = frozenset(("plane", "cylinder", "cone", "sphere"))
+_EDGE_ANCHOR_KINDS = frozenset(("line", "circle"))
+
+
+def _point_axis_distance(p, origin, axis):
+    """Distance from point p to the infinite line origin + t*axis (axis unit-ish)."""
+    d = [p[i] - origin[i] for i in range(3)]
+    t = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2]
+    proj = [origin[i] + t * axis[i] for i in range(3)]
+    return _dist3(p, proj)
+
+
+def resolve_component_entity_by_anchor(port, state_version, component_name, anchor, node_id=None):
+    """A mate side's COMPONENT-LOCAL anchor {kind, near} -> ('face'|'edge', index) on that
+    component — index-first selection for add_mate (KNOWN-LIMITATIONS #6).
+
+    The anchor coordinates are COMPONENT-LOCAL (the IR generator maps the original mate's
+    assembly-space EntityParams through the inverse component transform), which makes them
+    transform-invariant: they match the rebuild's component regardless of where it currently
+    sits. analyze_assembly(faces|edges, component) reports the same local coords (proven live).
+
+    Match rules by kind (the reader's swMateEntity2ReferenceType_e name, verbatim):
+      plane            -> planar faces whose plane contains 'near' (distinct planes = ambiguous;
+                          nearest representative point among coplanar wins — coplanar faces are
+                          interchangeable constraints);
+      cylinder         -> faces reported kind='cylinder' with |dist(near, axis) - radius| <= tol
+                          (coaxial same-radius faces group; distinct axes = ambiguous);
+      line | circle    -> edges whose MID lies within the anchor ball (exactly one);
+      cone | sphere    -> not resolvable yet (loud VOCABULARY/RESOLVER gap, C5)."""
+    step = "resolve_component_entity_by_anchor"
+    kind = anchor.get("kind")
+    near = anchor["near"]
+
+    if kind in _EDGE_ANCHOR_KINDS:
+        data = _analyze_assembly_payload(port, state_version, "edges", component_name, node_id, step)
+        in_ball = []
+        nearest = None
+        for e in data.get("edges") or []:
+            m = e.get("mid")
+            if not (isinstance(m, list) and len(m) >= 3):
+                continue
+            d = _dist3(near, m)
+            nearest = d if nearest is None or d < nearest else nearest
+            if d <= _EDGE_TOL:
+                in_ball.append((d, int(e.get("i", -1))))
+        if not in_ball:
+            raise FeatureError("edge anchor %s matched no edge mid on '%s' within %g m (nearest %.6f m)"
+                               % (list(near), component_name, _EDGE_TOL, nearest if nearest is not None else -1),
+                               code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+        if len(in_ball) > 1:
+            raise FeatureError("edge anchor %s matched %d edges on '%s' — ambiguous"
+                               % (list(near), len(in_ball), component_name),
+                               code="REFERENCE_AMBIGUOUS", node_id=node_id, step=step)
+        return "edge", in_ball[0][1]
+
+    if kind not in _FACE_ANCHOR_KINDS:
+        raise FeatureError("anchor kind %r is not resolvable (supported: %s)"
+                           % (kind, sorted(_FACE_ANCHOR_KINDS | _EDGE_ANCHOR_KINDS)),
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+    if kind in ("cone", "sphere"):
+        raise FeatureError("anchor kind %r is a recorded RESOLVER gap (v0 resolves plane/cylinder "
+                           "faces and line/circle edges)" % kind,
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+
+    # Optional stored DIRECTION (C7 ground truth from the original mate's EntityParams): the
+    # plane NORMAL / cylinder AXIS. A stored point can lie on TWO distinct planes (the 4-1
+    # interior-anchor lesson — hit live on 1-1's shaft flat); the direction disambiguates.
+    a_dir = anchor.get("dir")
+    a_radius = anchor.get("radius")
+
+    data = _analyze_assembly_payload(port, state_version, "faces", component_name, node_id, step)
+    matches = []  # (tie_break_dist, face_index, group_key)
+    for f in data.get("faces") or []:
+        idx = int(f.get("i", -1))
+        p = f.get("point")
+        if kind == "plane":
+            if not f.get("planar"):
+                continue
+            n = f.get("normal")
+            if not (isinstance(n, list) and isinstance(p, list) and len(n) >= 3 and len(p) >= 3):
+                continue
+            if a_dir is not None and abs(n[0] * a_dir[0] + n[1] * a_dir[1] + n[2] * a_dir[2]) < 0.999:
+                continue  # normal disagrees with the stored one — a different plane
+            plane_dist = abs((near[0] - p[0]) * n[0] + (near[1] - p[1]) * n[1] + (near[2] - p[2]) * n[2])
+            if plane_dist <= _PLANE_TOL:
+                nn = tuple(round(abs(c), 3) for c in n[:3])
+                d = round(abs(near[0] * n[0] + near[1] * n[1] + near[2] * n[2]), 5)
+                matches.append((_dist3(near, p), idx, (nn, d)))
+        else:  # cylinder
+            if f.get("kind") != "cylinder":
+                continue
+            origin, axis, radius = f.get("origin"), f.get("axis"), f.get("radius")
+            if not (isinstance(origin, list) and isinstance(axis, list) and _is_num(radius)):
+                continue
+            if a_dir is not None and abs(axis[0] * a_dir[0] + axis[1] * a_dir[1] + axis[2] * a_dir[2]) < 0.999:
+                continue  # axis disagrees with the stored one
+            if a_radius is not None and abs(float(radius) - float(a_radius)) > _PLANE_TOL:
+                continue  # the stored fit radius pins WHICH coaxial surface is meant
+            if abs(_point_axis_distance(near, origin, axis) - float(radius)) <= _PLANE_TOL:
+                ax = tuple(round(abs(c), 3) for c in axis[:3])
+                # axis line key: direction + the origin's projection distance off the axis
+                # through the model origin — coaxial faces share it.
+                op_ = _point_axis_distance((0.0, 0.0, 0.0), origin, axis)
+                key = (ax, round(op_, 5), round(float(radius), 5))
+                tie = _dist3(near, p) if isinstance(p, list) and len(p) >= 3 else 0.0
+                matches.append((tie, idx, key))
+
+    if not matches:
+        raise FeatureError("%s anchor %s matched no face on '%s'"
+                           % (kind, list(near), component_name),
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+    if len(set(m[2] for m in matches)) > 1:
+        raise FeatureError("%s anchor %s matches faces on %d DISTINCT surfaces of '%s' — ambiguous"
+                           % (kind, list(near), len(set(m[2] for m in matches)), component_name),
+                           code="REFERENCE_AMBIGUOUS", node_id=node_id, step=step)
+    matches.sort(key=lambda m: m[0])
+    idx = matches[0][1]
+    if idx < 0:
+        raise FeatureError("anchored face has no valid index",
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+    return "face", idx
+
+
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def resolve_edges_by_anchor(port, state_version, anchors, node_id=None):
     """Edge anchors -> edge indices (for add_edge_feature edge_indices).
 

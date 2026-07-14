@@ -332,6 +332,45 @@ def lower_mirror(node, feature_names):
                "mirror %s about %s" % (feature_names, _PLANE[d]))]
 
 
+def lower_component(node):
+    """component -> ONE insert_component with the FULL transform (13 numbers, the reader's
+    layout) as a JSON-array STRING (ADR-022). The transform is the placement input for a fixed
+    component and the best deterministic initial placement for a floating one (mates then
+    constrain it — starting at the original's final position keeps the solve trivial and the
+    stop-check comparable). `fixed` is always sent explicitly (deterministic state, C7 spirit)."""
+    src = node["source"]
+    params = {"file_path": src["path"],
+              "transform_json": json.dumps([float(v) for v in node["transform"]]),
+              "fixed": node.get("fixed") is True}
+    if node.get("config"):
+        params["config"] = node["config"]
+    name = src["path"].replace("\\", "/").rsplit("/", 1)[-1]
+    return [Op("insert_component", params,
+               "component %s%s" % (name, " (fixed)" if node.get("fixed") is True else ""))]
+
+
+def lower_mate(node, sides):
+    """mate -> ONE add_mate. sides = [(runtime_component_name, 'face'|'edge', index), ...2] —
+    the resolver already turned each side's COMPONENT-LOCAL anchor into an entity index
+    (index-first selection, KNOWN-LIMITATIONS #6). Values: distance passes SI meters through;
+    angle converts IR RADIANS -> tool-boundary DEGREES (C4). alignment/flip verbatim (C7)."""
+    (an, ak, ai), (bn, bk, bi) = sides
+    params = {"mate_type": node["mate_type"],
+              "a_component": an, "a_kind": ak, "a_index": int(ai),
+              "b_component": bn, "b_kind": bk, "b_index": int(bi)}
+    if node.get("alignment"):
+        params["alignment"] = node["alignment"]
+    if node.get("flip") is True:
+        params["flip"] = True
+    if node["mate_type"] == "distance":
+        params["value"] = float(node["value"])
+    elif node["mate_type"] == "angle":
+        params["value"] = round(math.degrees(float(node["value"])), 6)
+    return [Op("add_mate", params,
+               "%s mate %s[%s#%d] ~ %s[%s#%d]"
+               % (node["mate_type"], an, ak, int(ai), bn, bk, int(bi)))]
+
+
 def lower_hole(node, face_index, center2d):
     """hole -> create_sketch(on_face, face_index) + circle at the resolved centre + through cut."""
     r = float(node["diameter"]) / 2.0

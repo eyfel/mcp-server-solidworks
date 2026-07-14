@@ -109,16 +109,145 @@ def open_new_part(template_path: str = "") -> str:
 # Tool: open_document
 # ---------------------------------------------------------------------------
 @mcp.tool()
-def open_document(file_path: str) -> str:
+def open_document(file_path: str, as_assembly: bool = False) -> str:
     """Open an EXISTING document from disk (counterpart to open_new_part, which makes a BLANK doc).
     file_path: full path to the file.
       - Native .sldprt / .sldasm / .slddrw open directly.
-      - Foreign .ipt (Inventor) / .CATPart (CATIA) / .step / .iges / .x_t import as a PART via SolidWorks
-        3D Interconnect (must be enabled in Tools > Options > Import, and the translator licensed). If
-        unsupported, returns a clear OPEN_FAILED so you can convert to STEP or defer that file.
-    Makes the opened document active and bumps state_version. Use this to load a sample part before
-    producing its drawing (create_drawing + add_drawing_view)."""
-    return _call("open_document", {"file_path": file_path})
+      - Foreign .step / .iges / .x_t / NX .prt / .ipt / .CATPart import via a STAGED path: the
+        CLASSIC translator (LoadFile4) first — proven for STEP/IGES and NX .prt — with a
+        3D-Interconnect retry as the last resort. A clear OPEN_FAILED means no usable translator:
+        convert to STEP or defer that file.
+      - as_assembly=True (foreign files only): the file is an ASSEMBLY STEP — the classic import
+        would flatten it to a MULTIBODY PART; this asks for a real assembly import instead.
+    Makes the opened document active and bumps state_version."""
+    params = {"file_path": file_path}
+    if as_assembly:
+        params["as_assembly"] = True
+    return _call("open_document", params)
+
+
+# ---------------------------------------------------------------------------
+# Tool: open_new_assembly  (Phase B, ADR-047)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def open_new_assembly(template_path: str = "") -> str:
+    """Open a new blank SolidWorks ASSEMBLY document (the twin of open_new_part).
+    Use before insert_component / add_mate. template_path: optional .asmdot template
+    (default: the user-configured assembly template)."""
+    params = {}
+    if template_path:
+        params["template_path"] = template_path
+    return _call("open_new_assembly", params)
+
+
+# ---------------------------------------------------------------------------
+# Tool: analyze_assembly  (Phase B read tool, ADR-047 B1)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def analyze_assembly(
+    analysis_type: Literal["components", "components_flat", "mates", "faces", "edges"],
+    component: str = "",
+) -> str:
+    """Analyze the active ASSEMBLY document (read-only, does NOT change state).
+    analysis_type='components': top-level component occurrences in FEATURE-TREE order — per
+        instance: name (instance-numbered, e.g. 'Shaft-1'), source file path, config, fixed /
+        suppressed flags, children count (a subassembly — out of scope, recorded as a gap), and
+        the FULL transform (13 numbers: 3x3 rotation row-major + translation in meters + scale)
+        — the position ground truth for round-trip verification.
+    analysis_type='components_flat': LEAF occurrences across ALL nesting levels (depth-first
+        tree order, transforms in ROOT space, each with its parent's name) — flattens a
+        wrapper/subassembly level for ground-truth acquisition; the IR itself stays flat.
+    analysis_type='mates': all mates in CREATION order — type and alignment from the SolidWorks
+        ENUMS (locale-proof), the SI value for distance/angle mates, and per mate entity: owning
+        component, entity kind (plane/cylinder/circle/...), and its geometric params in ASSEMBLY
+        space (location + direction + radii).
+    analysis_type='faces' / 'edges': ONE component's face/edge list with stable indices — feeds
+        add_mate's index-based entity selection. Requires `component` (the Name2 from
+        'components'). Coordinates are COMPONENT-LOCAL (the payload carries the transform)."""
+    params = {"analysis_type": analysis_type}
+    if component:
+        params["component"] = component
+    return _call("analyze_assembly", params)
+
+
+# ---------------------------------------------------------------------------
+# Tool: insert_component  (Phase B build tool, ADR-047 B3)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def insert_component(
+    file_path: str,
+    x: float = 0.0,
+    y: float = 0.0,
+    z: float = 0.0,
+    config: str = "",
+    fixed: bool = False,
+    transform_json: str = "[]",
+) -> str:
+    """Insert a part file as a component of the ACTIVE assembly (open_new_assembly first).
+    file_path: the .SLDPRT to insert (meters for all coordinates).
+    x/y/z: insertion point — used when transform_json is not given.
+    transform_json: OPTIONAL full placement as a JSON array STRING of 13 numbers
+        (3x3 rotation row-major + translation xyz + scale — exactly the layout
+        analyze_assembly(components) reports). Needed for rotated placements.
+    fixed: True fixes the occurrence (its transform becomes authoritative); False leaves it
+        floating for mates to position. The state is applied explicitly either way.
+    Returns the runtime component name (e.g. 'Shaft-2') + fixed/transform readbacks."""
+    params = {"file_path": file_path, "x": x, "y": y, "z": z, "fixed": fixed}
+    if config:
+        params["config"] = config
+    if transform_json and transform_json != "[]":
+        params["transform_json"] = transform_json
+    return _call("insert_component", params)
+
+
+# ---------------------------------------------------------------------------
+# Tool: add_mate  (Phase B build tool, ADR-047 B3)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def add_mate(
+    mate_type: Literal["coincident", "concentric", "perpendicular", "parallel",
+                       "tangent", "distance", "angle", "lock"],
+    a_component: str,
+    a_index: int,
+    b_component: str,
+    b_index: int,
+    a_kind: Literal["face", "edge"] = "face",
+    b_kind: Literal["face", "edge"] = "face",
+    alignment: Literal["aligned", "anti_aligned", "closest"] = "closest",
+    flip: bool = False,
+    value: float = 0.0,
+) -> str:
+    """Add a mate between two component entities in the ACTIVE assembly.
+    Entity selection is INDEX-based (robust — coordinate picks miss real geometry): each side is
+    (component name from analyze_assembly(components), kind 'face'|'edge', index from
+    analyze_assembly(faces|edges, component=...)).
+    value: METERS for distance mates, DEGREES for angle mates (ignored otherwise).
+    alignment 'closest' lets SolidWorks pick the nearer solution; the mates reader reports the
+    RESOLVED alignment afterwards.
+    Returns the mate name + both components' post-rebuild transforms — compare against the
+    original's readback after EVERY mate (the stop-check discipline)."""
+    params = {"mate_type": mate_type, "alignment": alignment,
+              "a_component": a_component, "a_kind": a_kind, "a_index": a_index,
+              "b_component": b_component, "b_kind": b_kind, "b_index": b_index}
+    if flip:
+        params["flip"] = True
+    if mate_type in ("distance", "angle"):
+        params["value"] = value
+    return _call("add_mate", params)
+
+
+# ---------------------------------------------------------------------------
+# Tool: save_body_as_part  (Phase B — flattened-assembly reconstruction, ADR-048)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def save_body_as_part(body_index: int, file_path: str) -> str:
+    """Extract ONE solid body of the ACTIVE multibody part into its own .SLDPRT file.
+    body_index: from analyze_model(analysis_type='bodies'). The body's geometry stays in the
+    SOURCE coordinates (recover the instance transform separately); the new part is saved to
+    file_path and closed, and the source document is re-activated. Use for flattened assembly
+    imports whose per-part files don't exist: one file per DISTINCT body (fingerprint-deduped),
+    then instances reference it with recovered transforms."""
+    return _call("save_body_as_part", {"body_index": body_index, "file_path": file_path})
 
 
 # ---------------------------------------------------------------------------
@@ -440,17 +569,23 @@ def add_drawing_view(
     scale: Annotated[float, Field(
         gt=0, description="View scale (1.0 = 1:1)")] = 1.0,
     model_path: str = "",
+    display_mode: Literal["", "hlv", "hlr", "wireframe", "shaded", "shaded_edges", "default"] = "",
 ) -> str:
     """Add a model view to the active drawing sheet.
     view_type: 'front', 'top', 'right', 'isometric', 'back', 'bottom', 'left'.
     pos_x/pos_y: position on the drawing sheet in meters.
     scale: view scale (default 1.0 = 1:1).
     model_path: path to the part file; if omitted, uses the first open part document.
+    display_mode: view display style — 'hlv' (Hidden Lines Visible), 'hlr' (Hidden Lines Removed),
+        'wireframe', 'shaded', 'shaded_edges', or 'default' (document default). Leave '' to apply the
+        DRAFTING-CONVENTION default: orthographic views (front/top/right/back/bottom/left) become HLV
+        (hidden lines shown for reference — but never dimension to them), isometric keeps the document
+        default. Section views (add_section_view) are separate and show the cut, not hidden lines.
     Requires the part to be saved to disk (in-memory parts cannot be projected)."""
     return _call(
         "add_drawing_view",
         {"view_type": view_type, "pos_x": pos_x, "pos_y": pos_y,
-            "scale": scale, "model_path": model_path},
+            "scale": scale, "model_path": model_path, "display_mode": display_mode},
     )
 
 
@@ -672,9 +807,15 @@ def verify_state() -> str:
 # Tool: close_document
 # ---------------------------------------------------------------------------
 @mcp.tool()
-def close_document(save: bool = False) -> str:
-    """Close the active SolidWorks document. Set save=True to save before closing."""
-    return _call("close_document", {"save": save})
+def close_document(save: bool = False, close_all: bool = False) -> str:
+    """Close the active SolidWorks document. Set save=True to save before closing.
+    close_all=True closes ALL open documents (incl. invisibly-loaded component docs that a
+    per-document close loop can never reach), DISCARDING unsaved changes — use to fully reset
+    the document space between assembly jobs."""
+    params = {"save": save}
+    if close_all:
+        params["close_all"] = True
+    return _call("close_document", params)
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +836,7 @@ def save_document(file_path: str = "") -> str:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def analyze_model(
-    analysis_type: Literal["mass_properties", "geometry", "edges", "faces", "features", "sketch", "feature_map"],
+    analysis_type: Literal["mass_properties", "geometry", "bodies", "edges", "faces", "features", "sketch", "feature_map"],
     name: str = "",
     from_feature: str = "",
     to_feature: str = "",
@@ -703,6 +844,9 @@ def analyze_model(
     """Analyze the active SolidWorks part document (read-only, does NOT change state).
     analysis_type='mass_properties': returns volume, surface_area, center of gravity (cx, cy, cz) in document units.
     analysis_type='geometry': returns bodies, faces, edges, vertices counts of all solid bodies.
+    analysis_type='bodies': PER-BODY fingerprints for multibody parts (e.g. a flattened assembly
+        STEP import): volume, area, centroid, edge/vertex counts, and the body's face-index RANGE
+        in the same enumeration 'faces' walks — segment the faces list per body with it.
     analysis_type='edges': returns a JSON object listing EVERY solid edge with its start/end/MIDPOINT 3D coords
         in meters (rounded to 6 decimals; closed/circular edges also report length) and a stable index `i`. Use
         the index `i` for add_edge_feature(edge_indices=...) — robust for crowded/concave edges — or a MIDPOINT
@@ -1158,16 +1302,19 @@ def save_analysis(file_path: str) -> str:
     is left null here (the AI/IR pass fills it later — see cad-planner/recipe.md). The part is
     left OPEN and ACTIVE for follow-up work.
 
-    file_path: absolute path of the .SLDPRT to analyze (v0 is parts-only; drawing/assembly
-        artifacts arrive with later pipeline steps).
+    file_path: absolute path of the .SLDPRT part OR .SLDASM assembly to analyze (drawing
+        artifacts arrive with later pipeline steps). An assembly artifact's recipe holds the
+        component tree (tree order, full transforms) + mates (creation order, enum types,
+        entity anchors) + assembly mass properties.
     Returns a token-frugal summary (artifact path + counts) — the artifact JSON stays on disk;
     read it from there when the full content is needed."""
     src = os.path.abspath(file_path)
     if not os.path.isfile(src):
         return f"FAILED | FILE_NOT_FOUND | {src}"
-    if not src.lower().endswith(".sldprt"):
-        return ("FAILED | UNSUPPORTED_TYPE | save_analysis v0 analyzes .SLDPRT parts only "
-                "(drawing/assembly artifacts come with later pipeline steps)")
+    is_assembly = src.lower().endswith(".sldasm")
+    if not src.lower().endswith(".sldprt") and not is_assembly:
+        return ("FAILED | UNSUPPORTED_TYPE | save_analysis analyzes .SLDPRT parts and .SLDASM "
+                "assemblies (drawing artifacts come with later pipeline steps)")
     with open(src, "rb") as fh:
         sha = hashlib.sha256(fh.read()).hexdigest()
 
@@ -1178,6 +1325,9 @@ def save_analysis(file_path: str) -> str:
         if activated.get("status") == "FAILED":
             err = opened.get("error") or {}
             return f"FAILED | OPEN_FAILED | {err.get('code')}: {err.get('message')}"
+
+    if is_assembly:
+        return _save_assembly_analysis(src, sha)
 
     try:
         features_items = _analysis_items(_call_raw("analyze_model", {"analysis_type": "features", "name": ""}))
@@ -1254,6 +1404,74 @@ def save_analysis(file_path: str) -> str:
             f"drawings_linked={len(drawings)} | hash=sha256:{sha[:12]}")
 
 
+def _save_assembly_analysis(src: str, sha: str) -> str:
+    """The .SLDASM branch of save_analysis (Phase B): components (tree order, full transforms)
+    + mates (creation order, enum types, entity anchors) + assembly mass properties. Component
+    source files get their own sha256 in relationships so staleness is loud per part
+    (ADR-047b: the assembly references part FILES — their artifacts live separately)."""
+    try:
+        comp_items = _analysis_items(_call_raw("analyze_assembly", {"analysis_type": "components"}))
+        mate_items = _analysis_items(_call_raw("analyze_assembly", {"analysis_type": "mates"}))
+        mass_kv = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "mass_properties", "name": ""})))
+    except RuntimeError as ex:
+        return f"FAILED | ANALYZE_FAILED | {ex}"
+    try:
+        components = json.loads(comp_items[0]) if comp_items else {}
+        mates = json.loads(mate_items[0]) if mate_items else {}
+    except (ValueError, TypeError) as ex:
+        return f"FAILED | PAYLOAD_UNPARSEABLE | {ex}"
+
+    part_files = []
+    seen_paths = set()
+    for c in components.get("components", []):
+        p = c.get("path")
+        if not p or p in seen_paths:
+            continue
+        seen_paths.add(p)
+        entry = {"path": p}
+        if os.path.isfile(p):
+            with open(p, "rb") as fh:
+                entry["hash"] = "sha256:" + hashlib.sha256(fh.read()).hexdigest()
+        else:
+            entry["missing"] = True
+        part_files.append(entry)
+
+    artifact = {
+        "identity": {
+            "source_path": src,
+            "source_filename": os.path.basename(src),
+            "source_hash": "sha256:" + sha,
+            "source_mtime": datetime.fromtimestamp(os.path.getmtime(src), timezone.utc).isoformat(),
+            "schema_version": ANALYSIS_SCHEMA_VERSION,
+            "analyzed_at": datetime.now(timezone.utc).isoformat(),
+            "generator": {"kind": "deterministic"},
+        },
+        "document_type": "assembly",
+        "recipe": {
+            "components": components,
+            "mates": mates,
+            "mass_properties": {
+                "volume_m3": mass_kv.get("volume"),
+                "surface_area_m2": mass_kv.get("surface_area"),
+                "cg": {"x": mass_kv.get("cx"), "y": mass_kv.get("cy"), "z": mass_kv.get("cz")},
+            },
+        },
+        "parameters": [],
+        "ir": None,
+        "relationships": {"part_files": part_files, "category": None, "cluster_signals": {}},
+        "notes": [],
+    }
+
+    out_dir = os.path.join(os.path.dirname(src), ".solidpilot")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, os.path.basename(src) + ".analysis.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(artifact, fh, ensure_ascii=False, indent=2)
+
+    return (f"COMPLETED | artifact={out_path} | components={components.get('component_count')} | "
+            f"mates={mates.get('mate_count')} | part_files={len(part_files)} | hash=sha256:{sha[:12]}")
+
+
 # ---------------------------------------------------------------------------
 # Tool: rebuild_from_ir  (adapter-only — the analysis pipeline's IR door, IR-ADR-005)
 # ---------------------------------------------------------------------------
@@ -1308,10 +1526,15 @@ def rebuild_from_ir(artifact_path: str, fresh_document: bool = True) -> str:
             source_stale = " | source_stale=true (file changed since analysis — regenerate the artifact)"
 
     if fresh_document:
-        opened = _call_raw("open_new_part", {})
+        # An assembly graph (component/mate nodes) rebuilds into a fresh ASSEMBLY document;
+        # part graphs into a fresh part (two doors, ONE compiler — the graph type decides).
+        is_assembly_graph = any(isinstance(n, dict) and n.get("type") in ("component", "mate")
+                                for n in graph.get("nodes", []))
+        new_tool = "open_new_assembly" if is_assembly_graph else "open_new_part"
+        opened = _call_raw(new_tool, {})
         if opened.get("status") != "COMPLETED":
             err = opened.get("error") or {}
-            return f"FAILED | OPEN_NEW_PART_FAILED | {err.get('code')}: {err.get('message')}"
+            return f"FAILED | {new_tool.upper()}_FAILED | {err.get('code')}: {err.get('message')}"
 
     # Lazy import: pycompiler lives in the hyphenated solidworks-compiler/ dir; ir_execution_port
     # wires sys.path + the ExecutionPort. Imported here so a missing compiler tree degrades to a
@@ -1399,6 +1622,95 @@ def compare_parts(doc_a: str, doc_b: str) -> str:
             f"volume A={fmt(mass_a.get('volume'))} B={fmt(mass_b.get('volume'))} dV={fmt(dv, '.4f')}% | "
             f"area A={fmt(mass_a.get('surface_area'))} B={fmt(mass_b.get('surface_area'))} dA={fmt(da, '.4f')}% | "
             f"cg_distance={fmt(cg_dist)} m | reference=A ({doc_a})")
+
+
+# ---------------------------------------------------------------------------
+# Tool: compare_assemblies  (adapter-only — the assembly round-trip verifier, ADR-047 B4)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def compare_assemblies(doc_a: str, doc_b: str) -> str:
+    """Objectively diff two ASSEMBLY documents against the RATIFIED verified criteria
+    (ADR-047): component set EXACT (source file + config + instance counts) AND every
+    component transform within tolerance (position <= 1µm, rotation <= 1e-6) AND mate
+    count + types match AND mass properties within the V1 thresholds (|dV| <= 1%, |dA| <= 1%).
+
+    doc_a / doc_b: EITHER an absolute .SLDASM path OR the TITLE of an already-open document
+        (e.g. 'Assem2' for an unsaved rebuild). doc_a is the REFERENCE (the original).
+
+    Components are paired by (source basename, instance ordinal in tree order) — instance
+    numbering may legitimately differ between original and rebuild. The verdict is a REPORT;
+    writing ir.verification into the artifact stays the caller's job. doc_b is left active."""
+    def _read(doc: str, label: str):
+        if os.path.isfile(doc):
+            r = _call_raw("open_document", {"file_path": os.path.abspath(doc)})
+            if r.get("status") != "COMPLETED":
+                r = _call_raw("activate_document", {"title": os.path.splitext(os.path.basename(doc))[0]})
+        else:
+            r = _call_raw("activate_document", {"title": doc})
+        if r.get("status") != "COMPLETED":
+            err = r.get("error") or {}
+            raise RuntimeError(f"DOC_{label}_UNAVAILABLE | {doc} | {err.get('code')}: {err.get('message')}")
+        comps = json.loads(_analysis_items(_call_raw("analyze_assembly", {"analysis_type": "components"}))[0])
+        mates = json.loads(_analysis_items(_call_raw("analyze_assembly", {"analysis_type": "mates"}))[0])
+        mass = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "mass_properties", "name": ""})))
+        return comps.get("components", []), mates.get("mates", []), mass
+
+    try:
+        comps_a, mates_a, mass_a = _read(doc_a, "A")
+        comps_b, mates_b, mass_b = _read(doc_b, "B")
+    except (RuntimeError, ValueError, IndexError) as ex:
+        return f"FAILED | {ex}"
+
+    def _key_seq(comps):
+        counters: dict = {}
+        out = []
+        for c in comps:
+            base = os.path.basename(c.get("path") or "").lower()
+            cfg = c.get("config") or ""
+            n = counters.get((base, cfg), 0) + 1
+            counters[(base, cfg)] = n
+            out.append(((base, cfg, n), c))
+        return dict(out), sorted(k for k, _c in out)
+
+    map_a, keys_a = _key_seq(comps_a)
+    map_b, keys_b = _key_seq(comps_b)
+    set_exact = keys_a == keys_b
+
+    # Transform comparison over the paired components (rotation elements vs 1e-6; translation
+    # meters vs 1µm). Only meaningful when the sets pair up.
+    max_rot = max_pos = 0.0
+    transforms_ok = set_exact
+    if set_exact:
+        for k in keys_a:
+            ta, tb = map_a[k].get("transform"), map_b[k].get("transform")
+            if not (isinstance(ta, list) and isinstance(tb, list) and len(ta) >= 12 and len(tb) >= 12):
+                transforms_ok = False
+                break
+            max_rot = max(max_rot, max(abs(ta[i] - tb[i]) for i in range(9)))
+            max_pos = max(max_pos, max(abs(ta[i] - tb[i]) for i in range(9, 12)))
+        transforms_ok = transforms_ok and max_rot <= 1e-6 and max_pos <= 1e-6
+
+    types_a = sorted(m.get("type") or "" for m in mates_a)
+    types_b = sorted(m.get("type") or "" for m in mates_b)
+    mates_ok = len(mates_a) == len(mates_b) and types_a == types_b
+
+    def _delta_pct(a, b):
+        if not isinstance(a, (int, float)) or not isinstance(b, (int, float)) or a == 0:
+            return None
+        return (b - a) / a * 100.0
+
+    dv = _delta_pct(mass_a.get("volume"), mass_b.get("volume"))
+    da = _delta_pct(mass_a.get("surface_area"), mass_b.get("surface_area"))
+    mass_ok = dv is not None and da is not None and abs(dv) <= 1.0 and abs(da) <= 1.0
+
+    verified = set_exact and transforms_ok and mates_ok and mass_ok
+    fmt = lambda v, spec=".6g": ("?" if v is None else format(v, spec))  # noqa: E731
+    return (f"COMPLETED | verified_criteria={'PASS' if verified else 'FAIL'} | "
+            f"components A={len(comps_a)} B={len(comps_b)} set={'EXACT' if set_exact else 'DIFFER'} | "
+            f"transforms max_rot={fmt(max_rot, '.3g')} max_pos={fmt(max_pos, '.3g')} m "
+            f"{'OK' if transforms_ok else 'FAIL'} | "
+            f"mates A={len(mates_a)} B={len(mates_b)} types={'MATCH' if types_a == types_b else 'DIFFER'} | "
+            f"volume dV={fmt(dv, '.4f')}% area dA={fmt(da, '.4f')}% | reference=A ({doc_a})")
 
 
 # ---------------------------------------------------------------------------

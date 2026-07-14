@@ -11,8 +11,9 @@ Public API (consumed by pycompiler/__init__.py and the adapter):
 from . import lowering
 from .errors import FeatureError
 from .ir_schema import validate
-from .resolver import (resolve_center_on_face, resolve_edges_by_anchor,
-                       resolve_face_by_anchor, resolve_face_on_plane, resolve_top_face)
+from .resolver import (resolve_center_on_face, resolve_component_entity_by_anchor,
+                       resolve_edges_by_anchor, resolve_face_by_anchor, resolve_face_on_plane,
+                       resolve_top_face)
 
 
 class CompileResult(object):
@@ -222,6 +223,24 @@ def _plan_node(port, node, state_version, node_features):
                                    code="NODE_FEATURE_UNAVAILABLE", node_id=node.get("id"))
             names.append(nm)
         return lowering.lower_mirror(node, names)
+    if ntype == "component":
+        return lowering.lower_component(node)
+    if ntype == "mate":
+        # Each side: the component's RUNTIME Name2 comes from node_features (insert_component's
+        # response — instance-numbered by SolidWorks, never guessed), and the COMPONENT-LOCAL
+        # anchor resolves to a face/edge INDEX on that component (live read-only reads).
+        sides = []
+        for side in node["sides"]:
+            cid = side["component"]
+            comp_name = node_features.get(cid)
+            if not comp_name:
+                raise FeatureError("mate side references component node '%s' with no recorded "
+                                   "runtime component name" % cid,
+                                   code="NODE_FEATURE_UNAVAILABLE", node_id=node.get("id"))
+            kind, index = resolve_component_entity_by_anchor(port, state_version, comp_name,
+                                                             side["anchor"], node_id=node.get("id"))
+            sides.append((comp_name, kind, index))
+        return lowering.lower_mate(node, sides)
     if ntype == "loft":
         # The profile sketches ran earlier (loft comes after them in tree order), so each one's
         # runtime name is already recorded in node_features. Resolve them now; the loft selects

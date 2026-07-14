@@ -51,12 +51,16 @@ class FakePort(ExecutionPort):
     name ('Düzlem1' — the Turkish install) so the FROM_PREV_FEATURE substitution is proven
     localization-independent. fail_on=(tool, nth) injects a FAILED response on the nth call."""
 
-    def __init__(self, faces=_BOX_FACES, edges=None, fail_on=None, sketch_frame=None):
+    def __init__(self, faces=_BOX_FACES, edges=None, fail_on=None, sketch_frame=None,
+                 asm_faces=None, asm_edges=None):
         self._sv = 0
         self._faces = faces
         self._edges = edges
         self._fail_on = fail_on
         self._sketch_frame = sketch_frame  # echoed by create_sketch (the MEASURED rebuild frame)
+        self._asm_faces = asm_faces or {}  # component Name2 -> faces JSON payload
+        self._asm_edges = asm_edges or {}  # component Name2 -> edges JSON payload
+        self._insert_counts = {}           # part basename -> instance counter (Name2 numbering)
         self._counts = {}
         self.calls = []  # list of (tool, params)
 
@@ -73,6 +77,24 @@ class FakePort(ExecutionPort):
             payload = self._edges if params.get("analysis_type") == "edges" else self._faces
             return {"status": "COMPLETED", "stateVersion": self._sv,
                     "cadState": {"features": [payload] if payload else []}}
+        if tool == "analyze_assembly":
+            src = self._asm_edges if params.get("analysis_type") == "edges" else self._asm_faces
+            payload = src.get(params.get("component"))
+            return {"status": "COMPLETED", "stateVersion": self._sv,
+                    "cadState": {"features": [payload] if payload else []}}
+        if tool == "insert_component":
+            # Mirrors the live layer: features[0] = the PLAIN instance-numbered Name2
+            # (SolidWorks numbers instances per source part).
+            self._sv += 1
+            base = params["file_path"].replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            n = self._insert_counts.get(base, 0) + 1
+            self._insert_counts[base] = n
+            return {"status": "COMPLETED", "stateVersion": self._sv,
+                    "cadState": {"features": ["%s-%d" % (base, n), "fixed=%s" % params.get("fixed")]}}
+        if tool == "add_mate":
+            self._sv += 1
+            return {"status": "COMPLETED", "stateVersion": self._sv,
+                    "cadState": {"features": ["Mate%d" % self._sv]}}
         self._sv += 1  # a write op bumps state_version
         # Feature-creating tools echo a LOCALIZED created-feature name (mirrors the live layer:
         # cadState.features = [feature.Name]) so the FROM_PREV_FEATURE / node_feature
@@ -926,6 +948,188 @@ def test_edge_flange_validation_rejections():
         r = compile_and_run(port, {"schema_version": "0.5.6-draft", "units": "meters", "nodes": nodes})
         assert r.status == "FAILED" and r.error["code"] == "VALIDATION_FAILED", r.to_dict()
         assert port.calls == []
+
+
+# ---------------------------------------------------------------------------
+# v0.6 assembly sub-vocabulary (component + mate — Phase B, ADR-047)
+# ---------------------------------------------------------------------------
+
+_IDENTITY = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+_SHIFTED = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.2, 0.0, 0.05, 1.0]
+
+# Component-LOCAL face payloads (analyze_assembly(faces, component) reports part-space coords —
+# proven live 2026-07-09: two instances at different transforms report identical face points).
+_BODY_FACES = json.dumps({"face_count": 3, "faces": [
+    {"i": 0, "planar": True, "area": 0.001, "normal": [0, 1, 0], "point": [0.0, 0.02, 0.0]},
+    {"i": 1, "planar": False, "area": 0.002, "kind": "cylinder",
+     "origin": [0.0, 0.0, 0.0], "axis": [0.0, 1.0, 0.0], "radius": 0.008,
+     "point": [0.008, 0.01, 0.0]},
+    {"i": 2, "planar": False, "area": 0.001, "kind": "cylinder",
+     "origin": [0.03, 0.0, 0.0], "axis": [0.0, 1.0, 0.0], "radius": 0.008,
+     "point": [0.038, 0.01, 0.0]},
+]})
+_SHAFT_FACES = json.dumps({"face_count": 2, "faces": [
+    {"i": 0, "planar": False, "area": 0.0015, "kind": "cylinder",
+     "origin": [0.0, 0.0, 0.0], "axis": [0.0, 1.0, 0.0], "radius": 0.008,
+     "point": [0.008, 0.03, 0.0]},
+    {"i": 1, "planar": True, "area": 0.0002, "normal": [0, 1, 0], "point": [0.0, 0.06, 0.0]},
+]})
+_SHAFT_EDGES = json.dumps({"edge_count": 1, "edges": [
+    {"i": 0, "start": [0.008, 0.06, 0.0], "end": [0.008, 0.06, 0.0],
+     "mid": [-0.008, 0.06, 0.0], "length": 0.050265},
+]})
+
+
+def _asm_graph(mates):
+    return {
+        "schema_version": "0.6.0-draft", "units": "meters",
+        "nodes": [
+            {"id": "c1", "type": "component",
+             "source": {"path": "C:\\parts\\Body.SLDPRT", "hash": "sha256:aa"},
+             "fixed": True, "transform": _IDENTITY},
+            {"id": "c2", "type": "component",
+             "source": {"path": "C:\\parts\\Shaft.SLDPRT", "hash": "sha256:bb"},
+             "transform": _SHIFTED},
+        ] + mates,
+    }
+
+
+def test_assembly_components_and_concentric_mate():
+    # Components lower to insert_component with the FULL transform (JSON-string, ADR-022) and an
+    # EXPLICIT fixed flag; the mate resolves each side's COMPONENT-LOCAL cylinder anchor to a
+    # face index on the runtime-named component (index-first, KNOWN-LIMITATIONS #6).
+    g = _asm_graph([
+        {"id": "m1", "type": "mate", "mate_type": "concentric", "alignment": "anti_aligned",
+         "sides": [
+             {"component": "c1", "anchor": {"kind": "cylinder", "near": [0.0, 0.01, 0.008],
+                                            "hint": "body bore"}},
+             {"component": "c2", "anchor": {"kind": "cylinder", "near": [-0.008, 0.02, 0.0],
+                                            "hint": "shaft OD"}},
+         ]},
+    ])
+    port = FakePort(asm_faces={"Body-1": _BODY_FACES, "Shaft-1": _SHAFT_FACES})
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()
+    assert _tools(port) == ["insert_component", "insert_component",
+                            "analyze_assembly", "analyze_assembly", "add_mate"]
+    ins1, ins2 = port.calls[0][1], port.calls[1][1]
+    assert json.loads(ins1["transform_json"]) == _IDENTITY and ins1["fixed"] is True
+    assert json.loads(ins2["transform_json"]) == _SHIFTED and ins2["fixed"] is False
+    mate = port.calls[-1][1]
+    assert mate["mate_type"] == "concentric" and mate["alignment"] == "anti_aligned"
+    # c1's anchor sits on the ORIGIN-axis bore (i=1), NOT the offset bore (i=2)
+    assert (mate["a_component"], mate["a_kind"], mate["a_index"]) == ("Body-1", "face", 1)
+    assert (mate["b_component"], mate["b_kind"], mate["b_index"]) == ("Shaft-1", "face", 0)
+    assert "value" not in mate and "flip" not in mate
+
+
+def test_assembly_plane_edge_anchors_and_values():
+    # plane anchor -> planar face by plane containment; circle anchor -> edge by mid ball;
+    # distance passes SI meters through; angle converts IR RADIANS -> tool DEGREES (C4).
+    g = _asm_graph([
+        {"id": "m1", "type": "mate", "mate_type": "distance", "value": 0.012, "flip": True,
+         "sides": [
+             {"component": "c1", "anchor": {"kind": "plane", "near": [0.005, 0.02, 0.003]}},
+             {"component": "c2", "anchor": {"kind": "plane", "near": [-0.002, 0.06, 0.001]}},
+         ]},
+        {"id": "m2", "type": "mate", "mate_type": "angle", "value": 1.570796,
+         "sides": [
+             {"component": "c1", "anchor": {"kind": "plane", "near": [0.0, 0.02, 0.0]}},
+             {"component": "c2", "anchor": {"kind": "circle", "near": [-0.008, 0.06, 0.0]}},
+         ]},
+    ])
+    port = FakePort(asm_faces={"Body-1": _BODY_FACES, "Shaft-1": _SHAFT_FACES},
+                    asm_edges={"Shaft-1": _SHAFT_EDGES})
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()
+    m1 = [p for (t, p) in port.calls if t == "add_mate"][0]
+    assert m1["value"] == 0.012 and m1["flip"] is True
+    assert (m1["a_kind"], m1["a_index"]) == ("face", 0)
+    assert (m1["b_kind"], m1["b_index"]) == ("face", 1)
+    m2 = [p for (t, p) in port.calls if t == "add_mate"][1]
+    assert abs(m2["value"] - 90.0) < 1e-3            # rad -> deg at the boundary
+    assert (m2["b_kind"], m2["b_index"]) == ("edge", 0)  # the circle anchor searched EDGES
+
+
+def test_assembly_cylinder_anchor_ambiguous():
+    # The anchor is equidistant-compatible with BOTH distinct bores' surfaces? No — make it match
+    # two DISTINCT axes by putting it exactly between two same-radius cylinders' surfaces is
+    # contrived; instead: a point on bore 2's surface matches ONLY bore 2 (sanity), then a
+    # payload with two coaxial faces (a split bore) resolves WITHOUT ambiguity.
+    split_bore = json.dumps({"face_count": 2, "faces": [
+        {"i": 0, "planar": False, "kind": "cylinder", "origin": [0, 0, 0],
+         "axis": [0, 1, 0], "radius": 0.008, "point": [0.008, 0.005, 0.0]},
+        {"i": 1, "planar": False, "kind": "cylinder", "origin": [0, 0.02, 0],
+         "axis": [0, 1, 0], "radius": 0.008, "point": [0.008, 0.03, 0.0]},
+    ]})
+    g = _asm_graph([
+        {"id": "m1", "type": "mate", "mate_type": "concentric",
+         "sides": [
+             {"component": "c1", "anchor": {"kind": "cylinder", "near": [0.008, 0.005, 0.0]}},
+             {"component": "c2", "anchor": {"kind": "cylinder", "near": [-0.008, 0.02, 0.0]}},
+         ]},
+    ])
+    port = FakePort(asm_faces={"Body-1": split_bore, "Shaft-1": _SHAFT_FACES})
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()   # coaxial faces group -> nearest point wins
+    mate = [p for (t, p) in port.calls if t == "add_mate"][0]
+    assert mate["a_index"] == 0                   # the nearer split face
+
+
+def test_assembly_validation_rejections():
+    # Mixing part+assembly nodes; mate before any component; unknown component id; bad anchor
+    # kind; missing transform; distance without value — all rejected, zero execution.
+    comp = {"id": "c1", "type": "component",
+            "source": {"path": "C:\\parts\\Body.SLDPRT"}, "transform": _IDENTITY}
+    mate = {"id": "m1", "type": "mate", "mate_type": "coincident",
+            "sides": [{"component": "c1", "anchor": {"kind": "plane", "near": [0, 0, 0]}},
+                      {"component": "c1", "anchor": {"kind": "plane", "near": [0, 0, 1]}}]}
+    bads = [
+        [comp, {"id": "b1", "type": "box", "width": 0.05, "depth": 0.05, "height": 0.05}],
+        [json.loads(json.dumps(mate))],
+        [comp, {"id": "m1", "type": "mate", "mate_type": "coincident",
+                "sides": [{"component": "cX", "anchor": {"kind": "plane", "near": [0, 0, 0]}},
+                          {"component": "c1", "anchor": {"kind": "plane", "near": [0, 0, 1]}}]}],
+        [comp, {"id": "m1", "type": "mate", "mate_type": "coincident",
+                "sides": [{"component": "c1", "anchor": {"kind": "blob", "near": [0, 0, 0]}},
+                          {"component": "c1", "anchor": {"kind": "plane", "near": [0, 0, 1]}}]}],
+        [{"id": "c1", "type": "component", "source": {"path": "C:\\parts\\Body.SLDPRT"}}],
+        [comp, {"id": "m1", "type": "mate", "mate_type": "distance",
+                "sides": [{"component": "c1", "anchor": {"kind": "plane", "near": [0, 0, 0]}},
+                          {"component": "c1", "anchor": {"kind": "plane", "near": [0, 0, 1]}}]}],
+        [json.loads(json.dumps(mate)), comp],   # mate BEFORE its component (order rule)
+    ]
+    for nodes in bads:
+        port = FakePort()
+        r = compile_and_run(port, {"schema_version": "0.6.0-draft", "units": "meters", "nodes": nodes})
+        assert r.status == "FAILED" and r.error["code"] == "VALIDATION_FAILED", r.to_dict()
+        assert port.calls == []
+
+
+def test_assembly_anchor_unresolved_and_gap_kinds():
+    # A cylinder anchor off every surface -> REFERENCE_UNRESOLVED; a cone anchor -> the recorded
+    # resolver gap (loud, C5).
+    g1 = _asm_graph([
+        {"id": "m1", "type": "mate", "mate_type": "concentric",
+         "sides": [
+             {"component": "c1", "anchor": {"kind": "cylinder", "near": [0.5, 0.5, 0.5]}},
+             {"component": "c2", "anchor": {"kind": "cylinder", "near": [-0.008, 0.02, 0.0]}},
+         ]},
+    ])
+    port = FakePort(asm_faces={"Body-1": _BODY_FACES, "Shaft-1": _SHAFT_FACES})
+    r = compile_and_run(port, g1)
+    assert r.status == "FAILED" and r.error["code"] == "REFERENCE_UNRESOLVED"
+    assert r.nodes_completed == 2  # both components inserted before the mate failed
+    g2 = _asm_graph([
+        {"id": "m1", "type": "mate", "mate_type": "tangent",
+         "sides": [
+             {"component": "c1", "anchor": {"kind": "cone", "near": [0.0, 0.01, 0.0]}},
+             {"component": "c2", "anchor": {"kind": "plane", "near": [0.0, 0.06, 0.0]}},
+         ]},
+    ])
+    r2 = compile_and_run(FakePort(asm_faces={"Body-1": _BODY_FACES, "Shaft-1": _SHAFT_FACES}), g2)
+    assert r2.status == "FAILED" and r2.error["code"] == "REFERENCE_UNRESOLVED"
+    assert "gap" in r2.error["message"]
 
 
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -27,8 +27,7 @@ Thumbs.db
 
 drawing-samples/
 
-# Scratch / throwaway dev working files (feature-map dumps, one-off rebuild scripts)
 scratch/
 
-# Private legal documents (evaluation/commercial license drafts) — never publish
+
 legal/

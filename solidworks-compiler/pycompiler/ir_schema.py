@@ -18,8 +18,21 @@ never silently ignored (recipe.md C5).
 """
 
 DATUMS = frozenset(("front", "top", "right"))
+# Assembly sub-vocabulary (v0.6.0 — Phase B, ADR-047): component + mate. An assembly graph is
+# components first (tree order) then mates (creation order); part and assembly node types never
+# mix in one graph (a component references its part FILE — part IRs are not embedded).
+ASSEMBLY_NODE_TYPES = frozenset(("component", "mate"))
+MATE_TYPES = frozenset(("coincident", "concentric", "perpendicular", "parallel", "tangent",
+                        "distance", "angle", "lock"))
+MATE_ALIGNMENTS = frozenset(("aligned", "anti_aligned", "closest"))
+# Anchor kinds mirror the reader's swMateEntity2ReferenceType_e names verbatim (C7). The kind
+# decides WHERE the resolver searches: face kinds vs edge kinds.
+ANCHOR_KINDS_FACE = frozenset(("plane", "cylinder", "cone", "sphere"))
+ANCHOR_KINDS_EDGE = frozenset(("line", "circle"))
+ANCHOR_KINDS = ANCHOR_KINDS_FACE | ANCHOR_KINDS_EDGE
 NODE_TYPES = frozenset(("box", "sketch", "extrude", "revolve", "rib", "hole", "fillet", "chamfer", "loft",
-                        "circular_pattern", "sheet_metal", "sketched_bend", "mirror", "edge_flange"))
+                        "circular_pattern", "sheet_metal", "sketched_bend", "mirror", "edge_flange")) \
+    | ASSEMBLY_NODE_TYPES
 PROFILE_KINDS = frozenset(("rectangle", "circle", "line", "arc"))
 FACE_SELECTORS = frozenset(("top",))          # v0.5: only 'top'
 POSITIONS = frozenset(("center",))            # v0.5: only 'center'
@@ -62,7 +75,18 @@ def validate(graph):
         errors.append("graph.nodes must be a non-empty array.")
         return errors  # nothing more to check without nodes
 
+    # Part vs assembly vocabularies never mix in one graph: an assembly's parts are separate
+    # FILES (verified by their own V1 loop, ADR-047b), never inline sub-graphs.
+    kinds = set()
+    for node in nodes:
+        if isinstance(node, dict) and node.get("type") in NODE_TYPES:
+            kinds.add("assembly" if node.get("type") in ASSEMBLY_NODE_TYPES else "part")
+    if len(kinds) > 1:
+        errors.append("graph mixes part-vocabulary and assembly-vocabulary nodes — an assembly "
+                      "IR references part FILES (component.source), it never embeds part nodes.")
+
     seen = {}  # id -> type (in declaration order)
+    seen_mate = False
     for pos, node in enumerate(nodes):
         where = "nodes[%d]" % pos
         if not isinstance(node, dict):
@@ -346,6 +370,77 @@ def validate(graph):
                     elif seen.get(fid) not in FEATURE_PRODUCERS:
                         errors.append("%s: feature '%s' must reference an earlier %s node."
                                       % (label, fid, "/".join(sorted(FEATURE_PRODUCERS))))
+
+        elif ntype == "component":
+            # Component occurrence: references its part FILE (path + hash — the V1 cache
+            # discipline extends, ADR-047b). `transform` (13 numbers: 3x3 rotation row-major +
+            # translation + scale — exactly the reader's layout) is REQUIRED: it is the
+            # PLACEMENT input for a fixed component and the initial placement + verification
+            # ground truth for a floating one (mates do the constraining).
+            src = node.get("source")
+            if not isinstance(src, dict) or not isinstance(src.get("path"), str) or not src.get("path"):
+                errors.append("%s: 'source' must be {path: '<part file>', hash?: 'sha256:...'}." % label)
+            elif src.get("hash") is not None and not isinstance(src.get("hash"), str):
+                errors.append("%s: source.hash must be a string when present." % label)
+            tr = node.get("transform")
+            if (not isinstance(tr, list) or len(tr) != 13
+                    or not all(_is_number(v) for v in tr)):
+                errors.append("%s: 'transform' must be 13 numbers (9 rotation row-major + "
+                              "3 translation (meters) + scale) — the reader's exact layout." % label)
+            if node.get("fixed") is not None and not isinstance(node.get("fixed"), bool):
+                errors.append("%s: 'fixed' must be a boolean." % label)
+            if node.get("config") is not None and not isinstance(node.get("config"), str):
+                errors.append("%s: 'config' must be a string (referenced configuration name)." % label)
+            if seen_mate:
+                errors.append("%s: components must come BEFORE all mates (components in tree "
+                              "order, then mates in creation order)." % label)
+
+        elif ntype == "mate":
+            seen_mate = True
+            mt = node.get("mate_type")
+            if mt not in MATE_TYPES:
+                errors.append("%s: 'mate_type' must be one of %s (got %r)."
+                              % (label, sorted(MATE_TYPES), mt))
+            al = node.get("alignment")
+            if al is not None and al not in MATE_ALIGNMENTS:
+                errors.append("%s: 'alignment' must be one of %s (got %r)."
+                              % (label, sorted(MATE_ALIGNMENTS), al))
+            if mt in ("distance", "angle") and not _is_number(node.get("value")):
+                errors.append("%s: mate_type '%s' requires 'value' (SI — meters / RADIANS, C4)."
+                              % (label, mt))
+            if node.get("flip") is not None and not isinstance(node.get("flip"), bool):
+                errors.append("%s: 'flip' must be a boolean." % label)
+            sides = node.get("sides")
+            if not isinstance(sides, list) or len(sides) != 2:
+                errors.append("%s: 'sides' must be exactly 2 entries "
+                              "[{component: <node id>, anchor: {kind, near, hint?}}, ...]." % label)
+            else:
+                for j, side in enumerate(sides):
+                    swhere = "%s.sides[%d]" % (label, j)
+                    if not isinstance(side, dict):
+                        errors.append("%s must be an object." % swhere)
+                        continue
+                    cid = side.get("component")
+                    if not isinstance(cid, str) or not cid:
+                        errors.append("%s: 'component' (an earlier component node id) is required." % swhere)
+                    elif seen.get(cid) != "component":
+                        errors.append("%s: component '%s' must reference an earlier component node." % (swhere, cid))
+                    anchor = side.get("anchor")
+                    if not isinstance(anchor, dict) or not _is_point3(anchor.get("near")):
+                        errors.append("%s: anchor must be {kind, near:[x,y,z] (COMPONENT-LOCAL "
+                                      "coords, meters), dir?, radius?, hint?}." % swhere)
+                    else:
+                        if anchor.get("kind") not in ANCHOR_KINDS:
+                            errors.append("%s: anchor.kind must be one of %s (the reader's entity "
+                                          "kind, verbatim — got %r)."
+                                          % (swhere, sorted(ANCHOR_KINDS), anchor.get("kind")))
+                        # dir = the stored plane NORMAL / cylinder AXIS (C7 ground truth) —
+                        # disambiguates distinct surfaces through the same point (the 4-1
+                        # interior-anchor lesson, hit live on 1-1's shaft flat).
+                        if anchor.get("dir") is not None and not _is_point3(anchor.get("dir")):
+                            errors.append("%s: anchor.dir must be a 3D unit vector when present." % swhere)
+                        if anchor.get("radius") is not None and not _is_pos_number(anchor.get("radius")):
+                            errors.append("%s: anchor.radius must be a positive number when present." % swhere)
 
         elif ntype == "loft":
             # Multi-profile boss loft. Unlike extrude/revolve/rib, the profile sketches are

@@ -281,12 +281,65 @@ namespace SolidworksExecution.Services
                 var modelDoc = _solidWorks.OpenDoc6(filePath, docType,
                     (int)swOpenDocOptions_e.swOpenDocOptions_Silent, "", ref errors, ref warnings) as IModelDoc2;
 
+                // FOREIGN-FORMAT staged fallback (2026-07-09, proven live): with 3D Interconnect OFF,
+                // OpenDoc6 does NOT import foreign files — it returns null with the misleading
+                // errors=2097152 (swFileRequiresRepairError; observed on both .step and NX .prt).
+                // Stage 2: LoadFile4 = the CLASSIC translator import (STEP/IGES; content decides
+                // part vs assembly). Stage 3: NX/Creo/CATIA native formats have no classic
+                // translator — they REQUIRE Interconnect, so enable it (documented prerequisite,
+                // swMultiCAD_Enable3DInterconnect=691) and retry OpenDoc6 once; left ON afterwards
+                // (the steady state for mixed-CAD sample folders).
+                bool foreign = ext != ".sldprt" && ext != ".sldasm" && ext != ".slddrw";
+                string openPath = "OpenDoc6";
+                // as_assembly=true (foreign only): the file is an ASSEMBLY STEP/etc. The classic
+                // translator (LoadFile4) imports an assembly STEP as a MULTIBODY PART (proven live
+                // 2026-07-09 on Fixture Assembly.step) — only 3D Interconnect maps it to a real
+                // assembly with components. Enable the toggle just for this open and RESTORE it
+                // after, so foreign PART opens elsewhere keep their proven classic-import behavior.
+                bool asAssembly = p.Value<bool?>("as_assembly") ?? false;
+                if (modelDoc == null && foreign && asAssembly)
+                {
+                    bool prior = _solidWorks.GetUserPreferenceToggle(691); // swMultiCAD_Enable3DInterconnect
+                    bool onlyParts = _solidWorks.GetUserPreferenceToggle(758); // swMultiCAD_ApplyOnlyToParts — excludes assemblies from Interconnect when ON
+                    try
+                    {
+                        if (!prior) _solidWorks.SetUserPreferenceToggle(691, true);
+                        if (onlyParts) _solidWorks.SetUserPreferenceToggle(758, false);
+                        errors = 0; warnings = 0;
+                        modelDoc = _solidWorks.OpenDoc6(filePath, (int)swDocumentTypes_e.swDocASSEMBLY,
+                            (int)swOpenDocOptions_e.swOpenDocOptions_Silent, "", ref errors, ref warnings) as IModelDoc2;
+                        openPath = "OpenDoc6+3DInterconnect(as_assembly)";
+                        ExecLog.Write($"open_document(as_assembly): prior691={prior} onlyParts758={onlyParts} errors={errors} warnings={warnings} null={modelDoc == null}");
+                    }
+                    finally
+                    {
+                        if (!prior) _solidWorks.SetUserPreferenceToggle(691, false);
+                        if (onlyParts) _solidWorks.SetUserPreferenceToggle(758, true);
+                    }
+                }
+                if (modelDoc == null && foreign)
+                {
+                    int lfErrors = 0;
+                    modelDoc = _solidWorks.LoadFile4(filePath, "r", null, ref lfErrors) as IModelDoc2;
+                    openPath = "LoadFile4";
+                    if (modelDoc == null && !_solidWorks.GetUserPreferenceToggle(691))
+                    {
+                        _solidWorks.SetUserPreferenceToggle(691, true);
+                        ExecLog.Write("open_document: enabled 3D Interconnect (toggle 691) for foreign-format import");
+                        errors = 0; warnings = 0;
+                        modelDoc = _solidWorks.OpenDoc6(filePath, docType,
+                            (int)swOpenDocOptions_e.swOpenDocOptions_Silent, "", ref errors, ref warnings) as IModelDoc2;
+                        openPath = "OpenDoc6+3DInterconnect";
+                    }
+                }
+
                 if (modelDoc == null)
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "OPEN_FAILED",
-                        $"OpenDoc6 returned null for '{filePath}' (errors={errors}, warnings={warnings}). " +
-                        "For .ipt/.CATPart, SolidWorks 3D Interconnect must be enabled (Tools > Options > " +
-                        "Import) and the translator licensed; otherwise convert to STEP or defer this sample.");
+                        $"Could not open '{filePath}' (OpenDoc6 errors={errors}, then LoadFile4 also null for foreign formats). " +
+                        "errors=2097152 is swFileRequiresRepairError — for foreign files this usually means no usable " +
+                        "translator; convert to STEP or defer this sample.");
+                ExecLog.Write($"open_document: '{System.IO.Path.GetFileName(filePath)}' via {openPath}");
 
                 string typeName = modelDoc is IDrawingDoc ? "DRAWING"
                                 : modelDoc is IAssemblyDoc ? "ASSEMBLY" : "PART";
@@ -298,7 +351,12 @@ namespace SolidworksExecution.Services
                 int actErr = 0;
                 _solidWorks.ActivateDoc3(modelDoc.GetTitle(), false, 1 /* swDontRebuildActiveDoc */, ref actErr);
                 var nowActive = _solidWorks.IActiveDoc2 as IModelDoc2;
-                if (nowActive == null || nowActive.GetTitle() != modelDoc.GetTitle())
+                // Title normalization: an imported doc's title can gain/lose its extension between
+                // reads ('Butterfly_valve' vs 'Butterfly_valve.prt' — observed live on an NX
+                // import). Compare extension-stripped, case-insensitive.
+                Func<string, string> baseTitle = t =>
+                    (System.IO.Path.GetFileNameWithoutExtension(t ?? "") ?? "").ToLowerInvariant();
+                if (nowActive == null || baseTitle(nowActive.GetTitle()) != baseTitle(modelDoc.GetTitle()))
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "ACTIVATE_FAILED",
                         $"Opened '{modelDoc.GetTitle()}' but could not make it the ACTIVE document " +
@@ -1497,22 +1555,35 @@ namespace SolidworksExecution.Services
             {
                 var p = request.Params as JObject;
                 bool save = p != null && (p.Value<bool?>("save") ?? false);
+                bool closeAll = p != null && (p.Value<bool?>("close_all") ?? false);
 
-                var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
-                if (modelDoc == null)
-                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                        "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
-
-                // IModelDoc2.Close() is not implemented in the interop (throws NotImplementedException);
-                // close via ISldWorks.CloseDoc(title). CloseDoc discards unsaved changes silently, so
-                // when save=true we must persist first. GetTitle() works for unsaved docs too (e.g. "Part2").
-                string docTitle = modelDoc.GetTitle();
-                if (save)
+                if (closeAll)
                 {
-                    int saveErrors = 0, saveWarnings = 0;
-                    modelDoc.Save3((int)swSaveAsOptions_e.swSaveAsOptions_Silent, ref saveErrors, ref saveWarnings);
+                    // Close EVERYTHING, including invisibly-loaded component docs that a
+                    // per-active-doc close loop can never reach (they are never active).
+                    // Live lesson: a lingering doc with the same TITLE blocks opening another
+                    // folder's same-named part (swFileWithSameTitleAlreadyOpen = 65536) and
+                    // keeps files locked on disk. Discards unsaved changes (true).
+                    _solidWorks.CloseAllDocuments(true);
                 }
-                _solidWorks.CloseDoc(docTitle);
+                else
+                {
+                    var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                    if (modelDoc == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+
+                    // IModelDoc2.Close() is not implemented in the interop (throws NotImplementedException);
+                    // close via ISldWorks.CloseDoc(title). CloseDoc discards unsaved changes silently, so
+                    // when save=true we must persist first. GetTitle() works for unsaved docs too (e.g. "Part2").
+                    string docTitle = modelDoc.GetTitle();
+                    if (save)
+                    {
+                        int saveErrors = 0, saveWarnings = 0;
+                        modelDoc.Save3((int)swSaveAsOptions_e.swSaveAsOptions_Silent, ref saveErrors, ref saveWarnings);
+                    }
+                    _solidWorks.CloseDoc(docTitle);
+                }
 
                 var response = new ExecutionResponse
                 {
@@ -1965,6 +2036,7 @@ namespace SolidworksExecution.Services
                 double posY = p?.Value<double?>("pos_y") ?? 0.1;
                 double scale = p?.Value<double?>("scale") ?? 1.0;
                 string modelPath = p?.Value<string>("model_path") ?? "";
+                string displayMode = (p?.Value<string>("display_mode") ?? "").Trim().ToLowerInvariant();
 
                 var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
                 if (modelDoc == null)
@@ -2022,6 +2094,39 @@ namespace SolidworksExecution.Services
 
                 // Apply scale
                 view.ScaleDecimal = scale;
+
+                // Apply display mode (drafting convention). swDisplayMode_e:
+                //   0=WIREFRAME, 1=HIDDEN_GREYED (Hidden Lines Visible/HLV), 2=HIDDEN (Hidden Lines Removed/HLR),
+                //   3=SHADED, 7=SHADED_EDGES. IView.SetDisplayMode3(UseParent, Mode, Facetted, Edges) — reflection-verified.
+                // If display_mode is not given, DEFAULT orthographic views to HLV (drafting rule: show hidden lines
+                // for reference, never dimension them); leave isometric at the document default (shaded/HLR).
+                int? modeToSet = null;
+                switch (displayMode)
+                {
+                    case "wireframe":                       modeToSet = 0; break;
+                    case "hlv":
+                    case "hidden_lines_visible":
+                    case "hidden_greyed":                   modeToSet = 1; break;
+                    case "hlr":
+                    case "hidden_lines_removed":
+                    case "hidden":                          modeToSet = 2; break;
+                    case "shaded":                          modeToSet = 3; break;
+                    case "shaded_edges":                    modeToSet = 7; break;
+                    case "default":                         modeToSet = null; break;
+                    case "":
+                        // no explicit request → view-type default
+                        if (viewType != "isometric") modeToSet = 1; // ortho views → HLV
+                        break;
+                    default:
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "UNSUPPORTED_DISPLAY_MODE",
+                            $"display_mode '{displayMode}' is not supported. Use: hlv, hlr, wireframe, shaded, shaded_edges, default.");
+                }
+                if (modeToSet.HasValue)
+                {
+                    try { view.SetDisplayMode3(false, modeToSet.Value, false, false); } catch { /* best-effort; never break the view creation */ }
+                }
+
                 modelDoc.GraphicsRedraw2();
 
                 var response = new ExecutionResponse
@@ -2952,6 +3057,25 @@ namespace SolidworksExecution.Services
                 }
                 catch (Exception exd) { ExecLog.Write($"add_section_view DIAG err: {exd.Message}"); }
 
+                // ROOT-CAUSE FIX (#21): ACTIVATE the model view the cut belongs to BEFORE drawing/selecting
+                // the cut line, so the line is added to THAT VIEW's sketch — not the sheet. Without an active
+                // view the section line has no owning view and CreateSectionViewAt5 returns null (and the At2
+                // fallback then faulted SW with RPC_E_SERVERFAULT). The GUI activates the view implicitly when
+                // the user clicks inside it (user-taught flow, 2026-07-10). view_name overrides; otherwise the
+                // view is found by outline-containment of the cut point. ActivateView verified via reflection.
+                double cutMidX = lineMode ? (x1.Value + x2.Value) / 2.0 : edgeX.Value;
+                double cutMidY = lineMode ? (y1.Value + y2.Value) / 2.0 : edgeY.Value;
+                string targetView = p?.Value<string>("view_name");
+                if (string.IsNullOrEmpty(targetView))
+                    targetView = FindDrawingViewAtPoint(drawingDoc, cutMidX, cutMidY);
+                if (!string.IsNullOrEmpty(targetView))
+                {
+                    bool activated = false;
+                    try { activated = drawingDoc.ActivateView(targetView); } catch (Exception exa) { ExecLog.Write($"add_section_view: ActivateView threw {exa.Message}"); }
+                    ExecLog.Write($"add_section_view: ActivateView('{targetView}') -> {activated}");
+                }
+                else ExecLog.Write($"add_section_view: no model view contains cut point ({cutMidX},{cutMidY}) — proceeding without explicit activation");
+
                 // Define the cut line and SELECT it (drawing views project the model as EDGE entities;
                 // selecting the line/edge also sets the owning view). The selected line IS the section cut.
                 modelDoc.ClearSelection2(true);
@@ -2960,25 +3084,39 @@ namespace SolidworksExecution.Services
                 string selType = "EDGE";
                 if (lineMode)
                 {
-                    // Draw the cut line exactly where specified (AddToDB avoids snapping to nearby geometry),
-                    // exit the sketch, then re-select it by its midpoint.
-                    bool prevAddToDB = modelDoc.SketchManager.AddToDB;
-                    modelDoc.SketchManager.AddToDB = true;
-                    var seg = modelDoc.SketchManager.CreateLine(x1.Value, y1.Value, 0, x2.Value, y2.Value, 0) as ISketchSegment;
-                    modelDoc.SketchManager.AddToDB = prevAddToDB;
+                    // The cut line must live in the TARGET VIEW's sketch. When a view is active,
+                    // SketchManager.CreateLine works in VIEW-SKETCH space (model scale, view-centred) — NOT
+                    // sheet space. So transform the intended SHEET endpoints into view-sketch space via
+                    // view.GetSketch().ModelToSketchTransform (the published CodeStack recipe) before drawing;
+                    // otherwise the line lands far OUTSIDE the part and CreateSectionViewAt5 returns null — the
+                    // real ROOT CAUSE of #21 (a raw sheet-coord line drawn in an active view misses the geometry,
+                    // yet still object-selects, so the failure looked like a flaky API).
+                    IView tView = FindViewObjectByName(drawingDoc, targetView);
+                    if (tView == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "SECTION_LINE_FAILED", "Could not resolve the model view to draw the cut line in. Point the cut inside a view, or pass view_name.");
+                    double[] vp1 = TransformSheetToViewSketch(tView, x1.Value, y1.Value);
+                    double[] vp2 = TransformSheetToViewSketch(tView, x2.Value, y2.Value);
+                    if (vp1 == null || vp2 == null || vp1.Length < 3 || vp2.Length < 3)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "SECTION_LINE_FAILED", "Could not transform the sheet coordinates into the view sketch space.");
+                    drawingDoc.ActivateView(tView.Name);
+                    var seg = modelDoc.SketchManager.CreateLine(vp1[0], vp1[1], vp1[2], vp2[0], vp2[1], vp2[2]) as ISketchSegment;
                     if (modelDoc.SketchManager.ActiveSketch != null)
                         modelDoc.SketchManager.InsertSketch(true);
                     if (seg == null)
                         return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "SECTION_LINE_FAILED", "Could not sketch the cut line. Ensure (x1,y1)-(x2,y2) lie on the sheet and cross the view.");
-                    modelDoc.ClearSelection2(true);
+                            "SECTION_LINE_FAILED", "Could not sketch the cut line in the view.");
                     selX = (x1.Value + x2.Value) / 2.0; selY = (y1.Value + y2.Value) / 2.0; selType = "SKETCHSEGMENT";
+                    modelDoc.ClearSelection2(true);
+                    // The transformed line DISPLAYS at the intended sheet location, so a sheet-coord pick finds
+                    // it (also a self-check that the transform was right); object-select is the robust fallback.
                     sel = modelDoc.Extension.SelectByID2("", "SKETCHSEGMENT", selX, selY, 0, false, 0, null, 0);
                     if (!sel) try { sel = seg.Select4(false, null); } catch { }
-                    ExecLog.Write($"add_section_view: LINE ({x1.Value},{y1.Value})-({x2.Value},{y2.Value}) mid=({selX},{selY}) selected={sel}");
+                    ExecLog.Write($"add_section_view: LINE sheet ({x1.Value},{y1.Value})-({x2.Value},{y2.Value}) -> viewSketch ({R6(vp1[0])},{R6(vp1[1])})-({R6(vp2[0])},{R6(vp2[1])}) selected={sel} coordPick={(sel ? "y" : "n")}");
                     if (!sel)
                         return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "SECTION_LINE_FAILED", "Drew the cut line but could not select it. Check the coordinates lie on the sheet.");
+                            "SECTION_LINE_FAILED", "Drew the cut line but could not select it.");
                 }
                 else
                 {
@@ -2992,6 +3130,20 @@ namespace SolidworksExecution.Services
                             "EDGE_NOT_FOUND", $"No projected straight edge/line found at or near ({selX}, {selY}). Point at an edge already shown in a view, or use x1,y1,x2,y2 to draw a cut line through the feature.");
                 }
 
+                // Read-only diagnostic (#21): confirm exactly what SW believes is selected at call time
+                // (a valid section line should be a sketch segment = swSelSKETCHSEGS 9, or an edge = 1).
+                try
+                {
+                    var selMgr = modelDoc.ISelectionManager as ISelectionMgr;
+                    if (selMgr != null)
+                    {
+                        int selCount = selMgr.GetSelectedObjectCount2(-1);
+                        int selT = selCount > 0 ? selMgr.GetSelectedObjectType3(1, -1) : -1;
+                        ExecLog.Write($"add_section_view: pre-create selection count={selCount} type={selT} activeView='{targetView}'");
+                    }
+                }
+                catch (Exception exs) { ExecLog.Write($"add_section_view: sel diag err {exs.Message}"); }
+
                 int options = 0;
                 if (flip) options |= 4; // swCreateSectionViewAtOptions_e.swCreateSectionView_ChangeDirection
 
@@ -3003,14 +3155,11 @@ namespace SolidworksExecution.Services
                 ExecLog.Write($"add_section_view: CreateSectionViewAt5 -> {(view == null ? "null" : view.Name)}");
                 if (view == null)
                 {
-                    try
-                    {
-                        modelDoc.ClearSelection2(true);
-                        modelDoc.Extension.SelectByID2("", selType, selX, selY, 0, false, 0, null, 0);
-                        view = drawingDoc.CreateSectionViewAt2(px.Value, py.Value, 0, false, false, label, flip, false, false, false) as IView;
-                        ExecLog.Write($"add_section_view: CreateSectionViewAt2 fallback -> {(view == null ? "null" : view.Name)}");
-                    }
-                    catch (Exception ex2) { ExecLog.Write($"add_section_view: At2 threw {ex2.Message}"); }
+                    // SAFETY: the CreateSectionViewAt2 fallback is DISABLED. On this SW 2026 (34.x) build it
+                    // does not merely fail — it throws RPC_E_SERVERFAULT (0x80010105) and can CRASH SolidWorks
+                    // (observed twice 2026-07-10, then a full slddrw crash). At5 returning null is a clean,
+                    // recoverable failure; escalating to At2 is net-negative. See KNOWN-LIMITATIONS #21 / ADR-037.
+                    ExecLog.Write("add_section_view: At5 returned null; At2 fallback DISABLED (it crashes SW). Failing cleanly.");
                 }
                 if (view == null)
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
@@ -3062,6 +3211,78 @@ namespace SolidworksExecution.Services
                 return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                     "UNEXPECTED_ERROR", ex.Message);
             }
+        }
+
+        // Find the model view whose sheet OUTLINE contains a point (sheet meters). Skips the sheet view
+        // (Type==1). Used to activate the correct owning view for a section cut. Returns null if none contains it.
+        private string FindDrawingViewAtPoint(IDrawingDoc drawingDoc, double sx, double sy)
+        {
+            try
+            {
+                object dvo = drawingDoc.GetFirstView();
+                int guard = 0;
+                while (dvo != null && guard++ < 200)
+                {
+                    var dv = dvo as IView;
+                    object dn = (dv != null) ? dv.GetNextView() : null;
+                    if (dv != null)
+                    {
+                        int dt = -1; try { dt = dv.Type; } catch { }
+                        if (dt != 1)
+                        {
+                            double[] o = null; try { o = dv.GetOutline() as double[]; } catch { }
+                            if (o != null && o.Length >= 4 && sx >= o[0] && sx <= o[2] && sy >= o[1] && sy <= o[3])
+                                return dv.Name;
+                        }
+                    }
+                    dvo = dn;
+                }
+            }
+            catch (Exception ex) { ExecLog.Write($"FindDrawingViewAtPoint err: {ex.Message}"); }
+            return null;
+        }
+
+        // Resolve an IView by its Name in the active drawing (first name match; null if none).
+        private IView FindViewObjectByName(IDrawingDoc drawingDoc, string name)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+            try
+            {
+                object dvo = drawingDoc.GetFirstView();
+                int guard = 0;
+                while (dvo != null && guard++ < 200)
+                {
+                    var dv = dvo as IView;
+                    object dn = (dv != null) ? dv.GetNextView() : null;
+                    if (dv != null && dv.Name == name) return dv;
+                    dvo = dn;
+                }
+            }
+            catch (Exception ex) { ExecLog.Write($"FindViewObjectByName err: {ex.Message}"); }
+            return null;
+        }
+
+        // Transform a DRAWING SHEET point (meters) into a view's SKETCH coordinate space, so a line drawn via
+        // SketchManager while that view is active appears at the intended sheet location. Published recipe:
+        // view.GetSketch().ModelToSketchTransform + IMathUtility (handles the view's scale, offset and any
+        // rotation). Returns {x,y,z} in view-sketch space, or null on failure.
+        private double[] TransformSheetToViewSketch(IView view, double sheetX, double sheetY)
+        {
+            try
+            {
+                var sk = view.GetSketch() as ISketch;
+                if (sk == null) return null;
+                var xform = sk.ModelToSketchTransform;
+                if (xform == null) return null;
+                var mu = _solidWorks.GetMathUtility() as IMathUtility;
+                if (mu == null) return null;
+                var pt = mu.CreatePoint(new double[] { sheetX, sheetY, 0.0 }) as IMathPoint;
+                if (pt == null) return null;
+                pt = pt.MultiplyTransform(xform) as IMathPoint;
+                if (pt == null) return null;
+                return pt.ArrayData as double[];
+            }
+            catch (Exception ex) { ExecLog.Write($"TransformSheetToViewSketch err: {ex.Message}"); return null; }
         }
 
         public ExecutionResponse AddEdgeFeature(ToolRequest request)
@@ -3473,6 +3694,64 @@ namespace SolidworksExecution.Services
                     results.Add($"edges={totalEdges}");
                     results.Add($"vertices={totalVerts}");
                 }
+                else if (analysisType == "bodies")
+                {
+                    // Per-BODY fingerprint (multibody parts — e.g. a FLATTENED assembly STEP):
+                    // volume/area/centroid + the body's FACE INDEX RANGE in the same enumeration
+                    // ReadFaces walks, so a caller can segment analyze_model(faces) per body and
+                    // match bodies to known parts (assembly reconstruction, Phase B 1-3 class).
+                    var partDoc = modelDoc as IPartDoc;
+                    if (partDoc == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "WRONG_DOCUMENT_TYPE", "analysis_type='bodies' requires a part document.");
+                    var root = new JObject();
+                    var arr = new JArray();
+                    int faceCursor = 0, bidx = 0;
+                    object[] bodies = partDoc.GetBodies2((int)swBodyType_e.swSolidBody, true) as object[];
+                    if (bodies != null)
+                    {
+                        foreach (var b in bodies)
+                        {
+                            var body = b as IBody2;
+                            if (body == null) continue;
+                            var bj = new JObject();
+                            bj["i"] = bidx++;
+                            try
+                            {
+                                // Imported breps often carry the source product name (Fusion/NX
+                                // exports) — free naming for body->part extraction.
+                                var bn = body.Name;
+                                if (!string.IsNullOrEmpty(bn)) bj["name"] = bn;
+                            }
+                            catch { }
+                            int fc = body.GetFaceCount();
+                            bj["face_start"] = faceCursor;
+                            bj["face_count"] = fc;
+                            faceCursor += fc;
+                            bj["edges"] = body.GetEdgeCount();
+                            bj["vertices"] = body.GetVertexCount();
+                            try
+                            {
+                                // IBody2.GetMassProperties(density=1): [0..2]=centroid, [3]=volume,
+                                // [4]=area (layout sanity-checked live against document totals).
+                                var mp = body.GetMassProperties(1.0) as double[];
+                                if (mp == null && body.GetMassProperties(1.0) is object[] oa2)
+                                    mp = Array.ConvertAll(oa2, o => (double)o);
+                                if (mp != null && mp.Length >= 5)
+                                {
+                                    bj["centroid"] = new JArray { Math.Round(mp[0], 9), Math.Round(mp[1], 9), Math.Round(mp[2], 9) };
+                                    bj["volume"] = mp[3];
+                                    bj["area"] = mp[4];
+                                }
+                            }
+                            catch { }
+                            arr.Add(bj);
+                        }
+                    }
+                    root["body_count"] = arr.Count;
+                    root["bodies"] = arr;
+                    results.Add(root.ToString(Newtonsoft.Json.Formatting.None));
+                }
                 else if (analysisType == "edges")
                 {
                     // Edge list with start/end/MIDPOINT 3D coords — so a caller can pick an edge to
@@ -3574,7 +3853,7 @@ namespace SolidworksExecution.Services
                 {
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "UNSUPPORTED_ANALYSIS_TYPE",
-                        $"analysis_type '{analysisType}' is not supported. Supported: mass_properties, geometry, edges, faces, features, sketch, feature_map.");
+                        $"analysis_type '{analysisType}' is not supported. Supported: mass_properties, geometry, bodies, edges, faces, features, sketch, feature_map.");
                 }
 
                 // AnalyzeModel does NOT increment state_version — read-only, same pattern as VerifyState
@@ -6218,6 +6497,39 @@ namespace SolidworksExecution.Services
                             fj["point"] = new JArray { R6(pt[0]), R6(pt[1]), R6(pt[2]) };
                     }
                 }
+                else if (surf != null)
+                {
+                    // Non-planar faces: report the surface KIND + matching geometry (Phase B —
+                    // a concentric mate's anchor is a CYLINDRICAL face; the resolver matches it
+                    // by axis + radius). CylinderParams layout: [0..2]=origin, [3..5]=axis
+                    // (unit), [6]=radius. All faces also get a representative on-surface point.
+                    try
+                    {
+                        if (surf.IsCylinder())
+                        {
+                            fj["kind"] = "cylinder";
+                            var cp2 = surf.CylinderParams as double[];
+                            if (cp2 == null && surf.CylinderParams is object[] cpo)
+                                cp2 = Array.ConvertAll(cpo, o => (double)o);
+                            if (cp2 != null && cp2.Length >= 7)
+                            {
+                                fj["origin"] = new JArray { R6(cp2[0]), R6(cp2[1]), R6(cp2[2]) };
+                                fj["axis"] = new JArray { R6(cp2[3]), R6(cp2[4]), R6(cp2[5]) };
+                                fj["radius"] = R6(cp2[6]);
+                            }
+                        }
+                        else if (surf.IsCone()) fj["kind"] = "cone";
+                        else if (surf.IsSphere()) fj["kind"] = "sphere";
+                        var uv2 = face.GetUVBounds() as double[];
+                        if (uv2 != null && uv2.Length >= 4)
+                        {
+                            var pt2 = surf.Evaluate((uv2[0] + uv2[1]) / 2.0, (uv2[2] + uv2[3]) / 2.0, 0, 0) as double[];
+                            if (pt2 != null && pt2.Length >= 3)
+                                fj["point"] = new JArray { R6(pt2[0]), R6(pt2[1]), R6(pt2[2]) };
+                        }
+                    }
+                    catch { }
+                }
             }
             catch { }
             return fj;
@@ -6648,6 +6960,1029 @@ namespace SolidworksExecution.Services
             }
             catch { }
             return arr;
+        }
+
+        // ==================================================================
+        // ASSEMBLY SURFACE (Phase B, ADR-047) — readers first (B1), builders (B3).
+        // Signatures reflection-verified 2026-07-09 (scratch/b1_reflection_notes.md).
+        // Mate types/alignments come from the ENUMS — live SW is Turkish, display
+        // names are never trusted. Enum ints inlined per ADR-018 (values reflected
+        // from swconst 2026-07-09).
+        // ==================================================================
+
+        // swMateType_e — only the vocabulary slice + safe neighbors get canonical names;
+        // anything else reports unknown_<n> and becomes a VOCABULARY_GAP at the IR step (C5).
+        private static string MateTypeName(int t)
+        {
+            switch (t)
+            {
+                case 0: return "coincident";
+                case 1: return "concentric";
+                case 2: return "perpendicular";
+                case 3: return "parallel";
+                case 4: return "tangent";
+                case 5: return "distance";
+                case 6: return "angle";
+                case 8: return "symmetric";
+                case 11: return "width";
+                case 16: return "lock";
+                case 20: return "coordinate";
+                case 21: return "slot";
+                case 22: return "hinge";
+                case 24: return "profile_center";
+                default: return "unknown_" + t;
+            }
+        }
+
+        private static int MateTypeFromName(string s)
+        {
+            switch ((s ?? "").ToLowerInvariant())
+            {
+                case "coincident": return 0;
+                case "concentric": return 1;
+                case "perpendicular": return 2;
+                case "parallel": return 3;
+                case "tangent": return 4;
+                case "distance": return 5;
+                case "angle": return 6;
+                case "lock": return 16;
+                default: return -1;
+            }
+        }
+
+        // swMateAlign_e: 0=aligned, 1=anti_aligned, 2=closest
+        private static string MateAlignName(int a)
+        {
+            switch (a)
+            {
+                case 0: return "aligned";
+                case 1: return "anti_aligned";
+                case 2: return "closest";
+                default: return "unknown_" + a;
+            }
+        }
+
+        private static int MateAlignFromName(string s)
+        {
+            switch ((s ?? "").ToLowerInvariant())
+            {
+                case "aligned": return 0;
+                case "anti_aligned": return 1;
+                default: return 2; // closest — let SolidWorks pick the nearer solution
+            }
+        }
+
+        // swMateEntity2ReferenceType_e — the KIND of geometry a mate side references.
+        private static string MateEntityKind(int rt)
+        {
+            switch (rt)
+            {
+                case 0: return "point";
+                case 1: return "line";
+                case 2: return "circle";
+                case 3: return "plane";
+                case 4: return "cylinder";
+                case 5: return "sphere";
+                case 6: return "set";
+                case 7: return "cone";
+                case 11: return "ellipse";
+                case 12: return "general_curve";
+                default: return "unknown_" + rt;
+            }
+        }
+
+        // Component transform readback — Transform2.ArrayData: [0..8] = 3x3 rotation (row major),
+        // [9..11] = translation (meters), [12] = scale. Rounded to 9dp: comfortably beyond the
+        // ADR-047 verification tolerances (pos <= 1µm, rot <= 1e-6) without rounding AT them.
+        private static JArray TransformJson(IComponent2 comp)
+        {
+            try
+            {
+                var xf = comp.Transform2;
+                if (xf == null) return null;
+                var d = xf.ArrayData as double[];
+                if (d == null && xf.ArrayData is object[] oa)
+                    d = Array.ConvertAll(oa, o => (double)o);
+                if (d == null || d.Length < 13) return null;
+                var arr = new JArray();
+                for (int i = 0; i < 13; i++) arr.Add(Math.Round(d[i], 9));
+                return arr;
+            }
+            catch { return null; }
+        }
+
+        private IComponent2 FindComponentByName(IAssemblyDoc asm, string name)
+        {
+            object[] comps = asm.GetComponents(true) as object[];
+            if (comps == null) return null;
+            foreach (var c in comps)
+            {
+                var comp = c as IComponent2;
+                if (comp == null) continue;
+                if (string.Equals(comp.Name2, name, StringComparison.OrdinalIgnoreCase)) return comp;
+            }
+            return null;
+        }
+
+        // Component occurrences in FEATURE-TREE order — GetComponents(true) returns an
+        // ARBITRARY order (observed live: second insert listed first), but the IR grammar says
+        // components first, IN TREE ORDER. Component occurrences are features of type
+        // "Reference" whose specific feature is the Component2.
+        private List<IComponent2> ComponentsInTreeOrder(IModelDoc2 modelDoc, IAssemblyDoc asm)
+        {
+            var list = new List<IComponent2>();
+            var seen = new HashSet<string>();
+            var feat = modelDoc.FirstFeature() as IFeature;
+            int guard = 0;
+            while (feat != null && guard++ < 10000)
+            {
+                if ((feat.GetTypeName2() ?? "") == "Reference")
+                {
+                    var comp = feat.GetSpecificFeature2() as IComponent2;
+                    if (comp != null && seen.Add(comp.Name2)) list.Add(comp);
+                }
+                feat = feat.GetNextFeature() as IFeature;
+            }
+            if (list.Count == 0)
+            {
+                // Fallback — never return nothing just because the tree walk found no Reference
+                // features (unexpected): fall back to GetComponents' arbitrary order.
+                object[] comps = asm.GetComponents(true) as object[];
+                if (comps != null)
+                    foreach (var c in comps)
+                    {
+                        var comp = c as IComponent2;
+                        if (comp != null) list.Add(comp);
+                    }
+            }
+            return list;
+        }
+
+        // One component occurrence -> its JSON entry (shared by the flat and top-level reads).
+        private JObject ComponentJson(IComponent2 comp, int idx)
+        {
+            var cj = new JObject();
+            cj["i"] = idx;
+            cj["name"] = comp.Name2;
+            try { cj["path"] = comp.GetPathName(); } catch { }
+            try
+            {
+                var cfg = comp.ReferencedConfiguration;
+                if (!string.IsNullOrEmpty(cfg)) cj["config"] = cfg;
+            }
+            catch { }
+            cj["fixed"] = comp.IsFixed();
+            if (comp.IsSuppressed()) cj["suppressed"] = true;
+            var t = TransformJson(comp);
+            if (t != null) cj["transform"] = t;
+            return cj;
+        }
+
+        // Recursive LEAF collection for components_flat: a WRAPPER/subassembly level is
+        // descended into (the user-provided samples wrap everything one level down); leaves
+        // report their Transform2, which SolidWorks gives in ROOT-assembly space. The IR stays
+        // FLAT — this read is ground-truth acquisition, and the artifact notes the wrapper.
+        private void CollectLeafComponents(IComponent2 comp, JArray arr, ref int idx, string parent)
+        {
+            object[] children = null;
+            try { children = comp.GetChildren() as object[]; } catch { }
+            if (children != null && children.Length > 0)
+            {
+                foreach (var ch in children)
+                {
+                    var c = ch as IComponent2;
+                    if (c != null) CollectLeafComponents(c, arr, ref idx, comp.Name2);
+                }
+                return;
+            }
+            var cj = ComponentJson(comp, idx++);
+            if (parent != null) cj["parent"] = parent;
+            arr.Add(cj);
+        }
+
+        // Component tree read (B1). Top-level components in TREE order; per instance: name,
+        // source path, config, fixed/suppressed flags, FULL Transform2 (the verification ground
+        // truth, ADR-047). A component with children is a SUBASSEMBLY — out of scope first round
+        // (ADR-047d): still reported (with child count) so the IR step can record the gap loudly.
+        private JObject ReadComponents(IModelDoc2 modelDoc, IAssemblyDoc asm)
+        {
+            var root = new JObject();
+            var arr = new JArray();
+            int idx = 0;
+            var comps = ComponentsInTreeOrder(modelDoc, asm);
+            {
+                foreach (var comp in comps)
+                {
+                    if (comp == null) continue;
+                    var cj = new JObject();
+                    cj["i"] = idx++;
+                    cj["name"] = comp.Name2;
+                    try { cj["path"] = comp.GetPathName(); } catch { }
+                    try
+                    {
+                        var cfg = comp.ReferencedConfiguration;
+                        if (!string.IsNullOrEmpty(cfg)) cj["config"] = cfg;
+                    }
+                    catch { }
+                    cj["fixed"] = comp.IsFixed();
+                    if (comp.IsSuppressed()) cj["suppressed"] = true;
+                    try
+                    {
+                        int children = comp.IGetChildrenCount();
+                        if (children > 0) cj["children"] = children;
+                    }
+                    catch { }
+                    var t = TransformJson(comp);
+                    if (t != null) cj["transform"] = t;
+                    arr.Add(cj);
+                }
+            }
+            root["component_count"] = arr.Count;
+            root["components"] = arr;
+            return root;
+        }
+
+        // Mate read (B1) — walks the MateGroup's subfeatures, which IS creation order (the IR's
+        // mate grammar: creation order is law). Type/alignment from the ENUMS (never the Turkish
+        // display name); distance/angle value in SI from the mate's own dimension (C7 verbatim);
+        // per entity: owning component (null = the assembly's own datum), geometry KIND, and
+        // EntityParams (location + direction + radii, assembly space) as the geometric anchor.
+        // Read-only: plain FeatureData reads, no AccessSelections needed.
+        private JObject ReadMates(IModelDoc2 modelDoc)
+        {
+            var root = new JObject();
+            var arr = new JArray();
+            int idx = 0;
+            var feat = modelDoc.FirstFeature() as IFeature;
+            int guard = 0;
+            while (feat != null && guard++ < 5000)
+            {
+                if ((feat.GetTypeName2() ?? "") == "MateGroup")
+                {
+                    var sub = feat.GetFirstSubFeature() as IFeature;
+                    int subGuard = 0;
+                    while (sub != null && subGuard++ < 2000)
+                    {
+                        var mate = sub.GetSpecificFeature2() as IMate2;
+                        if (mate != null)
+                        {
+                            var mj = new JObject();
+                            mj["i"] = idx++;
+                            mj["name"] = sub.Name;
+                            int mtype = -1;
+                            try { mtype = mate.Type; } catch { }
+                            mj["type"] = MateTypeName(mtype);
+                            try { mj["alignment"] = MateAlignName(mate.Alignment); } catch { }
+                            if (mtype == 5 || mtype == 6) // distance / angle carry a driving dimension
+                            {
+                                try
+                                {
+                                    var dd = mate.get_DisplayDimension2(0);
+                                    var dim = dd?.GetDimension2(0);
+                                    if (dim != null) mj["value"] = Math.Round(dim.SystemValue, 9); // SI: m / rad
+                                }
+                                catch { }
+                            }
+                            var ents = new JArray();
+                            int ec = 0;
+                            try { ec = mate.GetMateEntityCount(); } catch { }
+                            for (int i = 0; i < ec; i++)
+                            {
+                                try
+                                {
+                                    var me = mate.MateEntity(i);
+                                    if (me == null) continue;
+                                    var ej = new JObject();
+                                    var rc = me.ReferenceComponent;
+                                    ej["component"] = rc != null ? rc.Name2 : null;
+                                    ej["kind"] = MateEntityKind(me.ReferenceType2);
+                                    var raw = me.EntityParams;
+                                    double[] prms = raw as double[];
+                                    if (prms == null && raw is object[] oa)
+                                        prms = Array.ConvertAll(oa, o => (double)o);
+                                    if (prms != null)
+                                    {
+                                        var pa = new JArray();
+                                        foreach (var v in prms) pa.Add(Math.Round(v, 9));
+                                        ej["params"] = pa;
+                                    }
+                                    ents.Add(ej);
+                                }
+                                catch { }
+                            }
+                            mj["entities"] = ents;
+                            arr.Add(mj);
+                        }
+                        sub = sub.GetNextSubFeature() as IFeature;
+                    }
+                }
+                feat = feat.GetNextFeature() as IFeature;
+            }
+            root["mate_count"] = arr.Count;
+            root["mates"] = arr;
+            return root;
+        }
+
+        // Component-scoped face/edge enumeration (B3's index-first selection, ADR-047 carry-over:
+        // KNOWN-LIMITATIONS #6 — coordinate picks miss real geometry; select by INDEX instead).
+        // The enumeration order here is EXACTLY the order GetComponentEntity walks, so an index
+        // from this read selects the same entity in add_mate. The component's transform is
+        // included so the caller can map coordinates between part and assembly space.
+        private JObject ReadComponentEntities(IAssemblyDoc asm, string componentName, bool faces,
+            out string errCode, out string errMsg)
+        {
+            errCode = null; errMsg = null;
+            var comp = FindComponentByName(asm, componentName);
+            if (comp == null)
+            {
+                errCode = "COMPONENT_NOT_FOUND";
+                errMsg = $"No top-level component named '{componentName}'. Use analyze_assembly(components) for the exact Name2 values (e.g. 'Shaft-1').";
+                return null;
+            }
+            var root = new JObject();
+            root["component"] = comp.Name2;
+            var t = TransformJson(comp);
+            if (t != null) root["transform"] = t;
+            var arr = new JArray();
+            int idx = 0;
+            object info;
+            object[] bodies = comp.GetBodies3((int)swBodyType_e.swSolidBody, out info) as object[];
+            if (bodies != null)
+            {
+                foreach (var b in bodies)
+                {
+                    var body = b as IBody2;
+                    if (body == null) continue;
+                    if (faces)
+                    {
+                        object[] fs = body.GetFaces() as object[];
+                        if (fs == null) continue;
+                        foreach (var f in fs)
+                        {
+                            var face = f as IFace2;
+                            if (face == null) continue;
+                            arr.Add(BuildFaceJson(face, idx++));
+                        }
+                    }
+                    else
+                    {
+                        object[] es = body.GetEdges() as object[];
+                        if (es == null) continue;
+                        foreach (var e in es)
+                        {
+                            var edge = e as IEdge;
+                            if (edge == null) continue;
+                            arr.Add(BuildEdgeJson(edge, idx++));
+                        }
+                    }
+                }
+            }
+            root[faces ? "face_count" : "edge_count"] = arr.Count;
+            root[faces ? "faces" : "edges"] = arr;
+            return root;
+        }
+
+        // Resolve (component, kind, index) → the selectable entity, using the SAME enumeration
+        // ReadComponentEntities reports. Returns null with a populated error when unresolvable.
+        private object GetComponentEntity(IAssemblyDoc asm, string componentName, string kind, int index,
+            out string errCode, out string errMsg)
+        {
+            errCode = null; errMsg = null;
+            var comp = FindComponentByName(asm, componentName);
+            if (comp == null)
+            {
+                errCode = "COMPONENT_NOT_FOUND";
+                errMsg = $"No top-level component named '{componentName}'.";
+                return null;
+            }
+            bool faces = kind == "face";
+            if (!faces && kind != "edge")
+            {
+                errCode = "UNSUPPORTED_ENTITY_KIND";
+                errMsg = $"Entity kind '{kind}' is not supported yet (face|edge). Datum-plane mates are a recorded gap.";
+                return null;
+            }
+            int idx = 0;
+            object info;
+            object[] bodies = comp.GetBodies3((int)swBodyType_e.swSolidBody, out info) as object[];
+            if (bodies != null)
+            {
+                foreach (var b in bodies)
+                {
+                    var body = b as IBody2;
+                    if (body == null) continue;
+                    object[] items = faces ? body.GetFaces() as object[] : body.GetEdges() as object[];
+                    if (items == null) continue;
+                    foreach (var it in items)
+                    {
+                        if (it == null) continue;
+                        if (idx == index) return it;
+                        idx++;
+                    }
+                }
+            }
+            errCode = "ENTITY_NOT_FOUND";
+            errMsg = $"{kind} index {index} not found on '{componentName}' (component has {idx} {kind}s). Re-read analyze_assembly({kind}s, component=...) — indices shift when geometry changes.";
+            return null;
+        }
+
+        // analyze_assembly — the B1 READ tool. analysis_type: 'components' (tree + transforms),
+        // 'mates' (creation order, enum types, values, entity anchors), 'faces'/'edges'
+        // (component-scoped, index-first; requires 'component'). Read-only, no state bump.
+        // mass_properties for the whole assembly: analyze_model(mass_properties) already works.
+        public ExecutionResponse AnalyzeAssembly(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string analysisType = (p?.Value<string>("analysis_type") ?? "components").ToLowerInvariant();
+
+                var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                if (modelDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+                var asm = modelDoc as IAssemblyDoc;
+                if (asm == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "WRONG_DOCUMENT_TYPE", "analyze_assembly requires an ASSEMBLY document to be active.");
+
+                var results = new List<string>();
+                if (analysisType == "components")
+                {
+                    results.Add(ReadComponents(modelDoc, asm).ToString(Newtonsoft.Json.Formatting.None));
+                }
+                else if (analysisType == "components_flat")
+                {
+                    // LEAF occurrences across all nesting levels (tree order, depth-first),
+                    // transforms in ROOT space — flattens wrapper/subassembly levels for
+                    // ground-truth acquisition (the IR itself stays flat; nesting is noted).
+                    var root = new JObject();
+                    var arr = new JArray();
+                    int idx = 0;
+                    foreach (var comp in ComponentsInTreeOrder(modelDoc, asm))
+                        CollectLeafComponents(comp, arr, ref idx, null);
+                    root["component_count"] = arr.Count;
+                    root["components"] = arr;
+                    results.Add(root.ToString(Newtonsoft.Json.Formatting.None));
+                }
+                else if (analysisType == "mates")
+                {
+                    results.Add(ReadMates(modelDoc).ToString(Newtonsoft.Json.Formatting.None));
+                }
+                else if (analysisType == "faces" || analysisType == "edges")
+                {
+                    string componentName = p?.Value<string>("component");
+                    if (string.IsNullOrEmpty(componentName))
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "MISSING_PARAMETER",
+                            $"analysis_type='{analysisType}' requires 'component' (Name2 from analyze_assembly(components), e.g. 'Shaft-1').");
+                    string errCode, errMsg;
+                    var res = ReadComponentEntities(asm, componentName, analysisType == "faces", out errCode, out errMsg);
+                    if (res == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), errCode, errMsg);
+                    results.Add(res.ToString(Newtonsoft.Json.Formatting.None));
+                }
+                else
+                {
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "UNSUPPORTED_ANALYSIS_TYPE",
+                        $"analysis_type '{analysisType}' is not supported. Supported: components, components_flat, mates, faces, edges.");
+                }
+
+                // Read-only — no state bump (same pattern as AnalyzeModel).
+                return new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion(),
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion(),
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "ASSEMBLY",
+                        ActiveSketch = null,
+                        Features = results,
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
+        // open_new_assembly — blank ASSEMBLY document (the twin of open_new_part).
+        public ExecutionResponse OpenNewAssembly(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string templatePath = p != null ? p.Value<string>("template_path") : null;
+
+                if (string.IsNullOrEmpty(templatePath))
+                {
+                    templatePath = _solidWorks.GetUserPreferenceStringValue(
+                        (int)swUserPreferenceStringValue_e.swDefaultTemplateAssembly);
+                }
+
+                if (string.IsNullOrEmpty(templatePath) || !System.IO.File.Exists(templatePath))
+                {
+                    string templatesDir = System.IO.Path.Combine(
+                        System.Environment.GetFolderPath(System.Environment.SpecialFolder.CommonApplicationData),
+                        "SolidWorks");
+                    var found = System.IO.Directory.GetFiles(templatesDir, "*.asmdot",
+                        System.IO.SearchOption.AllDirectories);
+                    if (found.Length == 0)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "TEMPLATE_NOT_FOUND",
+                            "No assembly template (.asmdot) found. Set a default template in SolidWorks → Tools → Options → Default Templates.");
+                    templatePath = found[0];
+                }
+
+                object doc = _solidWorks.NewDocument(templatePath, 0, 0, 0);
+                var modelDoc = doc as IModelDoc2;
+                if (modelDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "DOCUMENT_CREATION_FAILED",
+                        $"SolidWorks NewDocument returned null. Template used: '{templatePath}'.");
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "ASSEMBLY",
+                        ActiveSketch = null,
+                        Features = new List<string>(),
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
+        // insert_component — AddComponent5 (B3). The component document must be LOADED first
+        // (AddComponent5 contract), so we preload it silently, re-activate the assembly, insert,
+        // then close the preloaded doc (the assembly holds its own reference). fixed=true fixes
+        // the inserted instance; fixed=false explicitly unfixes (SolidWorks auto-fixes a first
+        // component in some flows — we make the state deterministic either way, C7 spirit).
+        public ExecutionResponse InsertComponent(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string filePath = p?.Value<string>("file_path");
+                if (string.IsNullOrEmpty(filePath))
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "MISSING_PARAMETER", "file_path is required (.sldprt to insert).");
+                if (!System.IO.File.Exists(filePath))
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "FILE_NOT_FOUND", $"No file at '{filePath}'.");
+                double x = p?.Value<double?>("x") ?? 0.0;
+                double y = p?.Value<double?>("y") ?? 0.0;
+                double z = p?.Value<double?>("z") ?? 0.0;
+                string config = p?.Value<string>("config") ?? "";
+                bool? fixedFlag = p?.Value<bool?>("fixed");
+
+                var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                var asm = modelDoc as IAssemblyDoc;
+                if (asm == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "WRONG_DOCUMENT_TYPE", "insert_component requires an ASSEMBLY document to be active (open_new_assembly first).");
+                string asmTitle = modelDoc.GetTitle();
+
+                // Preload the component document (required by AddComponent5), then restore the
+                // assembly as active — OpenDoc6 activates what it opens.
+                int e1 = 0, w1 = 0;
+                var partDoc = _solidWorks.OpenDoc6(filePath, (int)swDocumentTypes_e.swDocPART,
+                    (int)swOpenDocOptions_e.swOpenDocOptions_Silent, "", ref e1, ref w1) as IModelDoc2;
+                if (partDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "OPEN_FAILED", $"Could not preload '{filePath}' (errors={e1}).");
+                string partTitle = partDoc.GetTitle();
+                int actErr = 0;
+                _solidWorks.ActivateDoc3(asmTitle, false, 1 /* swDontRebuildActiveDoc */, ref actErr);
+
+                var comp = asm.AddComponent5(filePath,
+                    0 /* swAddComponentConfigOptions_CurrentSelectedConfig */, "",
+                    false, config, x, y, z);
+                if (comp == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "INSERT_FAILED",
+                        $"AddComponent5 returned null for '{filePath}' (config='{config}'). The file must be a loadable part/assembly document.");
+
+                // Optional FULL transform placement (13 doubles: 3x3 rotation row-major, translation
+                // xyz, scale — the exact layout analyze_assembly reports). Needed for mate-less
+                // imported assemblies (1-3 class) whose fixed components sit at arbitrary rotations
+                // x/y/z alone cannot express. JSON-string param per the ADR-022 idiom.
+                string transformJson = p?.Value<string>("transform_json");
+                if (!string.IsNullOrEmpty(transformJson) && transformJson != "[]")
+                {
+                    var tvals = Newtonsoft.Json.Linq.JArray.Parse(transformJson);
+                    if (tvals.Count < 13)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "INVALID_PARAMETER", "transform_json needs 13 numbers: 9 rotation (row-major) + 3 translation + scale.");
+                    var arr = new double[16];
+                    for (int i = 0; i < 13; i++) arr[i] = (double)tvals[i];
+                    arr[13] = arr[14] = arr[15] = 0.0;
+                    var mu = _solidWorks.IGetMathUtility();
+                    var xf = mu.CreateTransform(arr) as MathTransform;
+                    if (xf == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "TRANSFORM_FAILED", "CreateTransform rejected the array.");
+                    comp.Transform2 = xf;
+                }
+
+                // Deterministic fixed state when the caller asked for one.
+                if (fixedFlag.HasValue && comp.IsFixed() != fixedFlag.Value)
+                {
+                    modelDoc.ClearSelection2(true);
+                    if (comp.Select4(false, null, false))
+                    {
+                        if (fixedFlag.Value) asm.FixComponent(); else asm.UnfixComponent();
+                    }
+                    modelDoc.ClearSelection2(true);
+                }
+
+                // Close the preloaded standalone doc — the assembly keeps its own reference.
+                try { if (partTitle != asmTitle) _solidWorks.CloseDoc(partTitle); } catch { }
+
+                // CloseDoc leaves the ACTIVE doc unpredictable (observed live: the next call saw a
+                // non-assembly active doc). Re-activate the assembly deterministically.
+                int actErr2 = 0;
+                _solidWorks.ActivateDoc3(asmTitle, false, 1 /* swDontRebuildActiveDoc */, ref actErr2);
+
+                modelDoc.EditRebuild3();
+
+                var features = new List<string>();
+                // features[0] = the PLAIN runtime component name (instance-numbered Name2) — the
+                // pycompiler records features[0] as the node's runtime name, exactly like created
+                // feature names elsewhere; mates reference components through it.
+                features.Add(comp.Name2);
+                features.Add($"fixed={comp.IsFixed()}");
+                var tj = TransformJson(comp);
+                if (tj != null) features.Add("transform=" + tj.ToString(Newtonsoft.Json.Formatting.None));
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "ASSEMBLY",
+                        ActiveSketch = null,
+                        Features = features,
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
+        // The most recent mate feature's name (the MateGroup's LAST subfeature) — AddMate5
+        // returns a Mate2 with no name accessor, so the readback goes through the tree.
+        private string LastMateName(IModelDoc2 modelDoc)
+        {
+            string last = null;
+            var feat = modelDoc.FirstFeature() as IFeature;
+            int guard = 0;
+            while (feat != null && guard++ < 5000)
+            {
+                if ((feat.GetTypeName2() ?? "") == "MateGroup")
+                {
+                    var sub = feat.GetFirstSubFeature() as IFeature;
+                    int subGuard = 0;
+                    while (sub != null && subGuard++ < 2000)
+                    {
+                        if (sub.GetSpecificFeature2() is IMate2) last = sub.Name;
+                        sub = sub.GetNextSubFeature() as IFeature;
+                    }
+                }
+                feat = feat.GetNextFeature() as IFeature;
+            }
+            return last;
+        }
+
+        // add_mate — AddMate5 (B3). Entity selection is INDEX-FIRST: each side is
+        // (component Name2, kind face|edge, index from analyze_assembly(faces|edges, component)).
+        // value: METERS for distance, DEGREES for angle (C4 — degrees at tool boundaries).
+        // After the mate: rebuild + report BOTH sides' component transforms (the per-mate stop
+        // check — compare against the original's readback before the next mate).
+        public ExecutionResponse AddMateTool(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                string mateType = p?.Value<string>("mate_type");
+                int mateTypeInt = MateTypeFromName(mateType);
+                if (mateTypeInt < 0)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "UNSUPPORTED_MATE_TYPE",
+                        $"mate_type '{mateType}' is not supported. Supported: coincident, concentric, perpendicular, parallel, tangent, distance, angle, lock.");
+                int alignInt = MateAlignFromName(p?.Value<string>("alignment"));
+                bool flip = p?.Value<bool?>("flip") ?? false;
+                double value = p?.Value<double?>("value") ?? 0.0;
+
+                string aComp = p?.Value<string>("a_component");
+                string aKind = (p?.Value<string>("a_kind") ?? "face").ToLowerInvariant();
+                int aIndex = p?.Value<int?>("a_index") ?? -1;
+                string bComp = p?.Value<string>("b_component");
+                string bKind = (p?.Value<string>("b_kind") ?? "face").ToLowerInvariant();
+                int bIndex = p?.Value<int?>("b_index") ?? -1;
+                if (string.IsNullOrEmpty(aComp) || string.IsNullOrEmpty(bComp) || aIndex < 0 || bIndex < 0)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "MISSING_PARAMETER",
+                        "a_component/a_index and b_component/b_index are required (indices from analyze_assembly(faces|edges, component=...)).");
+
+                var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                var asm = modelDoc as IAssemblyDoc;
+                if (asm == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "WRONG_DOCUMENT_TYPE", "add_mate requires an ASSEMBLY document to be active.");
+
+                string errCode, errMsg;
+                object entA = GetComponentEntity(asm, aComp, aKind, aIndex, out errCode, out errMsg);
+                if (entA == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), errCode, "side A: " + errMsg);
+                object entB = GetComponentEntity(asm, bComp, bKind, bIndex, out errCode, out errMsg);
+                if (entB == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), errCode, "side B: " + errMsg);
+
+                modelDoc.ClearSelection2(true);
+                var selMgr = modelDoc.SelectionManager as ISelectionMgr;
+                var sd = selMgr?.CreateSelectData();
+                if (sd != null) sd.Mark = 1; // mate entities carry mark 1
+                bool selA = ((IEntity)entA).Select4(true, sd);
+                bool selB = ((IEntity)entB).Select4(true, sd);
+                if (!selA || !selB)
+                {
+                    modelDoc.ClearSelection2(true);
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "SELECTION_FAILED", $"Entity selection failed (A={selA}, B={selB}).");
+                }
+
+                double dist = 0, distU = 0, distL = 0, ang = 0, angU = 0, angL = 0;
+                if (mateTypeInt == 5) { dist = value; distU = value; distL = value; }
+                if (mateTypeInt == 6) { ang = value * Math.PI / 180.0; angU = ang; angL = ang; }
+
+                int errStat = 0;
+                var mate = asm.AddMate5(mateTypeInt, alignInt, flip,
+                    dist, distU, distL, 0, 0, ang, angU, angL,
+                    false /* ForPositioningOnly */, false /* LockRotation */, 0 /* WidthMateOption */,
+                    out errStat);
+                modelDoc.ClearSelection2(true);
+                if (mate == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "ADD_MATE_FAILED",
+                        $"AddMate5 returned null (ErrorStatus={errStat}, swAddMateError_e). Check the entity kinds fit the mate type (e.g. concentric wants cylindrical faces) and the alignment.");
+
+                modelDoc.EditRebuild3();
+
+                var features = new List<string>();
+                string mateName = LastMateName(modelDoc);
+                if (mateName != null) features.Add($"mate={mateName}");
+                features.Add($"type={MateTypeName(mateTypeInt)}");
+                features.Add($"error_status={errStat}");
+                var compA = FindComponentByName(asm, aComp);
+                var compB = FindComponentByName(asm, bComp);
+                var ta = compA != null ? TransformJson(compA) : null;
+                var tb = compB != null ? TransformJson(compB) : null;
+                if (ta != null) features.Add("a_transform=" + ta.ToString(Newtonsoft.Json.Formatting.None));
+                if (tb != null) features.Add("b_transform=" + tb.ToString(Newtonsoft.Json.Formatting.None));
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "ASSEMBLY",
+                        ActiveSketch = null,
+                        Features = features,
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
+        // save_body_as_part — extract ONE body of a multibody part into its own SLDPRT
+        // (CreateFeatureFromBody3 on a fresh part; geometry stays in the SOURCE coordinates).
+        // The missing-parts half of flattened-assembly reconstruction (ADR-048): a structured
+        // assembly STEP with no per-part files flattens to a multibody import; each distinct
+        // body becomes a referenced part file, instances get transforms via fingerprint match.
+        public ExecutionResponse SaveBodyAsPart(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                int bodyIndex = p?.Value<int?>("body_index") ?? -1;
+                string filePath = p?.Value<string>("file_path");
+                if (bodyIndex < 0 || string.IsNullOrEmpty(filePath))
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "MISSING_PARAMETER", "body_index (>= 0) and file_path (.sldprt) are required.");
+
+                var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                var partDoc = modelDoc as IPartDoc;
+                if (partDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "WRONG_DOCUMENT_TYPE", "save_body_as_part requires a (multibody) PART document to be active.");
+                string srcTitle = modelDoc.GetTitle();
+
+                object[] bodies = partDoc.GetBodies2((int)swBodyType_e.swSolidBody, true) as object[];
+                if (bodies == null || bodyIndex >= bodies.Length)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "BODY_NOT_FOUND", $"body_index {bodyIndex} out of range (document has {bodies?.Length ?? 0} solid bodies).");
+                var body = bodies[bodyIndex] as IBody2;
+                object copy = body.Copy2(false);
+                if (copy == null) copy = body.Copy();
+                if (copy == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "BODY_COPY_FAILED", "IBody2.Copy2/Copy returned null.");
+
+                string templatePath = _solidWorks.GetUserPreferenceStringValue(
+                    (int)swUserPreferenceStringValue_e.swDefaultTemplatePart);
+                var newDoc = _solidWorks.NewDocument(templatePath, 0, 0, 0) as IModelDoc2;
+                var newPart = newDoc as IPartDoc;
+                if (newPart == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "DOCUMENT_CREATION_FAILED", "Could not create the target part document.");
+                string newTitle = newDoc.GetTitle();
+
+                var feat = newPart.CreateFeatureFromBody3(copy, false, 0) as IFeature;
+                if (feat == null)
+                {
+                    try { _solidWorks.CloseDoc(newTitle); } catch { }
+                    int actErr0 = 0;
+                    _solidWorks.ActivateDoc3(srcTitle, false, 1, ref actErr0);
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "BODY_FEATURE_FAILED", "CreateFeatureFromBody3 returned null for the copied body.");
+                }
+                newDoc.EditRebuild3();
+
+                string dir = System.IO.Path.GetDirectoryName(filePath);
+                if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
+                    System.IO.Directory.CreateDirectory(dir);
+                int se = 0, sw = 0;
+                bool ok = newDoc.Extension.SaveAs3(filePath,
+                    (int)swSaveAsVersion_e.swSaveAsCurrentVersion,
+                    (int)swSaveAsOptions_e.swSaveAsOptions_Silent,
+                    null, null, ref se, ref sw);
+                try { _solidWorks.CloseDoc(newDoc.GetTitle()); } catch { }
+                int actErr = 0;
+                _solidWorks.ActivateDoc3(srcTitle, false, 1 /* swDontRebuildActiveDoc */, ref actErr);
+                if (!ok)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "SAVE_FAILED", $"SaveAs3('{filePath}') failed (errors={se}, warnings={sw}).");
+
+                var features = new List<string>();
+                features.Add(System.IO.Path.GetFileName(filePath));
+                try { if (!string.IsNullOrEmpty(body.Name)) features.Add("body_name=" + body.Name); } catch { }
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = srcTitle,
+                        DocumentType = "PART",
+                        ActiveSketch = null,
+                        Features = features,
+                        Dimensions = new List<string>()
+                    },
+                    Error = null
+                };
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
         }
 
         private ExecutionResponse BuildFailed(string operationId, int stateVersion, string code, string message)
