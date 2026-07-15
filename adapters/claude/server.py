@@ -840,6 +840,9 @@ def analyze_model(
     name: str = "",
     from_feature: str = "",
     to_feature: str = "",
+    near: str = "",
+    k: int = 0,
+    axis: str = "",
 ) -> str:
     """Analyze the active SolidWorks part document (read-only, does NOT change state).
     analysis_type='mass_properties': returns volume, surface_area, center of gravity (cx, cy, cz) in document units.
@@ -851,11 +854,14 @@ def analyze_model(
         in meters (rounded to 6 decimals; closed/circular edges also report length) and a stable index `i`. Use
         the index `i` for add_edge_feature(edge_indices=...) — robust for crowded/concave edges — or a MIDPOINT
         for coordinate-based selection (e.g. edge_flange's ex/ey/ez). On a very large part (many hundreds of edges)
-        this is the slowest mode; prefer 'features' for a general understanding.
+        this is the slowest mode; prefer 'features' for a general understanding. TARGETED (recommended when you
+        already know roughly WHERE): pass near='[x,y,z]' (+ optional k, axis) to get only the k nearest edges to
+        a point instead of the full dump — see near/k/axis below.
     analysis_type='faces': returns a JSON object listing EVERY solid face with a stable index `i`; planar faces
         also carry normal, area, and a representative on-plane point (meters, rounded to 6 decimals). Use the
         index `i` for create_sketch(on_face=True, face_index=i) — robust where a coordinate pick is ambiguous
-        (e.g. a revolve end-cap / shaft end whose centre lies on the axis).
+        (e.g. a revolve end-cap / shaft end whose centre lies on the axis). TARGETED: pass near='[x,y,z]'
+        (+ optional k, axis) for only the k nearest faces to a point — see near/k/axis below.
     analysis_type='features': the part's COMPACT RECIPE — this is the default "understand the part" read. Returns
         the ordered feature tree (name/type; suppressed shown only when true), each feature's driving dimensions
         (deduped, SI meters/radians, rounded to 6 decimals), a per-sketch SUMMARY (segment counts + an inline
@@ -884,9 +890,19 @@ def analyze_model(
         Sketches/planes are listed without a delta; suppressed features are skipped. Optional from_feature/to_feature
         (tree names) limit the walk to a range. NON-DESTRUCTIVE: the rollback bar is restored to the end, nothing is
         saved — but it does rebuild the model feature-by-feature, so it is the slowest mode on big trees.
+
+    near / k / axis (edges and faces modes ONLY — a TARGETED read instead of the full dump): when you already
+        know approximately where the geometry is (the common build-time case — you almost always do), pass
+        near='[x,y,z]' (a JSON string, meters) to return only the nearest entities to that point, each annotated
+        with `dist` (meters) and still carrying its STABLE full-enumeration index `i` (so selection is unchanged).
+        k (default 0 = no cap): keep only the k nearest. axis='[x,y,z]' (optional JSON string): keep only entities
+        whose direction is ~parallel to axis — for faces that's the planar-face NORMAL (e.g. axis='[0,0,1]' → only
+        faces on +Z planes), for edges the chord direction. The response adds total_edge_count/total_face_count so
+        you know how many were filtered out. Omitting near preserves the exact historical full-dump behavior.
     Does NOT increment state_version."""
     return _call("analyze_model", {"analysis_type": analysis_type, "name": name,
-                                   "from_feature": from_feature, "to_feature": to_feature})
+                                   "from_feature": from_feature, "to_feature": to_feature,
+                                   "near": near, "k": k, "axis": axis})
 
 
 # ---------------------------------------------------------------------------
@@ -896,10 +912,26 @@ def analyze_model(
 def analyze_drawing(include_geometry: bool = False) -> str:
     """Analyze the ACTIVE drawing document (read-only, does NOT change state) — the drawing-side sibling
     of analyze_model. Returns a JSON object {view_count, dimension_count, views:[{name, type, scale, pos,
-    dimensions:[{name, value_si}]}]}: each view's name, type (swDrawingViewTypes_e int), scale, sheet
-    position [x,y] in meters, and its display dimensions (full-name + SI value, meters/radians, rounded to
-    6 decimals). The FIRST view is the drawing SHEET (interpret accordingly). Use it to (a) check a drawing
-    you produced — do its dimensions match the model? — and (b) read a drawing back for re-modeling.
+    dimensions:[...], section?}]}: each view's name, type (swDrawingViewTypes_e int), scale, sheet
+    position [x,y] in meters, and its display dimensions. The FIRST view is the drawing SHEET (interpret
+    accordingly). Use it to (a) check a drawing you produced — do its dimensions match the model? — and
+    (b) read a drawing back for re-modeling.
+
+    ⮕ RECONSTRUCTING A PART FROM THIS DRAWING? Call get_recipe('verification') (and get_recipe('drawing'))
+      FIRST — the reverse-reading discipline (dimension ownership, section→3D mapping, through-vs-blind,
+      profile-from-first-vector, PDF-crop as last resort) lives there and only helps if read.
+
+    Each dimension is {name, value_si (meters/radians, 6 decimals), dim_type, diametric?, attached?, anchors?}:
+      dim_type  — what the value MEASURES (linear/diameter/radial/angular/...), so "is this 17 a diameter?"
+                  is DATA, not a guess; diametric=true also flags a Ø dimension.
+      attached  — the KIND(s) of geometry the dim hangs off (edge/vertex/sketch_seg/...).
+      anchors   — the dimension's reference points in SHEET space [x,y,z] meters — the concrete geometry it
+                  snaps to (maps "what is this 17 the dimension of?" to a location arithmetically).
+    A view's section block (present only on SECTION views) is {parent_view, cut_normal, axis?, frame, label?}:
+      cut_normal — the cutting-plane NORMAL in MODEL space (= the section's viewing direction);
+      axis       — that normal snapped to 'X'/'Y'/'Z' when axis-aligned (the direct answer to "A-A ⟂ which axis?");
+      frame      — {origin, xdir, ydir} in model space, so a 2D section-view coord maps to 3D:
+                   p_model = origin + u*xdir + v*ydir; parent_view names the view the cut was taken in.
 
     include_geometry (default False): also return each view's PROJECTED 2D GEOMETRY as clean primitives —
         geometry:{lines:[{x1,y1,x2,y2}], curves:[{n,x1,y1,xm,ym,x2,y2}], frame}. This is the CLEAN SHAPE
@@ -1630,7 +1662,7 @@ def rebuild_from_ir(artifact_path: str, fresh_document: bool = True) -> str:
 # Tool: compare_parts  (adapter-only — the objective round-trip verifier, ADR-040/A0)
 # ---------------------------------------------------------------------------
 @mcp.tool()
-def compare_parts(doc_a: str, doc_b: str) -> str:
+def compare_parts(doc_a: str, doc_b: str, detail: str = "") -> str:
     """Objectively diff two part documents — the round-trip verifier behind the artifact's
     `verified` label (and a general-purpose "are these the same part?" check).
 
@@ -1643,8 +1675,15 @@ def compare_parts(doc_a: str, doc_b: str) -> str:
     the DECIDED verified-criteria verdict (analysis-artifact.schema.json): topology EXACT AND
     |ΔV| <= 1% AND |ΔA| <= 1%. The verdict is a REPORT — writing ir.verification into the
     artifact stays the caller's job. Read-only geometry-wise (activation may switch the active
-    document; doc_b is left active). bbox comparison: pending (analyze doesn't expose it yet)."""
-    def _read(doc: str, label: str):
+    document; doc_b is left active). bbox comparison: pending (analyze doesn't expose it yet).
+
+    detail='faces' (optional): ALSO run analyze_model(faces) on both and list the surfaces that
+        are EXTRA (in doc_b only) or MISSING (in doc_a only), matched by supporting plane (normal
+        + offset) for planar faces and by (axis, radius) for cylinders. This is the ONE diagnosis a
+        point-query can't do — it turns "which face did my rebuild add/drop?" into one call instead
+        of manually pairing two full face lists. Faces are reported with their key attributes + the
+        stable index `i` in their own document."""
+    def _read(doc: str, label: str, want_faces: bool):
         if os.path.isfile(doc):
             r = _call_raw("open_document", {"file_path": os.path.abspath(doc)})
             if r.get("status") != "COMPLETED":
@@ -1656,11 +1695,16 @@ def compare_parts(doc_a: str, doc_b: str) -> str:
             raise RuntimeError(f"DOC_{label}_UNAVAILABLE | {doc} | {err.get('code')}: {err.get('message')}")
         geo = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "geometry", "name": ""})))
         mass = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "mass_properties", "name": ""})))
-        return geo, mass
+        faces = None
+        if want_faces:
+            items = _analysis_items(_call_raw("analyze_model", {"analysis_type": "faces", "name": ""}))
+            faces = json.loads(items[0]).get("faces", []) if items else []
+        return geo, mass, faces
 
+    want_faces = detail == "faces"
     try:
-        geo_a, mass_a = _read(doc_a, "A")
-        geo_b, mass_b = _read(doc_b, "B")
+        geo_a, mass_a, faces_a = _read(doc_a, "A", want_faces)
+        geo_b, mass_b, faces_b = _read(doc_b, "B", want_faces)
     except RuntimeError as ex:
         return f"FAILED | {ex}"
 
@@ -1685,12 +1729,111 @@ def compare_parts(doc_a: str, doc_b: str) -> str:
                 and abs(dv) <= 1.0 and abs(da) <= 1.0)
 
     fmt = lambda v, spec=".6g": ("?" if v is None else format(v, spec))  # noqa: E731
-    return (f"COMPLETED | verified_criteria={'PASS' if verified else 'FAIL'} | "
+    line = (f"COMPLETED | verified_criteria={'PASS' if verified else 'FAIL'} | "
             f"topology A={'-'.join(str(t) for t in topo_a)} B={'-'.join(str(t) for t in topo_b)} "
             f"{'EXACT' if topology_exact else 'DIFFER'} | "
             f"volume A={fmt(mass_a.get('volume'))} B={fmt(mass_b.get('volume'))} dV={fmt(dv, '.4f')}% | "
             f"area A={fmt(mass_a.get('surface_area'))} B={fmt(mass_b.get('surface_area'))} dA={fmt(da, '.4f')}% | "
             f"cg_distance={fmt(cg_dist)} m | reference=A ({doc_a})")
+
+    if want_faces:
+        missing, extra = _diff_faces(faces_a, faces_b)
+        line += (f"\nfaces: matched={len(faces_a) - len(missing)} "
+                 f"MISSING(in A only)={len(missing)} EXTRA(in B only)={len(extra)}")
+
+        def _list(faces, cap=20):
+            shown = "; ".join(_face_desc(f) for f in faces[:cap])
+            if len(faces) > cap:
+                shown += f"; …(+{len(faces) - cap} more)"
+            return shown
+        if missing:
+            line += "\n  MISSING: " + _list(missing)
+        if extra:
+            line += "\n  EXTRA:   " + _list(extra)
+    return line
+
+
+_FACE_POS_TOL = 5e-5   # 50µm — supporting plane offset / point match
+_FACE_RAD_TOL = 5e-5   # 50µm — cylinder radius match
+
+
+def _faces_compatible(fa: dict, fb: dict) -> bool:
+    """True if two faces (from analyze_model(faces) JSON) are the SAME SURFACE within tolerance —
+    matched by supporting geometry, not by trim/area. Planar → same unit normal (sign-canonicalized)
+    AND same signed offset from origin (±50µm). Cylinder → parallel axis AND same radius (±50µm).
+    Other → same kind AND representative point within 50µm. This is deliberately looser than the
+    <=1% verified gate: a face-DIFF looks for surfaces one part has and the other doesn't, so
+    sub-µm/µm parameter drift on a shared surface must PAIR, leaving only true add/drops unmatched."""
+    ka, kb = _face_cat(fa), _face_cat(fb)
+    if ka != kb:
+        return False
+    if ka == "plane":
+        na, oa = _plane_no(fa)
+        nb, ob = _plane_no(fb)
+        dot = na[0] * nb[0] + na[1] * nb[1] + na[2] * nb[2]
+        return dot > 0.999 and abs(oa - ob) <= _FACE_POS_TOL
+    if ka == "cyl":
+        aa = [abs(float(x)) for x in fa["axis"]]
+        ab = [abs(float(x)) for x in fb["axis"]]
+        parallel = sum(x * y for x, y in zip(aa, ab)) > 0.999
+        return parallel and abs(float(fa.get("radius", 0)) - float(fb.get("radius", 0))) <= _FACE_RAD_TOL
+    pa, pb = fa.get("point"), fb.get("point")
+    if isinstance(pa, list) and isinstance(pb, list):
+        return all(abs(float(x) - float(y)) <= _FACE_POS_TOL for x, y in zip(pa, pb))
+    return False
+
+
+def _face_cat(f: dict) -> str:
+    if f.get("planar") and isinstance(f.get("normal"), list) and isinstance(f.get("point"), list):
+        return "plane"
+    if f.get("kind") == "cylinder" and isinstance(f.get("axis"), list):
+        return "cyl"
+    return f.get("kind", "surf")
+
+
+def _plane_no(f: dict):
+    """Unit normal (sign-canonicalized so the dominant axis is positive) + signed offset from origin."""
+    n = [float(x) for x in f["normal"]]
+    p = [float(x) for x in f["point"]]
+    offset = n[0] * p[0] + n[1] * p[1] + n[2] * p[2]
+    dom = max(range(3), key=lambda i: abs(n[i]))
+    if n[dom] < 0:
+        n = [-x for x in n]
+        offset = -offset
+    return n, offset
+
+
+def _diff_faces(faces_a: list, faces_b: list):
+    """Greedy tolerance set-difference of two face lists. Returns (missing, extra): missing = faces
+    in A that pair with no face in B; extra = faces in B that pair with none in A. Same-surface faces
+    pair through sub-µm/µm parameter drift (_faces_compatible), so only genuine add/drops remain."""
+    used_b = [False] * len(faces_b)
+    missing = []
+    for fa in faces_a:
+        hit = -1
+        for j, fb in enumerate(faces_b):
+            if not used_b[j] and _faces_compatible(fa, fb):
+                hit = j
+                break
+        if hit >= 0:
+            used_b[hit] = True
+        else:
+            missing.append(fa)
+    extra = [fb for j, fb in enumerate(faces_b) if not used_b[j]]
+    return missing, extra
+
+
+def _face_desc(f: dict) -> str:
+    """Compact human description of a face for the diff report."""
+    i = f.get("i")
+    if f.get("planar"):
+        n = f.get("normal")
+        area = f.get("area")
+        nstr = ("[" + ",".join(format(float(x), ".3g") for x in n) + "]") if isinstance(n, list) else "?"
+        return f"i={i} plane n={nstr} area={format(float(area), '.4g') if isinstance(area, (int, float)) else '?'}"
+    if f.get("kind") == "cylinder":
+        return f"i={i} cyl r={format(float(f.get('radius', 0)), '.4g')}"
+    return f"i={i} {f.get('kind', 'surf')}"
 
 
 # ---------------------------------------------------------------------------

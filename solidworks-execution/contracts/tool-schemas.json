@@ -341,10 +341,13 @@
    "operation_id": "string (required, unique idempotency key)",
    "state_version": "integer (required, must match current execution state)",
    "params": {
-    "analysis_type": "string (required: 'mass_properties', 'geometry', 'edges', 'faces', 'features', 'sketch', or 'feature_map')",
+    "analysis_type": "string (required: 'mass_properties', 'geometry', 'bodies', 'edges', 'faces', 'features', 'sketch', or 'feature_map')",
     "name": "string (required only for analysis_type='sketch' — the sketch feature name, e.g. 'Sketch2')",
     "from_feature": "string (optional, feature_map only — start the walk at this tree feature name; default = tree base)",
-    "to_feature": "string (optional, feature_map only — end the walk at this tree feature name; default = tree end)"
+    "to_feature": "string (optional, feature_map only — end the walk at this tree feature name; default = tree end)",
+    "near": "string (optional, edges/faces only — JSON '[x,y,z]' in meters; return only entities nearest this point instead of the full dump, each annotated with dist and its stable index i; blank = full dump, backward compatible)",
+    "k": "integer (optional, edges/faces only — keep only the k nearest to 'near'; 0 = no cap)",
+    "axis": "string (optional, edges/faces only — JSON '[x,y,z]'; keep only entities whose direction is ~parallel to axis: faces filter by planar NORMAL, edges by chord direction)"
    }
   },
   "output": "→ see execution-response.json — results encoded in CadState.Features list. mass_properties/geometry: flat 'key=value' strings. edges: a single JSON string {edge_count, edges:[{i,start,end,mid}]} (closed/circular edges also carry length). faces: a single JSON string {face_count, faces:[{i, planar, area, normal?, point?}]} (normal/point only for planar faces). features: a single consolidated JSON string {feature_count, features[], equations[]} — sketches carry a summary (counts [+circle]); NO raw segments. sketch: a single JSON string {name, sketch:{counts, segments[]}, plane} for the one named sketch. feature_map: a single JSON string {feature_count, map:[{feature, type, suppressed?, delta:{faces,edges,vertices}, consumed_edges:[{mid,len}], created_faces:[{point, normal?, planar, area}]}]} — coords in meters rounded to 6 decimals; delta/consumed/created present only for unsuppressed solid-affecting features (sketches/ref geometry are listed name+type only)."
@@ -542,10 +545,11 @@
    "state_version": "n/a at this level — the underlying calls thread the adapter's tracked state_version (one-shot resync-retry on INVALID_STATE_VERSION)",
    "params": {
     "doc_a": "string (required — REFERENCE document: absolute .SLDPRT path or open-doc title; deltas are relative to it — normally the ORIGINAL)",
-    "doc_b": "string (required — comparison document: absolute .SLDPRT path or open-doc title — normally the REBUILD)"
+    "doc_b": "string (required — comparison document: absolute .SLDPRT path or open-doc title — normally the REBUILD)",
+    "detail": "string (optional — 'faces' also lists EXTRA (in doc_b only) / MISSING (in doc_a only) surfaces, matched by supporting plane or cylinder axis+radius; blank = summary only)"
    }
   },
-  "output": "One-line report: verified_criteria PASS/FAIL | topology A/B (EXACT|DIFFER) | volume A/B + dV% | area A/B + dA% | cg_distance."
+  "output": "One-line report: verified_criteria PASS/FAIL | topology A/B (EXACT|DIFFER) | volume A/B + dV% | area A/B + dA% | cg_distance. With detail='faces', a trailing faces: matched/MISSING/EXTRA breakdown."
  },
  "open_new_assembly": {
   "description": "Opens a new blank ASSEMBLY document (the twin of open_new_part). Template: explicit template_path, else the user-configured default assembly template, else the first *.asmdot found. Bumps state_version.",

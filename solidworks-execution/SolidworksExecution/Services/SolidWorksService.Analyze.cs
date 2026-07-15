@@ -157,12 +157,18 @@ namespace SolidworksExecution.Services
                     // Edge list with start/end/MIDPOINT 3D coords — so a caller can pick an edge to
                     // select (e.g. edge_flange's ex/ey/ez = an edge midpoint) WITHOUT blind-guessing
                     // coordinates or reverse-deriving the extrude direction from mass_properties.
+                    // Batch-1 Task-3: OPTIONAL near/k/axis narrow this to the k nearest edges to a point
+                    // (with an optional direction filter) — a filtered READ, not the full dump. A
+                    // parameterless call is byte-for-byte the historical full dump (backward compatible).
                     var partDoc = modelDoc as IPartDoc;
                     if (partDoc == null)
                         return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                             "WRONG_DOCUMENT_TYPE",
                             "analysis_type='edges' requires a part document.");
-                    JObject edgeAnalysis = ReadEdges(partDoc);
+                    double[] near = ParseVec3(p?.Value<string>("near"));
+                    double[] axis = ParseVec3(p?.Value<string>("axis"));
+                    int k = p?.Value<int?>("k") ?? 0;
+                    JObject edgeAnalysis = ReadEdges(partDoc, near, k, axis);
                     results.Add(edgeAnalysis.ToString(Newtonsoft.Json.Formatting.None));
                 }
                 else if (analysisType == "faces")
@@ -171,12 +177,17 @@ namespace SolidworksExecution.Services
                     // (ADR-027). Lets a caller pick a face to sketch on (create_sketch on_face + face_index)
                     // WITHOUT a coordinate pick, which is fragile on a revolve end-cap (the face centroid can
                     // sit on the revolve axis/origin → ambiguous SelectByID2). Baby reference-resolver → P1.3.
+                    // Batch-1 Task-3: OPTIONAL near/k/axis narrow this to the k nearest faces to a point (with
+                    // an optional normal filter). Parameterless call = the historical full dump (compatible).
                     var partDoc = modelDoc as IPartDoc;
                     if (partDoc == null)
                         return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                             "WRONG_DOCUMENT_TYPE",
                             "analysis_type='faces' requires a part document.");
-                    JObject faceAnalysis = ReadFaces(partDoc);
+                    double[] near = ParseVec3(p?.Value<string>("near"));
+                    double[] axis = ParseVec3(p?.Value<string>("axis"));
+                    int k = p?.Value<int?>("k") ?? 0;
+                    JObject faceAnalysis = ReadFaces(partDoc, near, k, axis);
                     results.Add(faceAnalysis.ToString(Newtonsoft.Json.Formatting.None));
                 }
                 else if (analysisType == "features")
@@ -1367,7 +1378,7 @@ namespace SolidworksExecution.Services
             return fj;
         }
 
-        private JObject ReadEdges(IPartDoc partDoc)
+        private JObject ReadEdges(IPartDoc partDoc, double[] near = null, int k = 0, double[] axis = null)
         {
             var root = new JObject();
             var edgesArr = new JArray();
@@ -1389,13 +1400,31 @@ namespace SolidworksExecution.Services
                     {
                         var edge = e as IEdge;
                         if (edge == null) continue;
+                        // BuildEdgeJson assigns the STABLE full-enumeration index `i` — kept even after a
+                        // near/k filter, so a filtered result still selects by the same index.
                         edgesArr.Add(BuildEdgeJson(edge, idx++));
                     }
                 }
             }
             swTotal.Stop();
-            ExecLog.Write($"ReadEdges: edges={edgesArr.Count} total={swTotal.ElapsedMilliseconds}ms");
-            root["edge_count"] = edgesArr.Count;
+            ExecLog.Write($"ReadEdges: edges={edgesArr.Count} total={swTotal.ElapsedMilliseconds}ms near={(near != null)} k={k}");
+            int totalCount = edgesArr.Count;
+
+            if (near != null)
+            {
+                // The edge's representative point is its `mid`; the direction filter (axis) compares the
+                // edge's CHORD direction (start→end) — for a curved edge that's the chord, documented.
+                var filtered = NarrowByNear(edgesArr, near, k, axis, "mid",
+                    (ej) => EdgeChordDir(ej));
+                root["edge_count"] = filtered.Count;
+                root["total_edge_count"] = totalCount;
+                root["near"] = new JArray { R6(near[0]), R6(near[1]), R6(near[2]) };
+                if (k > 0) root["k"] = k;
+                if (axis != null) root["axis"] = new JArray { R6(axis[0]), R6(axis[1]), R6(axis[2]) };
+                root["edges"] = filtered;
+                return root;
+            }
+            root["edge_count"] = totalCount;
             root["edges"] = edgesArr;
             return root;
         }
@@ -1405,7 +1434,7 @@ namespace SolidworksExecution.Services
         // so a caller picks a face to sketch on by index instead of a fragile coordinate pick. Per planar
         // face we report normal + area + a representative on-plane point; non-planar faces still get an
         // index (so the numbering stays aligned) but no normal.
-        private JObject ReadFaces(IPartDoc partDoc)
+        private JObject ReadFaces(IPartDoc partDoc, double[] near = null, int k = 0, double[] axis = null)
         {
             var root = new JObject();
             var facesArr = new JArray();
@@ -1427,10 +1456,102 @@ namespace SolidworksExecution.Services
                     }
                 }
             }
-            ExecLog.Write($"ReadFaces: faces={facesArr.Count}");
-            root["face_count"] = facesArr.Count;
+            ExecLog.Write($"ReadFaces: faces={facesArr.Count} near={(near != null)} k={k}");
+            int totalCount = facesArr.Count;
+
+            if (near != null)
+            {
+                // The face's representative point is `point`; the axis filter compares the (planar-face)
+                // NORMAL — a non-planar face has no single normal, so it's dropped when an axis is given.
+                var filtered = NarrowByNear(facesArr, near, k, axis, "point",
+                    (fj) => (fj["normal"] as JArray) != null
+                        ? new[] { fj["normal"][0].Value<double>(), fj["normal"][1].Value<double>(), fj["normal"][2].Value<double>() }
+                        : null);
+                root["face_count"] = filtered.Count;
+                root["total_face_count"] = totalCount;
+                root["near"] = new JArray { R6(near[0]), R6(near[1]), R6(near[2]) };
+                if (k > 0) root["k"] = k;
+                if (axis != null) root["axis"] = new JArray { R6(axis[0]), R6(axis[1]), R6(axis[2]) };
+                root["faces"] = filtered;
+                return root;
+            }
+            root["face_count"] = totalCount;
             root["faces"] = facesArr;
             return root;
+        }
+
+        // ------------------------------------------------------------------
+        // Batch-1 Task-3 — targeted near/k narrowing (shared by edges + faces).
+        // ------------------------------------------------------------------
+
+        // Parse a "[x,y,z]" JSON-string param (the ADR-022 array-param idiom) into a double[3]; null/blank →
+        // null (= "not requested"), which the readers treat as the full-dump path.
+        private static double[] ParseVec3(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            try
+            {
+                var tok = JToken.Parse(s) as JArray;
+                if (tok == null || tok.Count < 3) return null;
+                return new[] { tok[0].Value<double>(), tok[1].Value<double>(), tok[2].Value<double>() };
+            }
+            catch { return null; }
+        }
+
+        // Chord direction (unit) of an edge JSON built by BuildEdgeJson (start→end); null if degenerate.
+        private static double[] EdgeChordDir(JObject ej)
+        {
+            var s = ej["start"] as JArray; var e = ej["end"] as JArray;
+            if (s == null || e == null) return null;
+            double dx = e[0].Value<double>() - s[0].Value<double>();
+            double dy = e[1].Value<double>() - s[1].Value<double>();
+            double dz = e[2].Value<double>() - s[2].Value<double>();
+            double L = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+            if (L < 1e-9) return null;
+            return new[] { dx / L, dy / L, dz / L };
+        }
+
+        // Keep the k entries of `items` nearest (Euclidean) to `near` — measured from each item's
+        // representative point (`ptKey` = "mid" for edges, "point" for faces). Optional `axis`: keep only
+        // items whose direction (dirOf) is ~parallel to axis (|dot| ≥ 0.999), so e.g. "the nearest face on
+        // a +Z-normal plane" is one call. k ≤ 0 ⇒ no count cap (all that pass the axis filter, sorted by
+        // distance). Items with no representative point are dropped (can't be ranked). The returned JObjects
+        // are the SAME objects (stable `i` preserved), each annotated with `dist` (meters, R6).
+        private static JArray NarrowByNear(JArray items, double[] near, int k, double[] axis,
+            string ptKey, Func<JObject, double[]> dirOf)
+        {
+            double[] axisN = null;
+            if (axis != null)
+            {
+                double al = Math.Sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+                if (al > 1e-9) axisN = new[] { axis[0] / al, axis[1] / al, axis[2] / al };
+            }
+            var scored = new List<KeyValuePair<double, JObject>>();
+            foreach (var it in items)
+            {
+                var jo = it as JObject;
+                if (jo == null) continue;
+                var pt = jo[ptKey] as JArray;
+                if (pt == null || pt.Count < 3) continue;
+                if (axisN != null)
+                {
+                    var dir = dirOf(jo);
+                    if (dir == null) continue;
+                    double dot = Math.Abs(dir[0] * axisN[0] + dir[1] * axisN[1] + dir[2] * axisN[2]);
+                    if (dot < 0.999) continue;
+                }
+                double dx = pt[0].Value<double>() - near[0];
+                double dy = pt[1].Value<double>() - near[1];
+                double dz = pt[2].Value<double>() - near[2];
+                double dist = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+                jo["dist"] = R6(dist);
+                scored.Add(new KeyValuePair<double, JObject>(dist, jo));
+            }
+            scored.Sort((a, b) => a.Key.CompareTo(b.Key));
+            var outArr = new JArray();
+            int limit = k > 0 ? Math.Min(k, scored.Count) : scored.Count;
+            for (int i = 0; i < limit; i++) outArr.Add(scored[i].Value);
+            return outArr;
         }
 
         // ------------------------------------------------------------------

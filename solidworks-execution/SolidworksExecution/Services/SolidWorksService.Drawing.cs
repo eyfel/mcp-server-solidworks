@@ -548,6 +548,10 @@ namespace SolidworksExecution.Services
                         var dimsArr = ReadViewDimensions(view);
                         totalDims += dimsArr.Count;
                         vj["dimensions"] = dimsArr;
+                        // Batch-1 Task-2: section views also carry cutting-plane metadata (parent view +
+                        // model-space normal/frame) so section-coordinate → 3D mapping is arithmetic.
+                        var sect = ReadSectionMetadata(view);
+                        if (sect != null) vj["section"] = sect;
                         if (includeGeometry)
                             vj["geometry"] = ReadViewGeometry(view);
                         viewsArr.Add(vj);
@@ -593,6 +597,20 @@ namespace SolidworksExecution.Services
         // Per-view display dimensions, reusing the same IDisplayDimension→IDimension reader shape as the
         // feature-side ReadDisplayDimensions (FullName + SI value). View-level iteration uses
         // GetFirstDisplayDimension5()/GetNext5() (the IView/IDisplayDimension API). Best-effort + guarded.
+        //
+        // Batch-1 Task-1 (DIMENSION→GEOMETRY MAPPING): each dim also reports WHAT it measures, as DATA
+        // (never inference — the "what is this 17mm the dimension of?" question). Added fields:
+        //   diametric  — true when the display shows it as a Ø (IDisplayDimension.Diametric) — kills "is 17 the
+        //                diameter?" (this IS reliable; IDimension.GetType() is NOT — it comes back Unknown(0)
+        //                for most model-inserted drawing dims and mis-labels a chamfer angle, so it is not used).
+        //   attached   — the KIND(s) of geometry the dimension is attached to (swSelectType_e: edge/vertex/
+        //                sketch_seg/...), read from the underlying IAnnotation's attached-entity types.
+        //   anchors    — the dimension's REFERENCE POINTS in MODEL space (meters) for a model dimension — the
+        //                concrete 3D geometry it snaps to (live-proven: the Ø17 bore's anchor is [0,0,0.0651],
+        //                on the axis at the top plane), so a reader maps the value to a 3D location arithmetically.
+        // All reflection-verified against SolidWorks.Interop.sldworks (IAnnotation.GetAttachedEntityTypes,
+        // IDimension.GetReferencePointsCount/IGetReferencePoints→IMathPoint.ArrayData). swconst ints inlined
+        // (ADR-018 — never load swconst as a type at runtime).
         private JArray ReadViewDimensions(IView view)
         {
             var arr = new JArray();
@@ -617,6 +635,38 @@ namespace SolidworksExecution.Services
                         }
                         catch { }
                         dj["value_si"] = R6(val);
+
+                        // --- Ø flag (the reliable dimension-kind signal) ---
+                        try { if (disp.Diametric) dj["diametric"] = true; } catch { }
+
+                        // --- attached-entity KIND(s): what geometry this dim hangs off ---
+                        try
+                        {
+                            var ann = disp.GetAnnotation() as IAnnotation;
+                            if (ann != null)
+                            {
+                                object rawTypes = null;
+                                try { rawTypes = ann.GetAttachedEntityTypes(); } catch { }
+                                var kinds = new JArray();
+                                var seenKinds = new HashSet<string>();
+                                foreach (int et in ToIntArray(rawTypes))
+                                {
+                                    string kn = AttachEntityKindName(et);
+                                    if (seenKinds.Add(kn)) kinds.Add(kn);
+                                }
+                                if (kinds.Count > 0) dj["attached"] = kinds;
+                            }
+                        }
+                        catch { }
+
+                        // --- ANCHOR points (sheet space, meters): the concrete geometry the dim references ---
+                        try
+                        {
+                            var anchors = ReadDimensionAnchors(dim);
+                            if (anchors != null && anchors.Count > 0) dj["anchors"] = anchors;
+                        }
+                        catch { }
+
                         arr.Add(dj);
                     }
                 }
@@ -625,6 +675,180 @@ namespace SolidworksExecution.Services
                 dispObj = next;
             }
             return arr;
+        }
+
+        // The dimension's reference points (the points it snaps to) in MODEL space (meters) for a model
+        // dimension. IDimension exposes GetReferencePointsCount() + IGetReferencePoints(i)→IMathPoint
+        // (ArrayData = [x,y,z]); the aggregate get_ReferencePoints() returns an array of the same MathPoints.
+        // We prefer the indexed accessor and fall back to the aggregate. Rounded to 6 decimals (1µm). Identical
+        // points are de-duped: model-inserted drawing dims frequently report both reference points at the same
+        // spot (the attach location), so a lone point carries the same information without the duplicate noise.
+        private JArray ReadDimensionAnchors(IDimension dim)
+        {
+            var raw = new JArray();
+            int n = 0;
+            try { n = dim.GetReferencePointsCount(); } catch { n = 0; }
+            if (n > 0)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    IMathPoint mp = null;
+                    try { mp = dim.IGetReferencePoints(i) as IMathPoint; } catch { mp = null; }
+                    var pj = MathPointJson(mp);
+                    if (pj != null) raw.Add(pj);
+                }
+            }
+            if (raw.Count == 0)
+            {
+                // Fallback: the aggregate accessor (array of MathPoint COM objects).
+                try
+                {
+                    var agg = dim.ReferencePoints as object[];
+                    if (agg != null)
+                        foreach (var o in agg)
+                        {
+                            var pj = MathPointJson(o as IMathPoint);
+                            if (pj != null) raw.Add(pj);
+                        }
+                }
+                catch { }
+            }
+            // De-dup identical consecutive points.
+            var pts = new JArray();
+            foreach (var t in raw)
+            {
+                bool dup = false;
+                foreach (var u in pts)
+                    if (JToken.DeepEquals(t, u)) { dup = true; break; }
+                if (!dup) pts.Add(t);
+            }
+            return pts;
+        }
+
+        private static JArray MathPointJson(IMathPoint mp)
+        {
+            if (mp == null) return null;
+            try
+            {
+                var d = mp.ArrayData as double[];
+                if (d != null && d.Length >= 3)
+                    return new JArray { R6(d[0]), R6(d[1]), R6(d[2]) };
+            }
+            catch { }
+            return null;
+        }
+
+        // Coerce a COM VARIANT array (int[] or object[] of boxed ints) into an int[]. GetAttachedEntityTypes
+        // and section-line getters come back as one of these shapes depending on marshaling.
+        private static int[] ToIntArray(object raw)
+        {
+            if (raw is int[] ia) return ia;
+            if (raw is object[] oa)
+            {
+                var outp = new int[oa.Length];
+                for (int i = 0; i < oa.Length; i++)
+                {
+                    try { outp[i] = Convert.ToInt32(oa[i]); } catch { outp[i] = 0; }
+                }
+                return outp;
+            }
+            if (raw is double[] da)
+            {
+                var outp = new int[da.Length];
+                for (int i = 0; i < da.Length; i++) outp[i] = (int)Math.Round(da[i]);
+                return outp;
+            }
+            return System.Array.Empty<int>();
+        }
+
+        // swSelectType_e (subset that a drawing dimension attaches to) → label. Inlined ints (ADR-018).
+        private static string AttachEntityKindName(int t)
+        {
+            switch (t)
+            {
+                case 1: return "edge";
+                case 2: return "face";
+                case 3: return "vertex";
+                case 9: return "sketch";
+                case 10: return "sketch_seg";
+                case 11: return "sketch_point";
+                default: return "sel_" + t;
+            }
+        }
+
+        // Batch-1 Task-2 — SECTION VIEW cutting-plane metadata. For a section view (Type==2 =
+        // swDrawingSectionView, or one that owns an IDrSection) report, as DATA:
+        //   parent_view  — the view the section was cut from (IView.GetBaseView, fallback IDrSection.GetView)
+        //   cut_normal   — the cutting-plane NORMAL in MODEL space (= the section view's viewing direction):
+        //                  the section view's view→model transform maps view-Z to this. Read exactly as
+        //                  ReadSketchPlane reads a sketch normal (inverse transform, columns d[2],d[5],d[8]),
+        //                  so the sign convention matches the part-side readers. Normalized.
+        //   axis         — cut_normal snapped to a principal axis ("X"/"Y"/"Z") when axis-aligned — the direct
+        //                  answer to "which axis is A-A perpendicular to?" (else null → read cut_normal).
+        //   frame        — the section view's model-space frame {origin, xdir, ydir} (view→model), so a caller
+        //                  maps a 2D section-view coordinate to 3D: p_model = origin + u*xdir + v*ydir.
+        //   label        — the section label (A, B, ...) when available from the IDrSection.
+        // All reflection-verified: IView.Type / GetBaseView / ModelToViewTransform / GetSection→IDrSection.
+        // Best-effort — any failure just omits the affected field; a non-section view returns null.
+        private JObject ReadSectionMetadata(IView view)
+        {
+            IDrSection section = null;
+            try { section = view.GetSection() as IDrSection; } catch { section = null; }
+            int vtype = -1;
+            try { vtype = view.Type; } catch { }
+            // Gate: swDrawingSectionView (2) OR an owning IDrSection is present.
+            if (vtype != 2 && section == null) return null;
+
+            var sj = new JObject();
+
+            // Parent view — the view the cut was taken in.
+            try
+            {
+                var baseView = view.GetBaseView() as IView;
+                if (baseView != null) sj["parent_view"] = baseView.Name;
+            }
+            catch { }
+            if (sj["parent_view"] == null && section != null)
+            {
+                try { var pv = section.GetView() as IView; if (pv != null) sj["parent_view"] = pv.Name; }
+                catch { }
+            }
+
+            // Section label (A / B / ...).
+            if (section != null)
+            {
+                try { var lbl = section.GetLabel(); if (!string.IsNullOrEmpty(lbl)) sj["label"] = lbl; }
+                catch { }
+                try { if (section.IsAligned()) sj["aligned"] = true; } catch { }
+            }
+
+            // Cutting-plane normal + model-space frame, from the section view's view→model transform.
+            try
+            {
+                var m2v = view.ModelToViewTransform;   // model → view
+                var v2m = m2v != null ? m2v.IInverse() : null;   // view → model
+                double[] d = v2m != null ? v2m.ArrayData as double[] : null;
+                if (d != null && d.Length >= 12)
+                {
+                    // Same column reading as ReadSketchPlane: normal = mapped view-Z (d[2],d[5],d[8]);
+                    // in-plane axes xdir = d[0..2], ydir = d[3..5]; origin (view 0,0,0 → model) = d[9..11].
+                    double nx = d[2], ny = d[5], nz = d[8];
+                    double nlen = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+                    if (nlen > 1e-9) { nx /= nlen; ny /= nlen; nz /= nlen; }
+                    sj["cut_normal"] = new JArray { R6(nx), R6(ny), R6(nz) };
+                    string ax = PrincipalAxis(nx, ny, nz);
+                    if (ax != null) sj["axis"] = ax;
+                    sj["frame"] = new JObject
+                    {
+                        ["origin"] = new JArray { R6(d[9]), R6(d[10]), R6(d[11]) },
+                        ["xdir"] = new JArray { R6(d[0]), R6(d[1]), R6(d[2]) },
+                        ["ydir"] = new JArray { R6(d[3]), R6(d[4]), R6(d[5]) },
+                    };
+                }
+            }
+            catch { }
+
+            return sj.Count > 0 ? sj : null;
         }
 
         // Read a drawing view's PROJECTED 2D geometry as clean primitives — the "clean shape" needed to
