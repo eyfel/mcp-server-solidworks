@@ -13,6 +13,12 @@ v0.5 covered vocabulary (grown from the 1-1 bracket's recorded VOCABULARY_GAP, I
   distance_distance + edge anchors), loft (multi-profile boss over >= 2 sketch nodes), revolve,
   rib, circular_pattern, sheet_metal (base flange), sketched_bend, mirror (v0.5.5 — grown for
   4-1's sheet-metal enclosure), edge_flange (custom profile, v0.5.6 — 4-1's last gap).
+v0.7 forward-vocabulary session (IR-ADR-017 — full part-tool-surface coverage, the
+grow-from-real-parts mantra deliberately overridden once): sweep (profile = the immediately
+preceding sketch, path = an earlier sketch node by id), linear_pattern (canonical axis x|y|z +
+flip; single direction — the tool's D2 is unwired in C#), ellipse/spline profile primitives,
+graph-level `material` (part graphs only, applied after the last node), edge_flange SIMPLE
+length mode (length XOR frame+profile).
 Anything outside the covered set is rejected here with an explicit 'unsupported' message —
 never silently ignored (recipe.md C5).
 """
@@ -30,19 +36,27 @@ MATE_ALIGNMENTS = frozenset(("aligned", "anti_aligned", "closest"))
 ANCHOR_KINDS_FACE = frozenset(("plane", "cylinder", "cone", "sphere"))
 ANCHOR_KINDS_EDGE = frozenset(("line", "circle"))
 ANCHOR_KINDS = ANCHOR_KINDS_FACE | ANCHOR_KINDS_EDGE
-NODE_TYPES = frozenset(("box", "sketch", "extrude", "revolve", "rib", "hole", "fillet", "chamfer", "loft",
-                        "circular_pattern", "sheet_metal", "sketched_bend", "mirror", "edge_flange")) \
+NODE_TYPES = frozenset(("box", "sketch", "extrude", "revolve", "sweep", "rib", "hole", "fillet",
+                        "chamfer", "loft", "linear_pattern", "circular_pattern", "sheet_metal",
+                        "sketched_bend", "mirror", "edge_flange")) \
     | ASSEMBLY_NODE_TYPES
-PROFILE_KINDS = frozenset(("rectangle", "circle", "line", "arc"))
+PROFILE_KINDS = frozenset(("rectangle", "circle", "line", "arc", "ellipse", "spline"))
+# Optional boolean flags any profile primitive may carry (mirrors analyze_model's per-segment flag).
+PROFILE_FLAGS = frozenset(("construction",))
 FACE_SELECTORS = frozenset(("top",))          # v0.5: only 'top'
 POSITIONS = frozenset(("center",))            # v0.5: only 'center'
 THROUGH_DEPTHS = frozenset(("through_all", "through"))
 EXTRUDE_ENDS = frozenset(("blind", "through_all", "up_to_surface", "mid_plane"))
-BODY_PRODUCERS = frozenset(("box", "extrude", "revolve"))  # node types whose body a 'hole' may reference
-# Node types that CREATE a named feature — valid seeds for a circular_pattern / mirror (the
-# compiler substitutes the seed's runtime-created feature name).
-FEATURE_PRODUCERS = frozenset(("box", "extrude", "revolve", "rib", "hole", "fillet", "chamfer", "loft",
-                               "sheet_metal", "sketched_bend", "mirror", "edge_flange"))
+# Canonical model axes for linear_pattern's direction (the tool selects the default plane whose
+# normal is that axis; 'flip' patterns toward the negative axis).
+PATTERN_DIRECTIONS = frozenset(("x", "y", "z"))
+BODY_PRODUCERS = frozenset(("box", "extrude", "revolve", "sweep"))  # node types whose body a 'hole' may reference
+# Node types that CREATE a named feature — valid seeds for a linear/circular pattern / mirror
+# (the compiler substitutes the seed's runtime-created feature name). Patterns themselves are
+# producers too: a grid composes as a pattern OF a pattern (the D2-less linear tool).
+FEATURE_PRODUCERS = frozenset(("box", "extrude", "revolve", "sweep", "rib", "hole", "fillet", "chamfer",
+                               "loft", "linear_pattern", "circular_pattern", "sheet_metal",
+                               "sketched_bend", "mirror", "edge_flange"))
 CHAMFER_TYPES = frozenset(("distance_angle", "distance_distance"))
 BEND_POSITIONS = frozenset(("centerline", "material_inside", "material_outside", "bend_outside"))
 # Edge flange adds 'bend_sharp' (swFlangePositionTypes_e 5) to the shared position set.
@@ -84,6 +98,19 @@ def validate(graph):
     if len(kinds) > 1:
         errors.append("graph mixes part-vocabulary and assembly-vocabulary nodes — an assembly "
                       "IR references part FILES (component.source), it never embeds part nodes.")
+
+    # Graph-level material (v0.7.0): document state, not a tree feature — PART graphs only.
+    material = graph.get("material")
+    if material is not None:
+        if not isinstance(material, dict) or not isinstance(material.get("name"), str) \
+                or not material.get("name"):
+            errors.append("graph.material must be {name: '<exact library material name>', "
+                          "library?: '<database>'} when present.")
+        elif material.get("library") is not None and not isinstance(material.get("library"), str):
+            errors.append("graph.material.library must be a string when present.")
+        if "assembly" in kinds:
+            errors.append("graph.material is PART-only — set_part_material requires a part "
+                          "document, not an assembly.")
 
     seen = {}  # id -> type (in declaration order)
     seen_mate = False
@@ -200,9 +227,52 @@ def validate(graph):
                 errors.append("%s: a rib must immediately follow its sketch node '%s'." % (label, sk))
             if not _is_pos_number(node.get("thickness")):
                 errors.append("%s: 'thickness' must be a positive number (meters)." % label)
-            for k in ("two_sided", "reverse_material_dir", "is_norm_to_sketch"):
+            for k in ("two_sided", "reverse_thickness_dir", "reverse_material_dir", "is_norm_to_sketch"):
                 if node.get(k) is not None and not isinstance(node.get(k), bool):
                     errors.append("%s: '%s' must be a boolean." % (label, k))
+
+        elif ntype == "sweep":
+            # Swept boss (v0.7.0): the PROFILE sketch is consumed as the ACTIVE sketch (extrude's
+            # grammar — must immediately precede); the PATH is an EARLIER sketch node selected by
+            # its runtime NAME (node_feature substitution, like loft's profiles).
+            sk = node.get("sketch")
+            prev = nodes[pos - 1] if pos > 0 else None
+            if not isinstance(sk, str) or not sk:
+                errors.append("%s: 'sketch' (id of the PROFILE sketch node) is required." % label)
+            elif seen.get(sk) != "sketch":
+                errors.append("%s: 'sketch' must reference an earlier sketch node (got '%s')." % (label, sk))
+            elif not (isinstance(prev, dict) and prev.get("id") == sk):
+                errors.append("%s: a sweep must immediately follow its PROFILE sketch node '%s'." % (label, sk))
+            path = node.get("path")
+            if not isinstance(path, str) or not path:
+                errors.append("%s: 'path' (id of an EARLIER sketch node holding the sweep path) "
+                              "is required." % label)
+            elif seen.get(path) != "sketch":
+                errors.append("%s: 'path' must reference an earlier sketch node (got '%s')." % (label, path))
+            elif path == sk:
+                errors.append("%s: 'path' and 'sketch' (profile) must be two DIFFERENT sketch nodes." % label)
+
+        elif ntype == "linear_pattern":
+            # Linear pattern (v0.7.0): canonical axis direction + flip; SINGLE direction by
+            # design (the tool's documented count2/spacing2 second direction is unwired in C# —
+            # a grid composes as a pattern OF a pattern instead).
+            tgt = node.get("feature")
+            if not isinstance(tgt, str) or not tgt:
+                errors.append("%s: 'feature' (id of an earlier feature-producing node — the pattern seed) "
+                              "is required." % label)
+            elif seen.get(tgt) not in FEATURE_PRODUCERS:
+                errors.append("%s: 'feature' must reference an earlier %s node (got '%s')."
+                              % (label, "/".join(sorted(FEATURE_PRODUCERS)), tgt))
+            if node.get("direction") not in PATTERN_DIRECTIONS:
+                errors.append("%s: 'direction' must be one of %s (got %r)."
+                              % (label, sorted(PATTERN_DIRECTIONS), node.get("direction")))
+            if not _is_pos_number(node.get("spacing")):
+                errors.append("%s: 'spacing' must be a positive number (meters between instances)." % label)
+            count = node.get("count")
+            if not (isinstance(count, int) and not isinstance(count, bool) and count >= 2):
+                errors.append("%s: 'count' must be an integer >= 2 (total instances incl. the seed)." % label)
+            if node.get("flip") is not None and not isinstance(node.get("flip"), bool):
+                errors.append("%s: 'flip' must be a boolean (pattern toward the negative axis)." % label)
 
         elif ntype == "circular_pattern":
             tgt = node.get("feature")
@@ -321,37 +391,55 @@ def validate(graph):
                               "face, on the SIDE that stays put (PRE-bend geometry)." % label)
 
         elif ntype == "edge_flange":
-            # Custom-profile edge flange: SELF-CONTAINED (no preceding sketch node — the profile
-            # sketch is GENERATED by the flange API mid-node, then redrawn from `profile`).
+            # TWO MODES (v0.7.0): (A) custom profile — frame+profile given, the reverse-replay
+            # three-phase flow; (B) simple LENGTH — `length` given instead, ONE tool call, a
+            # full-edge-width flange (the forward mode: a forward AI cannot know the generated
+            # sketch's frame). The pair and `length` are mutually exclusive.
             edge = node.get("edge")
             if not isinstance(edge, dict) or not _is_point3(edge.get("near")):
                 errors.append("%s: 'edge' must be {near:[x,y,z], hint?} — a 3D point ON the attach "
                               "edge (the reader's edge `mid`)." % label)
-            frame = node.get("frame")
-            if (not isinstance(frame, dict)
-                    or not all(_is_point3(frame.get(k)) for k in ("origin", "xdir", "ydir"))):
-                errors.append("%s: 'frame' is REQUIRED {origin, xdir, ydir} — the ORIGINAL profile "
-                              "sketch's frame; the generated sketch's frame is unpredictable, so "
-                              "the coordinate transform is mandatory." % label)
-            profile = node.get("profile")
-            if not isinstance(profile, list) or len(profile) == 0:
-                errors.append("%s: 'profile' must be a non-empty array of primitives (the ORIGINAL "
-                              "profile sketch's segments, original 2D coords)." % label)
-            else:
-                for j, prim in enumerate(profile):
-                    _check_profile_prim(prim, "%s.profile[%d]" % (label, j), errors)
             angle = node.get("angle")
             if angle is not None and not _is_pos_number(angle):
                 errors.append("%s: 'angle' must be a positive number (RADIANS; omit for 90°)." % label)
-            if node.get("radius") is not None and not _is_pos_number(node.get("radius")):
-                errors.append("%s: 'radius' must be a positive number (meters); OMIT it to use the "
-                              "sheet's default bend radius." % label)
-            posn = node.get("position")
-            if posn is not None and posn not in EDGE_FLANGE_POSITIONS:
-                errors.append("%s: 'position' must be one of %s (got %r)."
-                              % (label, sorted(EDGE_FLANGE_POSITIONS), posn))
-            if node.get("flip") is not None and not isinstance(node.get("flip"), bool):
-                errors.append("%s: 'flip' must be a boolean." % label)
+            length = node.get("length")
+            frame = node.get("frame")
+            profile = node.get("profile")
+            if length is not None:
+                # MODE B — simple length flange.
+                if not _is_pos_number(length):
+                    errors.append("%s: 'length' must be a positive number (meters)." % label)
+                if frame is not None or profile is not None:
+                    errors.append("%s: 'length' (simple mode) and 'frame'/'profile' (custom-profile "
+                                  "mode) are mutually exclusive." % label)
+                for k in ("radius", "position", "flip"):
+                    if node.get(k) is not None:
+                        errors.append("%s: '%s' is not supported in length mode (the simple flange "
+                                      "uses the sheet default radius, position material_inside, no "
+                                      "flip) — use the frame+profile mode for it." % (label, k))
+            else:
+                # MODE A — custom profile (the original v0.5.6 contract).
+                if (not isinstance(frame, dict)
+                        or not all(_is_point3(frame.get(k)) for k in ("origin", "xdir", "ydir"))):
+                    errors.append("%s: 'frame' is REQUIRED {origin, xdir, ydir} — the ORIGINAL profile "
+                                  "sketch's frame; the generated sketch's frame is unpredictable, so "
+                                  "the coordinate transform is mandatory (or give 'length' for the "
+                                  "simple full-width flange)." % label)
+                if not isinstance(profile, list) or len(profile) == 0:
+                    errors.append("%s: 'profile' must be a non-empty array of primitives (the ORIGINAL "
+                                  "profile sketch's segments, original 2D coords)." % label)
+                else:
+                    for j, prim in enumerate(profile):
+                        _check_profile_prim(prim, "%s.profile[%d]" % (label, j), errors)
+                if node.get("radius") is not None and not _is_pos_number(node.get("radius")):
+                    errors.append("%s: 'radius' must be a positive number (meters); OMIT it to use the "
+                                  "sheet's default bend radius." % label)
+                posn = node.get("position")
+                if posn is not None and posn not in EDGE_FLANGE_POSITIONS:
+                    errors.append("%s: 'position' must be one of %s (got %r)."
+                                  % (label, sorted(EDGE_FLANGE_POSITIONS), posn))
+                if node.get("flip") is not None and not isinstance(node.get("flip"), bool):
+                    errors.append("%s: 'flip' must be a boolean." % label)
 
         elif ntype == "mirror":
             plane = node.get("plane")
@@ -530,9 +618,9 @@ def _check_profile_prim(prim, label, errors):
     if kind not in PROFILE_KINDS:
         errors.append("%s.kind '%s' unsupported in v0.5 (only %s)." % (label, kind, sorted(PROFILE_KINDS)))
         return
-    con = prim.get("construction")
-    if con is not None and not isinstance(con, bool):
-        errors.append("%s: 'construction' must be a boolean." % label)
+    for flag in sorted(PROFILE_FLAGS):
+        if prim.get(flag) is not None and not isinstance(prim.get(flag), bool):
+            errors.append("%s: '%s' must be a boolean." % (label, flag))
     if kind == "rectangle":
         for k in ("width", "height"):
             if not _is_pos_number(prim.get(k)):
@@ -554,3 +642,17 @@ def _check_profile_prim(prim, label, errors):
         if prim.get("dir") not in (1, -1):
             errors.append("%s: arc 'dir' must be 1 (CCW) or -1 (CW) — centre+start+end alone "
                           "describe two arcs." % label)
+    elif kind == "ellipse":
+        # Centre + a point on the MAJOR axis + a point on the MINOR axis — exactly the reader's
+        # shape and add_sketch_entity(ellipse)'s inputs (round-trips verbatim).
+        for k in ("cx", "cy", "x1", "y1", "x2", "y2"):
+            if not _is_number(prim.get(k)):
+                errors.append("%s: ellipse '%s' must be a number (centre / major-axis point / "
+                              "minor-axis point, exact 2D sketch coords)." % (label, k))
+    elif kind == "spline":
+        # Flat through-point list [x1, y1, x2, y2, ...] — mirrors the reader's spline 'points'.
+        pts = prim.get("points")
+        if (not isinstance(pts, list) or len(pts) < 4 or len(pts) % 2 != 0
+                or not all(_is_number(v) for v in pts)):
+            errors.append("%s: spline 'points' must be a FLAT number list [x1, y1, x2, y2, ...] "
+                          "with >= 2 points (even count)." % label)

@@ -85,7 +85,7 @@ The `adapters/` layer is provider-specific and replaceable. Because the executio
 
 ## Tool List
 
-The system currently exposes **44 tools** (the set keeps growing); a contract test keeps the adapter and the execution contract in exact sync (see [CONTRIBUTING.md](CONTRIBUTING.md)). Most are low-level CAD operations; a few (`save_analysis`, `rebuild_from_ir`, `compare_parts`, `compare_assemblies`) drive the analysis / IR round-trip described below. All lengths are in meters (SolidWorks internal units).
+The system currently exposes **46 tools** (the set keeps growing); a contract test keeps the adapter and the execution contract in exact sync (see [CONTRIBUTING.md](CONTRIBUTING.md)). Most are low-level CAD operations; a few (`save_analysis`, `rebuild_from_ir`, `submit_feature_graph`, `compare_parts`, `compare_assemblies`) drive the analysis / IR round-trip described below. All lengths are in meters (SolidWorks internal units).
 
 ### Document and lifecycle
 - `ensure_ready` — launches SolidWorks via COM and attaches if it is closed (does not open a document).
@@ -135,7 +135,8 @@ These tools implement the reverse-engineering loop — *"the LLM proposes, the r
 
 - `get_recipe` — serves the IR-generation recipe to the model section-by-section (mapping/canonicalization rules, the Feature Graph schema, the artifact contract) — the model calls it before writing an IR.
 - `save_analysis` — writes an **analysis artifact** for a part or assembly file (feature recipe / component + mate tree, driving parameters, and an optional Feature Graph IR block) to `<folder>/.solidpilot/`.
-- `rebuild_from_ir` — the mainline IR door: runs an artifact's IR block through the deterministic compiler to rebuild the part — or assembly — in a fresh document (same compiler that the future `submit_feature_graph` will use — two doors, one compiler).
+- `rebuild_from_ir` — the **reverse** IR door: runs an artifact's IR block through the deterministic compiler to rebuild the part — or assembly — in a fresh document, and warns when the source file has changed under the artifact (`source_stale`).
+- `submit_feature_graph` — the **forward** IR door: builds a part or assembly from a Feature Graph supplied directly by the model (design intent, no original to copy), through the *same* compiler — two doors, one compiler.
 - `compare_parts` — objective two-part diff (topology, volume, area, center of mass) with the project's `verified` verdict (topology-exact **and** |ΔV| ≤ 1% **and** |ΔA| ≤ 1%).
 
 ### Drawing
@@ -226,9 +227,9 @@ SolidPilot is a **working prototype / early alpha**. The low-level tools have be
 
 The open problem — and the project's real research risk — is a **durable reference resolver**: the v0 geometric anchors reproduce a part exactly in a fresh document but do **not** survive upstream edits (a changed dimension moves the anchors). Making semantic references (`top_face`, a specific edge) robust across topology changes is the make-or-break module still ahead.
 
-> **Two IR doors, one compiler.** The mainline door is `rebuild_from_ir` (reproduce from an artifact). A second, *forward* door — `submit_feature_graph`, building from scratch — is scaffolded but intentionally **commented out** in `adapters/claude/server.py` (it collapses the low-level surface into one tool, which is future work); re-enabling it is a one-block uncomment. Both doors execute through the same `pycompiler`, so every replay lesson improves both at once.
+> **Two IR doors, one compiler.** The *reverse* door is `rebuild_from_ir` (reproduce an existing part from its artifact). The *forward* door is `submit_feature_graph` (build from design intent, with no original to copy) — now **live and gate-free**, and proven on real geometry: swept solids matching πr²·L to six digits, composed pattern grids, elliptic prisms, and sheet-metal flanges. Both doors execute through the same `pycompiler`, so every lesson from one improves the other. Note that having the forward door is *not* the same as collapsing the low-level surface beneath it — the 40-odd low-level tools still stand, and retiring them waits on the reference resolver below.
 
-**Testing:** two automated suites run fully offline (no SolidWorks needed): a contract test (`adapters/claude/tests/test_schema_contract.py`) that fails on any tool/parameter drift between the adapter (`server.py`) and the execution contract (`tool-schemas.json`), and the compiler suite (`solidworks-compiler/pycompiler/tests/`) covering IR validation, lowering, and reference resolution against a fake execution port. Behavioral verification of the CAD operations themselves is manual against live SolidWorks, by design.
+**Testing:** three automated suites run fully offline (no SolidWorks needed) — a **tool contract test** (`adapters/claude/tests/test_schema_contract.py`) that fails on any tool/parameter drift between the adapter (`server.py`) and the execution contract (`tool-schemas.json`); an **IR contract test** (`solidworks-compiler/pycompiler/tests/test_ir_schema_contract.py`) that fails on any vocabulary drift between the IR schema — which doubles as the capability registry — and the validator that enforces it, in both directions; and the **compiler suite** (`solidworks-compiler/pycompiler/tests/`) covering IR validation, lowering, and reference resolution against a fake execution port. Behavioral verification of the CAD operations themselves is manual against live SolidWorks, by design.
 
 Notes:
 - The Python MCP adapter does not hot-reload while running; after editing `server.py`, the MCP server must be reconnected.
@@ -242,7 +243,7 @@ The project is under active development. The Feature Graph IR and deterministic 
 - **Durable reference resolver / persistent naming** — the critical module: making semantic references (`top_face`, a specific edge) survive dimension and topology changes, not just fresh-document replay. The current v0 geometric anchors are exact but edit-fragile.
 - **Assembly depth** — the assembly core (insert, mate, analyze, IR round-trip) works; remaining work is subassembly hierarchies as first-class IR, mates for deformable/seated parts (e.g. o-rings in grooves), and assembly drawings / BOM.
 - **Analysis pipeline breadth** — a folder scanner (batch-analyze a directory of parts/drawings into artifacts), an AI pass that generates IR per category with a coverage report, and pattern reuse across verified IRs (parametric rebuilds without an LLM).
-- **Forward IR surface** — collapsing the low-level tools under the single `submit_feature_graph` interface once the vocabulary and resolver are ready.
+- **Collapsing the tool surface** — the forward door (`submit_feature_graph`) is live and the IR now covers the whole part-modeling surface, so the remaining step is retiring the low-level tools beneath it. That is where the token-cost win of this architecture is actually realized; it waits on the resolver, since a single-tool interface is only usable if its references are durable.
 
 Coming soon in existing areas:
 

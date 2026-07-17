@@ -1,6 +1,6 @@
 # recipe-usage.md — The IR Generation Recipe (usage edition)
 
-**Version: 0.7.2** · Owner: cad-planner · Served to the model section-by-section via the
+**Version: 0.10.0** · Owner: cad-planner · Served to the model section-by-section via the
 `get_recipe` MCP tool. This is the operational rule set for turning an analysis artifact's
 recipe into a Feature Graph IR (and for producing reconstructable drawings). Sections are
 addressed by the slug in each `##` header.
@@ -45,16 +45,62 @@ The same part must always yield the same IR, modulo parameter values:
   geometry. Two constructions can be B-rep-identical yet carry opposite intrinsic orientations
   that downstream features are measured against.
 
+## forward — Forward authoring (intent → IR, no original part)
+
+Read this FIRST when writing a Feature Graph from DESIGN INTENT (the forward door,
+`submit_feature_graph`) rather than from an analysis artifact. The `mapping_*` sections assume
+an ORIGINAL part whose reader output you copy verbatim (C7 readback); forward authoring has no
+original — these rules replace the readback discipline there. C1–C5 still apply.
+
+- **Vocabulary + grammar come from the schema** (`get_recipe('feature_graph_schema')` — the
+  capability registry; what is not in it cannot be built). Grammar essentials: `extrude` /
+  `revolve` / `rib` / `sweep` / `sheet_metal` / `sketched_bend` consume the ACTIVE sketch —
+  each must IMMEDIATELY follow its (profile) sketch node. `loft` profiles, a sweep's `path`,
+  pattern seeds (`feature`) and mirror `features` reference EARLIER nodes by id — never by
+  name (the compiler substitutes runtime names). Units METERS, angles RADIANS; nodes build in
+  array order.
+- **Sketch profiles close by SHARED ENDPOINTS.** Consecutive primitives sharing identical
+  endpoint coordinates close the contour — do NOT add constraints or dimensions
+  (frozen-coordinate discipline). Arcs need `dir` (+1 CCW / −1 CW). OMIT `frame` — it is
+  reverse-replay data; a forward sketch on a datum/offset support needs none.
+- **Design anchors from the geometry you are CREATING.** An edge/face anchor's `near` must be
+  the target's coordinate IN THE STATE the node executes (after all earlier nodes). Compute it
+  from your own intended dimensions — and know the TOOL DEFAULTS that decide where geometry
+  lands: a base flange thickens to the sketch plane's −normal side by default
+  (`reverse_thickness` flips, `symmetric_thickness` splits ±t/2); box/rectangle profiles are
+  centred on the sketch origin; extrude runs toward +normal (`reversed` flips). A missed
+  anchor fails LOUD with the nearest distance — read it, correct the coordinate ONCE (the miss
+  distance usually names the mistake, e.g. exactly one sheet thickness), never iterate blindly.
+- **Prefer the forward-friendly forms:** `edge_flange` with `length` (not frame+profile —
+  those exist for verbatim replay); `material {name, library?}` at graph level; a GRID as a
+  pattern OF a pattern (a `linear_pattern` seeding on an earlier `linear_pattern` — the tool
+  has no second direction).
+- **Know what is NOT expressible** (state it, don't improvise a lookalike): sweep/revolve/loft
+  are BOSS-only; no shell/draft/dome/wrap/hole-wizard/thread; `linear_pattern` is
+  single-direction (+`flip`); mirror planes are canonical datums only. If the intent needs one
+  of these, report the gap (C5).
+- **Self-verify without an original:** before submitting, COMPUTE the expected outcome from
+  intent — volume by hand (πr²·L for a swept tube, π·a·b·h for an elliptic prism,
+  plate−n·holes for patterns), face/edge counts, CG shifts for asymmetric removals. After
+  COMPLETED, read `analyze_model(mass_properties + geometry)` and compare — a match within
+  rounding is the forward equivalent of the round-trip verdict. Splines are the exception:
+  through-point recreation is visually equivalent, never exact — check bounds, not equality.
+- **Failure model:** CAD ops are not transactional — a failed run leaves partial geometry
+  (reported, never hidden). Fix the graph and resubmit with `fresh_document=true` rather than
+  patching the partial document.
+
 ## mapping — Core mapping steps (recipe → IR)
 
 1. Walk `recipe.features` in order; classify each against the CURRENT covered vocabulary —
    **the schema IS the registry**: read the node types from `feature-graph.schema.json`
-   (`get_recipe('feature_graph_schema')`). Part vocabulary: `box`, `sketch`+`extrude` boss/cut
-   (ends blind / through_all / up_to_surface / mid_plane), `hole`-on-face, `fillet`, `chamfer`,
-   `revolve`, `rib`, `loft`, `circular_pattern`, `mirror`, `sheet_metal`, `sketched_bend`,
-   `edge_flange`; profiles rectangle/circle/line/arc + construction; sketch supports = datums
-   front/top/right with a signed `offset` OR a `ref.face` anchor. ASSEMBLY documents use the
-   separate `component`/`mate` sub-vocabulary (see `mapping_assembly`).
+   (`get_recipe('feature_graph_schema')`). Part vocabulary (0.7.1-draft): `box`,
+   `sketch`+`extrude` boss/cut (ends blind / through_all / up_to_surface / mid_plane),
+   `hole`-on-face, `fillet`, `chamfer`, `revolve`, `sweep`, `rib`, `loft`, `linear_pattern`,
+   `circular_pattern`, `mirror`, `sheet_metal`, `sketched_bend`, `edge_flange` (custom-profile
+   or simple length mode); profiles rectangle/circle/line/arc/ellipse/spline + construction;
+   sketch supports = datums front/top/right with a signed `offset` OR a `ref.face` anchor; an
+   optional graph-level `material {name, library?}` (part graphs only). ASSEMBLY documents use
+   the separate `component`/`mate` sub-vocabulary (see `mapping_assembly`).
 2. For each mappable feature emit the IR node per C1–C4; resolve its sketch plane from the
    recipe's `plane {ref, offset}` → `ref {datum, offset}` (the compiler creates the offset plane
    itself and threads its RUNTIME name — never guess a plane name). A plane the reference model
@@ -97,6 +143,26 @@ The same part must always yield the same IR, modulo parameter values:
 - **Anchors are replay-exact, edit-fragile.** They survive a fresh-doc rebuild bit-for-bit but
   break on ANY upstream change. A parametric variant workflow must re-derive anchors — do not
   reuse a graph's anchors after editing `_params` upstream of them.
+- **`sweep` grammar (0.9.0):** node order is path sketch, …, PROFILE sketch, sweep — the profile
+  sketch must IMMEDIATELY precede the sweep (it is consumed as the active sketch, extrude's
+  grammar); `path` references the EARLIER path-sketch node by id (the compiler substitutes its
+  runtime name). The path is an open line/arc chain that starts ON the profile's plane; boss
+  only (the tool surface has no sweep cut).
+- **`linear_pattern` (0.9.0):** `{feature, direction: x|y|z, spacing, count, flip?}` — the seed
+  is an earlier feature-producing node by id; `flip` patterns toward the NEGATIVE axis. SINGLE
+  direction per node: compose a grid as a pattern OF a pattern (a `linear_pattern` is itself a
+  valid seed). REVERSE-reading gap (recorded): `analyze_model(features)` lifts only an
+  LPattern's `d1_instances` + `d1_spacing_si` — direction/flip are not readable yet; a reverse
+  mapping of a linear pattern needs a geometric direction inference until the reader grows.
+- **`ellipse` / `spline` profile primitives (0.9.0):** copy the reader's segments verbatim —
+  ellipse `{cx,cy, x1,y1 (major-axis point), x2,y2 (minor-axis point)}`, spline
+  `{points: [x1,y1,x2,y2,…]}` (flat through-points). HONEST spline caveat: recreation from
+  through-points is visually equivalent, not bit-identical (SW stores control points +
+  tangency) — expect volume/area within tolerance, never byte-exact.
+- **Graph-level `material` (0.9.0):** `{name, library?}` at the TOP of the graph (not a node —
+  material is document state), applied by the compiler AFTER the last node; part graphs only.
+  REVERSE-reading gap (recorded): the reader does not lift the applied material yet — take it
+  from the artifact/user when known, else omit.
 
 ## mapping_sheet_metal — Sheet-metal rules
 
@@ -135,6 +201,12 @@ The same part must always yield the same IR, modulo parameter values:
   `profile_sketch` read fully via `analyze_model(sketch, name=…)` — `frame` is REQUIRED (the
   rebuild's generated profile sketch has an unpredictable frame; the frame transform maps the
   original coordinates into it).
+- **`edge_flange` SIMPLE LENGTH mode (0.9.0 — the FORWARD form):** give `length` INSTEAD of
+  frame+profile for a plain full-edge-width flange ("20 mm flange on this edge at 90°") — one
+  tool call, edge resolved by index from `edge.near`. Length mode accepts only edge + angle +
+  length (position = material_inside, radius = sheet default, no flip — use the custom-profile
+  mode for those). REVERSE mappings keep using frame+profile (verbatim replay, C7); length mode
+  exists because a forward generator cannot know the generated sketch's frame in advance.
 
 ## mapping_assembly — Assembly rules (component + mate)
 
@@ -203,9 +275,37 @@ Per PART (never per batch):
 5. Write the whole outcome into `ir.verification`. **Only `verified` IR may ever be used for
    rebuilds, variants, or pattern matching.**
 
-### Reverse reconstruction (drawing → part) — reading discipline (added 0.7.2)
+Reverse (drawing → part) reconstruction has its own reading discipline — see the `reverse`
+section.
 
-When rebuilding a part from ONLY its drawing (original never opened during the build):
+## reverse — Drawing → part reconstruction discipline
+
+When rebuilding a part from ONLY its drawing, the original part must never be opened DURING the
+build (deterministic readback of the original is allowed ONLY in the verification phase, to pin
+a topology delta). Real drawings carry the MINIMUM view set (often 2–3 views, sometimes with a
+section view REPLACING a standard view) and only the necessary dimensions — the rules below turn
+that into data, not guesswork.
+
+**Reading order — dimensions are the skeleton, vectors close the gaps:**
+
+1. Call `analyze_drawing(include_geometry=True)` ONCE and extract everything from this FIRST
+   read: all dimensions (value_si + anchors + diametric + owning view), all per-view vector
+   geometry (lines / curves / circles), every view's `frame`, and each section view's `section`
+   block. Corner counts, sharp-vs-filleted vertices and exact rectangles are all in this first
+   read — count arcs by radius/region BEFORE sketching, so a miss isn't discovered later via the
+   round-trip.
+2. Build the DIMENSION SKELETON first: place and size every feature that has a dimension from
+   that dimension (an engineer reads the dimension "edge-to-edge 35", not coordinates). A
+   dimension's `anchors` are MODEL-space 3D points — they locate what the value measures.
+3. Close the UNDIMENSIONED gaps from the vectors: engineers deliberately leave out derivable
+   dimensions and twins. An undimensioned feature identical in the vectors to a dimensioned one
+   (same radius circle, mirrored position) INHERITS its twin's size; anything else is measured
+   from the vector geometry through the view frame.
+4. Never guess a coordinate the frame arithmetic can give: for ANY view-2D coordinate (u,v) —
+   line endpoints, circle centers, section geometry — `p_model = origin + u*xdir + v*ydir` with
+   that view's `frame`.
+
+**Signal rules (each from a real benchmark failure):**
 
 - **Dimension NAMES are not feature-location truth.** A dim labelled `@Chamfer2` may be a block
   CORNER chamfer, not a hole chamfer; `@Fillet2` may sit on a feature-INTERSECTION edge (hole ∩
@@ -215,15 +315,29 @@ When rebuilding a part from ONLY its drawing (original never opened during the b
   the base sketch (`@Sketch1`) is a loop IN that sketch → it goes THROUGH the base extrude. Do not
   override this from an ambiguous section-view "looks blind" read. One-datum confirmation: the
   feature's hidden outline spans the FULL depth in an ortho view.
-- **Extract all profile detail from the FIRST vector read.** Corner counts (e.g. a slot with 3
-  rounded + 1 SHARP corner), sharp-vs-filleted vertices, exact rectangles are all in the first
-  `analyze_drawing(include_geometry)` polylines — count arcs by radius/region BEFORE sketching, so
-  the miss isn't discovered later via the round-trip.
+- **An anchor beyond the base body is a FEATURE, not bad data.** A dimension anchor whose
+  coordinate lies BEYOND the base extrude's depth (e.g. z=65.1 mm on a 45 mm body) means the part
+  EXTENDS there — an offset-plane feature, a loft/boss nose. Find that feature (an offset-plane
+  dimension like `D1@Plane1` plus profile circles usually names it) instead of discarding the
+  dimension as inconsistent.
+- **Loft/cone/taper signal.** CONCENTRIC full circles of DIFFERING diameter in a plan view plus
+  slanted silhouette lines in an adjacent or section view = a loft/cone between those two
+  profiles (the circles are its end sections; a third concentric circle is typically a coaxial
+  hole through it). TRUST the geometry read's explicit circle centers (`circles: {cx, cy, r}`) —
+  a shared center is data, not coincidence.
+- **A section view may BE the standard view.** When the side/top view is given AS a section
+  (e.g. front + top + Section C-C instead of a plain side view), read the section's OUTER outline
+  as that view's profile and its INTERIOR contours as the internal geometry exposed by the cut;
+  the `section` block's `frame`/`axis` does the 2D→3D mapping.
 - **PDF export+crop is a LAST-RESORT orientation aid, not the primary read.** Use it only when a
   specific 2D→3D orientation or corner is genuinely ambiguous from vectors; a cluttered section
   can mislead (it "looks blind").
-- **Deterministic readback of the original (`feature_map`/rollback) is allowed ONLY in the
-  verification phase**, to pin a topology delta — never during the build.
+- **Readback of the original belongs ONLY to a verification phase, never the build.** Whether a
+  verify-against-the-original phase exists at all is the TASK's call: a benchmark/round-trip
+  prompt specifies it; a production drawing-only job usually has NO original part to compare.
+  When no original comparison is available, self-check from the drawing itself (mass_properties
+  sanity vs the read dimensions; every dimension accounted for; report unmodeled features
+  explicitly — C5, no silent gaps).
 
 ## coverage — Coverage reporting
 

@@ -8,7 +8,9 @@ from pydantic import Field
 from fastmcp import FastMCP
 from execution_client import call_tool, get_state, ensure_ready as _ensure_ready, ExecutionLayerError
 from response_mapper import map_response
-# from ir_execution_port import run_feature_graph  # only used by the disabled test tool below
+# NOTE: pycompiler is reached via `from ir_execution_port import run_feature_graph` imported
+# LAZILY inside rebuild_from_ir and submit_feature_graph — a missing compiler tree degrades to a
+# clean tool error instead of killing the whole MCP server at startup.
 
 # P0.4 MCP hardening: discriminators are `Literal[...]` (invalid values rejected at the
 # MCP schema level, before any REST/COM round-trip) and numeric params carry Pydantic
@@ -296,7 +298,7 @@ def add_sketch_entity(
     vx: float = 0.0,
     vy: float = 0.0,
     distance: float = 0.0,
-    direction: float = 1.0,
+    direction: float = 0.0,
     points: str = "[]",
     construction: bool = False,
 ) -> str:
@@ -305,11 +307,11 @@ def add_sketch_entity(
     entity_type='circle':     uses cx,cy (center) and radius.
     entity_type='line':       uses x1,y1 (start) and x2,y2 (end).
     entity_type='arc':        uses x1,y1 (start), x2,y2 (end), xm,ym (mid-arc point) — a 3-point arc.
-    entity_type='arc_center': uses cx,cy (exact center), x1,y1 (start), x2,y2 (end) and
-                              direction (+1 CCW, -1 CW). Prefer this over 'arc' when the exact
-                              center/radius are known (e.g. straight from analyze_model): it
-                              guarantees the radius and is numerically stable for shallow/near-
-                              collinear arcs where the 3-point circle-fit is unreliable.
+    entity_type='arc_center': uses cx,cy (exact center), x1,y1 (start), x2,y2 (end) and optional
+                              direction. Prefer this over 'arc' when the exact center/radius are
+                              known (e.g. straight from analyze_model): it guarantees the radius
+                              and is numerically stable for shallow/near-collinear arcs where the
+                              3-point circle-fit is unreliable.
     entity_type='ellipse':    uses cx,cy (center), x1,y1 (a point on the MAJOR axis), x2,y2 (a point
                               on the MINOR axis). Mirrors analyze_model's ellipse segment exactly.
     entity_type='spline':     uses points — a JSON array STRING of flat through-points
@@ -317,8 +319,11 @@ def add_sketch_entity(
                               (its 'points'). Round-trips its through-points exactly.
     entity_type='fillet':     uses vx,vy (vertex to round) and radius.
     entity_type='chamfer':    uses vx,vy (vertex to cut) and distance.
-    direction: only for 'arc_center' — sweep sense from start to end (+1 CCW, -1 CW); pick the
-               sign that yields the intended (usually minor) arc. Ignored by other types.
+    direction: only for 'arc_center' — sweep sense from start to end. OMIT IT (or pass 0) to get
+               the MINOR (<=180°) arc automatically — what a corner round/fillet arc virtually
+               always means; a wrong explicit sign silently draws the >180° complement. Pass +1
+               (CCW) or -1 (CW) ONLY when you deliberately need a specific/major sweep (round-trip
+               replays pass analyze's 'dir' verbatim). Ignored by other types.
     points: only for 'spline' — a JSON array string of flat (x,y) through-points, e.g.
             '[-0.2,0.0,-0.18,0.04,-0.14,0.05]'. Ignored by other types.
     construction: True makes the created entity CONSTRUCTION/reference geometry (centerline,
@@ -349,6 +354,35 @@ def add_sketch_entity(
             "construction": construction,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Tool: add_sketch_entities (batch)
+# ---------------------------------------------------------------------------
+@mcp.tool()
+def add_sketch_entities(segments: str) -> str:
+    """Add MANY sketch entities to the active sketch in ONE call (the batch form of
+    add_sketch_entity — prefer this whenever a profile has more than ~3 segments).
+    segments: a JSON array STRING of entity records, each record = add_sketch_entity's
+    parameters for one entity, e.g.
+      '[{"entity_type":"line","x1":0,"y1":0,"x2":0.05,"y2":0},
+        {"entity_type":"arc_center","cx":0.05,"cy":0.005,"x1":0.05,"y1":0,"x2":0.055,"y2":0.005},
+        {"entity_type":"circle","cx":0.02,"cy":0.02,"radius":0.004,"construction":true}]'
+    Corner rounds / fillet arcs: use arc_center WITHOUT "direction" — the tool then draws the
+    MINOR (<=180°) arc deterministically (an explicit wrong sign silently draws the 270°
+    complement); pass direction ±1 only for a deliberate major arc.
+    Supported entity_type values and their parameters are IDENTICAL to add_sketch_entity
+    (rectangle/circle/line/arc/arc_center/ellipse/spline/fillet/chamfer; per-record
+    'construction': true supported; one difference: a 'spline' record's "points" is a plain
+    JSON array [x1,y1,x2,y2,...], not a nested string). Segments are created in array order —
+    list a profile's segments in contour order with EXACT shared endpoints (no coincident
+    constraints needed).
+    NOT transactional: on the first failing record the call returns FAILED naming segments[i]
+    and how many earlier records were created — those remain in the sketch.
+    On COMPLETED, result_geometry echoes {segment_count, counts per entity_type} (compact —
+    NO per-segment geometry echo; read back with analyze_model(sketch, name=...) if needed).
+    All coordinates in document units (meters)."""
+    return _call("add_sketch_entities", {"segments": json.loads(segments) if segments else []})
 
 
 # ---------------------------------------------------------------------------
@@ -917,31 +951,34 @@ def analyze_drawing(include_geometry: bool = False) -> str:
     accordingly). Use it to (a) check a drawing you produced — do its dimensions match the model? — and
     (b) read a drawing back for re-modeling.
 
-    ⮕ RECONSTRUCTING A PART FROM THIS DRAWING? Call get_recipe('verification') (and get_recipe('drawing'))
-      FIRST — the reverse-reading discipline (dimension ownership, section→3D mapping, through-vs-blind,
-      profile-from-first-vector, PDF-crop as last resort) lives there and only helps if read.
+    ⮕ RECONSTRUCTING A PART FROM THIS DRAWING? Call get_recipe('reverse') FIRST (and
+      get_recipe('drawing') for the section conventions) — the reverse-reading discipline (dimension
+      ownership, section→3D mapping, through-vs-blind, profile-from-first-vector, loft/taper signals,
+      PDF-crop as last resort) lives there and only helps if read.
 
-    Each dimension is {name, value_si (meters/radians, 6 decimals), dim_type, diametric?, attached?, anchors?}:
-      dim_type  — what the value MEASURES (linear/diameter/radial/angular/...), so "is this 17 a diameter?"
-                  is DATA, not a guess; diametric=true also flags a Ø dimension.
+    Each dimension is {name, value_si (meters/radians, 6 decimals), diametric?, attached?, anchors?}:
+      diametric — true flags a Ø (diameter) dimension, so "is this 17 a diameter?" is DATA, not a guess.
       attached  — the KIND(s) of geometry the dim hangs off (edge/vertex/sketch_seg/...).
-      anchors   — the dimension's reference points in SHEET space [x,y,z] meters — the concrete geometry it
-                  snaps to (maps "what is this 17 the dimension of?" to a location arithmetically).
+      anchors   — the dimension's reference points in MODEL space [x,y,z] meters — the concrete geometry it
+                  snaps to (maps "what is this 17 the dimension of?" to a 3D location arithmetically; an
+                  anchor whose coordinate lies BEYOND the base body's depth signals a feature that extends
+                  past it — an offset-plane boss/loft — not bad data).
     A view's section block (present only on SECTION views) is {parent_view, cut_normal, axis?, frame, label?}:
       cut_normal — the cutting-plane NORMAL in MODEL space (= the section's viewing direction);
       axis       — that normal snapped to 'X'/'Y'/'Z' when axis-aligned (the direct answer to "A-A ⟂ which axis?");
-      frame      — {origin, xdir, ydir} in model space, so a 2D section-view coord maps to 3D:
+      frame      — {origin, xdir, ydir} in MODEL space: a 2D section-geometry coord (u,v) maps to 3D as
                    p_model = origin + u*xdir + v*ydir; parent_view names the view the cut was taken in.
 
     include_geometry (default False): also return each view's PROJECTED 2D GEOMETRY as clean primitives —
-        geometry:{lines:[{x1,y1,x2,y2}], curves:[{n,x1,y1,xm,ym,x2,y2}], frame}. This is the CLEAN SHAPE
-        for reverse-engineering a part from its drawing, independent of dimension-line clutter (you read
-        the shape as vectors, not from a cluttered raster). Coordinates are in MODEL-scale METERS centered
-        on each view's centroid (z=0). Crucially, the line segments carry the UP/DOWN / which-face profile
-        structure that a dimension VALUE alone cannot (e.g. on a revolved flange's side view you can read
-        directly that a recess is on the BOTTOM face and a raised face is on the TOP). 'curves' are
-        tessellated arcs/circles reduced to start/mid/end (best-effort). Source: IView.GetPolylines7.
-        Heavier payload — use it when you need the shape to rebuild, not for a quick dim check.
+        geometry:{lines:[{x1,y1,x2,y2}], curves:[{n,x1,y1,xm,ym,x2,y2,cx?,cy?,r?}], circles:[{cx,cy,r}],
+        frame:{origin,xdir,ydir}}. This is the CLEAN SHAPE for reverse-engineering a part from its drawing,
+        independent of dimension-line clutter. Coordinates are MODEL-scale METERS in the view plane; the
+        view's frame maps ANY of them (incl. circle centers) to 3D: p_model = origin + x*xdir + y*ydir.
+        circles are FULL circles with their true center+radius (a bore/boss cross-section — TRUST cx,cy:
+        concentric circles of differing r in a plan view + slanted silhouette lines in an adjacent view
+        = a loft/cone/taper). curves are partial arcs (fillets etc.) as start/mid/end + fitted center.
+        The line segments carry the UP/DOWN / which-face profile structure a dimension VALUE alone cannot.
+        Source: IView.GetPolylines7. Heavier payload — use when you need the shape, not for a dim check.
 
     Requires an active drawing document (call create_drawing first)."""
     return _call("analyze_drawing", {"include_geometry": include_geometry})
@@ -1030,6 +1067,7 @@ def create_pattern(
         ge=1, description="Second-direction instances (1 = off)")] = 1,
     spacing2: Annotated[float, Field(
         gt=0, description="Second-direction spacing in METERS")] = 0.01,
+    flip: bool = False,
     axis_name: str = "",
     angle: Annotated[float, Field(
         gt=0, le=360, description="Circular pattern angle in DEGREES")] = 90.0,
@@ -1040,8 +1078,10 @@ def create_pattern(
 ) -> str:
     """Create a linear, circular, or mirror feature pattern.
     pattern_type='linear': repeats feature_name along direction ('X', 'Y', or 'Z') with spacing (meters) and count instances.
-        Optional second direction: count2>1 with spacing2.
+        flip=True patterns toward the NEGATIVE axis (default False = positive).
         Direction maps to default planes: X→Right Plane normal, Y→Top Plane normal, Z→Front Plane normal.
+        KNOWN LIMIT: count2/spacing2 are accepted but the second direction has no D2 entity wired —
+        two-direction grids do NOT work in one call; compose a grid as a pattern OF a pattern instead.
     pattern_type='circular': repeats feature_name around axis_name (reference axis, e.g. 'Axis1') with count instances.
         Create the axis first with add_reference_geometry(type='axis', ...).
         equal_spacing=True (default): angle is the TOTAL spread (use 360 for a full ring); count instances are
@@ -1074,6 +1114,7 @@ def create_pattern(
             "direction": direction,
             "count2": count2,
             "spacing2": spacing2,
+            "flip": flip,
             "axis_name": axis_name,
             "angle": angle,
             "equal_spacing": equal_spacing,
@@ -1142,7 +1183,9 @@ def sheet_metal_feature(
         When rebuilding, reproduce the original's own flag (analyze_model(features) reports it on the
         SMBaseFlange) — the flags also set the intrinsic sheet orientation downstream bends fold against.
         Exits sketch mode automatically.
-    feature_type='edge_flange': adds a DEFAULT-profile flange to an existing sheet metal edge at (ex, ey, ez).
+    feature_type='edge_flange': adds a DEFAULT-profile (full-edge-width) flange to an existing sheet metal
+        edge. Select the edge by edge_index (from analyze_model(edges), PREFERRED — a coordinate pick can
+        miss a real edge) or by a point (ex, ey, ez) on it.
         flange_length: flange length (meters). angle: bend angle in degrees (default 90).
     feature_type='edge_flange_sketch' + 'edge_flange_finish': the CUSTOM-profile edge flange, two calls.
         edge_flange_sketch selects the attach edge — pass edge_index (from analyze_model(edges),
@@ -1277,18 +1320,25 @@ def _recipe_sections():
 
 @mcp.tool()
 def get_recipe(
-    section: Literal["index", "contract", "canonicalization", "mapping", "mapping_part",
-                     "mapping_sheet_metal", "mapping_assembly", "verification", "coverage",
-                     "drawing", "feature_graph_schema", "analysis_artifact_schema"] = "index",
+    section: Literal["index", "contract", "canonicalization", "forward", "mapping",
+                     "mapping_part", "mapping_sheet_metal", "mapping_assembly", "verification",
+                     "reverse", "coverage", "drawing", "feature_graph_schema",
+                     "analysis_artifact_schema"] = "index",
 ) -> str:
     """The IR-generation recipe — REQUIRED READING before writing any Feature Graph IR
-    (an artifact's `ir.graph`) or producing a drawing meant for reconstruction. Serves the
-    rules section-by-section so token cost stays proportional to the task.
+    (an artifact's `ir.graph`), reconstructing a part from a drawing, or producing a drawing
+    meant for reconstruction. Serves the rules section-by-section so token cost stays
+    proportional to the task.
 
-    Call order for the IR flow: 'contract' + 'canonicalization' + 'mapping' first, then the
-    vocabulary section matching the document ('mapping_part' / 'mapping_sheet_metal' /
-    'mapping_assembly'), then 'verification' before labeling anything. 'drawing' holds the
-    model→drawing rules (section coverage, HLV convention, model_path sourcing).
+    Call order for the ARTIFACT→IR flow: 'contract' + 'canonicalization' + 'mapping' first,
+    then the vocabulary section matching the document ('mapping_part' / 'mapping_sheet_metal' /
+    'mapping_assembly'), then 'verification' before labeling anything. 'forward' holds the
+    INTENT→IR authoring discipline (grammar cheat-sheet, anchor design without an original,
+    computed-expectation self-verification) — read it FIRST when writing a graph for
+    submit_feature_graph from design intent. 'drawing' holds the model→drawing rules (section
+    coverage, HLV convention, model_path sourcing). 'reverse' holds the drawing→part
+    reconstruction discipline (dimension-skeleton reading order, section→3D mapping, loft
+    signals, readback discipline) — read it FIRST when rebuilding a part from its drawing.
 
     section='index' (default): the version header + a one-line table of contents.
     section='feature_graph_schema': the Feature Graph IR schema / capability registry JSON —
@@ -1579,7 +1629,7 @@ def rebuild_from_ir(artifact_path: str, fresh_document: bool = True) -> str:
     """Rebuild a part from its analysis artifact's Feature Graph IR — the verification half of
     the round-trip ("the LLM proposes, the round-trip decides", IR-ADR-006). Reads
     `<...>.analysis.json`, takes `ir.graph`, and executes it through the SAME deterministic
-    pycompiler the test tool uses (two doors, ONE compiler — never forked).
+    pycompiler as the forward door submit_feature_graph (two doors, ONE compiler — never forked).
 
     fresh_document (default True): open a NEW blank part first — the normal round-trip flow
         (rebuild fresh, then compare_parts against the original). Pass False only if you have
@@ -1926,76 +1976,81 @@ def compare_assemblies(doc_a: str, doc_b: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# TEST TOOL (disabled): submit_feature_graph — Feature Graph IR + deterministic compiler
+# Tool: submit_feature_graph  (the FORWARD IR door — intent → IR → pycompiler → SolidWorks.
+# Re-enabled GATE-FREE 2026-07-16 for the forward vocabulary effort (IR-ADR-017); the old
+# experimental gates were deleted by IR-ADR-005. Two doors, ONE pycompiler: rebuild_from_ir
+# replays an artifact's stored graph, this tool takes a graph directly — never fork the compiler.)
 # ---------------------------------------------------------------------------
-# The mainline IR path is the analysis pipeline's rebuild_from_ir (logs.md ADR-040, Phase A;
-# logs-ir.md IR-ADR-005). This direct-IR entry point is kept as a DEVELOPMENT/TEST tool only and is
-# commented out so it never appears on the MCP surface (zero token cost). The old experimental
-# gates (SOLIDPILOT_ENABLE_IR env switch + i_understand_this_is_experimental param) were DELETED
-# (IR-ADR-005) — the block below is the simplified, gate-free version.
-#
-# TO RE-ENABLE (3 steps):
-#   1. Uncomment this whole block AND the `from ir_execution_port import run_feature_graph`
-#      import at the top of this file.
-#   2. Re-add the following entry to solidworks-execution/contracts/tool-schemas.json (the
-#      contract test tests/test_schema_contract.py fails otherwise):
-#
-#          "submit_feature_graph": {
-#              "description": "[TEST TOOL — P1.4/P1.7] Feature Graph IR + deterministic compiler path. NOT a COM/execution tool: it has NO ToolController/SolidWorksService case. The adapter's pycompiler (solidworks-compiler/pycompiler) lowers a CAD-neutral Feature Graph IR into ordered calls to the EXISTING low-level tools (create_sketch / add_sketch_entity / extrude_feature / analyze_model) and resolves semantic refs (top_face/center) against live geometry. Coexists with the low-level tools WITHOUT changing them. v0-exp vocabulary: box, sketch+extrude (boss/cut), hole-on-face (selector 'top', position 'center', depth 'through_all'). The adapter resyncs its local state_version from GET /state after a run (one submit performs many state-bumping sub-ops).",
-#              "input": {
-#                  "operation_id": "n/a at this level — each lowered sub-op carries its own operation_id (uuid4) and state_version on /api/tool/execute",
-#                  "state_version": "n/a at this level — the adapter resyncs its local state_version from GET /state after the run",
-#                  "params": {
-#                      "graph": "string (required — JSON Feature Graph IR per cad-planner/contracts/feature-graph.schema.json v0-exp; all lengths in meters)",
-#                      "user_request": "string (optional — the user's request phrase, recorded for the logs)"
-#                  }
-#              },
-#              "output": "Per-node report string: COMPLETED (nodes built) or FAILED (feature-level error + how far it got). Partial geometry may remain on failure (CAD ops are not transactional). Not itself in the state_version/idempotency envelope; its sub-ops are."
-#          }
-#
-#   3. Reconnect the MCP server (no hot-reload — KNOWN-LIMITATIONS #4).
-#
-# def _resync_state_version() -> int:
-#     """Realign the adapter's local state_version with the authoritative GET /state.
-#
-#     A submit_feature_graph run performs MANY execution ops (each bumping state_version) OUTSIDE the
-#     normal _call() path, so afterwards — success OR failure — we resync the local value, or the NEXT
-#     normal tool call would fail INVALID_STATE_VERSION (KNOWN-LIMITATIONS #5)."""
-#     global _state_version
-#     try:
-#         _state_version = get_state()
-#     except Exception:
-#         pass
-#     return _state_version
-#
-#
-# @mcp.tool()
-# def submit_feature_graph(graph: str, user_request: str = "") -> str:
-#     """[TEST TOOL] Build a part from a CAD-neutral Feature Graph IR via the deterministic
-#     compiler (ONE IR -> MANY low-level tool calls).
-#
-#     graph: a JSON-string Feature Graph (see cad-planner/contracts/feature-graph.schema.json,
-#         v0-exp subset). Covered v0 vocabulary: 'box' (rectangular boss), 'sketch'+'extrude'
-#         (boss/cut), and 'hole' on a face with semantic refs (selector 'top', position 'center',
-#         depth 'through_all'). All lengths in METERS. The box is built centred on the datum origin.
-#     user_request: optional — the user's request phrase, recorded for the logs.
-#
-#     Returns a per-node report (COMPLETED, or FAILED with how far it got + a feature-level error).
-#     CAD ops are not transactional: on failure partial geometry may remain (reported, not hidden);
-#     the adapter's state_version is resynced either way so subsequent normal tools keep working."""
-#     # Parse the graph (structural validation happens inside the compiler).
-#     try:
-#         graph_obj = json.loads(graph)
-#     except Exception as ex:
-#         return f"FAILED | INVALID_JSON | the graph is not valid JSON: {ex}"
-#     # Compile + run. NEVER let an exception crash the MCP server; resync state_version regardless.
-#     try:
-#         result = run_feature_graph(graph_obj)
-#     except Exception as ex:
-#         sv = _resync_state_version()
-#         return f"FAILED | UNEXPECTED | {type(ex).__name__}: {ex} | state_version resynced to {sv}"
-#     sv = _resync_state_version()  # first-class resync, success OR failure
-#     return result.summary() + f" | state_version={sv}"
+def _resync_state_version() -> int:
+    """Realign the adapter's local state_version with the authoritative GET /state.
+
+    A submit_feature_graph run performs MANY execution ops (each bumping state_version) OUTSIDE the
+    normal _call() path, so afterwards — success OR failure — we resync the local value, or the NEXT
+    normal tool call would fail INVALID_STATE_VERSION (KNOWN-LIMITATIONS #5)."""
+    global _state_version
+    try:
+        _state_version = get_state()
+    except Exception:  # noqa: BLE001
+        pass
+    return _state_version
+
+
+@mcp.tool()
+def submit_feature_graph(graph: str, fresh_document: bool = True) -> str:
+    """Build a part (or assembly) from a Feature Graph IR in ONE call — the deterministic
+    compiler lowers each IR node to the right low-level tool sequence and resolves references
+    (geometric anchors, runtime feature names) against live geometry.
+
+    graph: the Feature Graph as a JSON STRING. Authoring from DESIGN INTENT: read
+        get_recipe('forward') FIRST (grammar, anchor design, self-verification), plus
+        get_recipe(section='feature_graph_schema') — the schema IS the capability registry.
+        Replaying an ANALYZED part instead: get_recipe('canonicalization') + 'mapping_part'
+        ('mapping_sheet_metal' for sheet metal, 'mapping_assembly' for assemblies).
+        Essentials: units METERS, angles RADIANS (the compiler converts at tool boundaries);
+        nodes build in array order (tree order is law); extrude/revolve/rib/sweep/sheet_metal/
+        sketched_bend consume the IMMEDIATELY preceding sketch node; loft profiles, a sweep's
+        path, pattern seeds and mirror features reference EARLIER nodes by id; an optional
+        graph-level material {name, library?} applies after the last node.
+    fresh_document (default True): open a new blank document first — part graphs a part,
+        assembly graphs (component/mate nodes) an assembly. Pass False to build into the
+        CURRENT active document instead.
+
+    Returns the compiler's per-node report: COMPLETED n/n, or FAILED with a feature-level error
+    and how far it got. CAD ops are NOT transactional — on failure partial geometry remains
+    (reported, never hidden). The adapter resyncs state_version after every run, so subsequent
+    normal tools keep working. Verify the result objectively (analyze_model / compare_parts) —
+    never assume."""
+    try:
+        graph_obj = json.loads(graph)
+    except Exception as ex:  # noqa: BLE001
+        return f"FAILED | INVALID_JSON | the graph is not valid JSON: {ex}"
+
+    if fresh_document:
+        # The graph type picks the document (mirrors rebuild_from_ir; two doors, one compiler).
+        nodes = graph_obj.get("nodes") or [] if isinstance(graph_obj, dict) else []
+        is_assembly_graph = any(isinstance(n, dict) and n.get("type") in ("component", "mate")
+                                for n in nodes)
+        new_tool = "open_new_assembly" if is_assembly_graph else "open_new_part"
+        opened = _call_raw(new_tool, {})
+        if opened.get("status") != "COMPLETED":
+            err = opened.get("error") or {}
+            return f"FAILED | {new_tool.upper()}_FAILED | {err.get('code')}: {err.get('message')}"
+
+    # Lazy import (mirrors rebuild_from_ir): a missing compiler tree degrades to a clean tool
+    # error instead of killing the whole MCP server at startup.
+    try:
+        from ir_execution_port import run_feature_graph
+    except Exception as ex:  # noqa: BLE001
+        return f"FAILED | COMPILER_UNAVAILABLE | {ex}"
+
+    # NEVER let an exception crash the MCP server; resync state_version regardless (IR-ADR-001).
+    try:
+        result = run_feature_graph(graph_obj)
+    except Exception as ex:  # noqa: BLE001
+        sv = _resync_state_version()
+        return f"FAILED | UNEXPECTED | {type(ex).__name__}: {ex} | state_version resynced to {sv}"
+    sv = _resync_state_version()  # first-class resync, success OR failure
+    return result.summary() + f" | state_version={sv}"
 
 
 # ---------------------------------------------------------------------------

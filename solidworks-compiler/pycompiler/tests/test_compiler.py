@@ -1132,6 +1132,286 @@ def test_assembly_anchor_unresolved_and_gap_kinds():
     assert "gap" in r2.error["message"]
 
 
+# ---------------------------------------------------------------------------
+# v0.7 forward vocabulary (sweep / linear_pattern / ellipse+spline / material /
+# edge_flange length mode — IR-ADR-017, full part-tool-surface coverage)
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_lowering_and_path_name_substitution():
+    # A swept tube: path sketch FIRST (open L-chain), profile sketch LAST (it stays active — the
+    # tool consumes it), then the sweep. The path is selected BY NAME: the compiler substitutes
+    # the path node's RUNTIME sketch name (localized fake port), never the IR id.
+    g = {
+        "schema_version": "0.7.0-draft", "units": "meters",
+        "nodes": [
+            {"id": "p1", "type": "sketch", "ref": {"datum": "front"},
+             "profile": [{"kind": "line", "x1": 0.0, "y1": 0.0, "x2": 0.05, "y2": 0.0},
+                         {"kind": "line", "x1": 0.05, "y1": 0.0, "x2": 0.05, "y2": 0.04}]},
+            {"id": "s1", "type": "sketch", "ref": {"datum": "right"},
+             "profile": [{"kind": "circle", "diameter": 0.008}]},
+            {"id": "sw1", "type": "sweep", "sketch": "s1", "path": "p1"},
+        ],
+    }
+    port = FakePort()
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()
+    sweep = port.calls[-1]
+    assert sweep[0] == "extrude_feature" and sweep[1]["feature_type"] == "sweep"
+    # The PATH sketch was the FIRST create_sketch (sv=1 -> 'Çizim1'); the profile is the ACTIVE
+    # sketch, so nothing else is passed.
+    assert sweep[1]["path_sketch"] == "Çizim1"
+    assert set(sweep[1]) == {"feature_type", "path_sketch"}
+
+
+def test_sweep_validation_rejections():
+    # Profile not immediately preceding; path == profile; path referencing a non-sketch node;
+    # unknown path id — all rejected at plan time, zero execution.
+    path = {"id": "p1", "type": "sketch", "ref": {"datum": "front"},
+            "profile": [{"kind": "line", "x1": 0, "y1": 0, "x2": 0.05, "y2": 0}]}
+    prof = {"id": "s1", "type": "sketch", "ref": {"datum": "right"},
+            "profile": [{"kind": "circle", "diameter": 0.008}]}
+    box = {"id": "b1", "type": "box", "width": 0.01, "depth": 0.01, "height": 0.01}
+    bads = [
+        [path, prof, box, {"id": "sw1", "type": "sweep", "sketch": "s1", "path": "p1"}],
+        [path, prof, {"id": "sw1", "type": "sweep", "sketch": "s1", "path": "s1"}],
+        [box, prof, {"id": "sw1", "type": "sweep", "sketch": "s1", "path": "b1"}],
+        [prof, {"id": "sw1", "type": "sweep", "sketch": "s1", "path": "p9"}],
+    ]
+    for nodes in bads:
+        port = FakePort()
+        r = compile_and_run(port, {"schema_version": "0.7.0-draft", "units": "meters", "nodes": nodes})
+        assert r.status == "FAILED" and r.error["code"] == "VALIDATION_FAILED", r.to_dict()
+        assert port.calls == []
+
+
+def test_linear_pattern_lowering_flip_and_grid():
+    # A plate hole patterned 4x along X, then a GRID composed as a pattern OF the pattern (the
+    # D2-less tool's composition idiom — linear_pattern is itself a FEATURE_PRODUCER). Seed
+    # names substitute per node_feature; 'flip' is emitted only when set.
+    g = {
+        "schema_version": "0.7.0-draft", "units": "meters",
+        "nodes": [
+            {"id": "b1", "type": "box", "width": 0.1, "depth": 0.06, "height": 0.005},
+            {"id": "s2", "type": "sketch", "ref": {"datum": "top", "offset": 0.005},
+             "profile": [{"kind": "circle", "diameter": 0.006, "cx": -0.04, "cy": -0.02}]},
+            {"id": "e2", "type": "extrude", "sketch": "s2", "operation": "cut", "end": "through_all"},
+            {"id": "lp1", "type": "linear_pattern", "feature": "e2", "direction": "x",
+             "spacing": 0.015, "count": 4},
+            {"id": "lp2", "type": "linear_pattern", "feature": "lp1", "direction": "z",
+             "spacing": 0.02, "count": 2, "flip": True},
+        ],
+    }
+    port = FakePort()
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()
+    pats = [p for (t, p) in port.calls if t == "create_pattern"]
+    assert len(pats) == 2
+    p1, p2 = pats
+    assert p1["pattern_type"] == "linear" and p1["direction"] == "X"
+    assert p1["spacing"] == 0.015 and p1["count"] == 4 and "flip" not in p1
+    assert p1["feature_name"].startswith("Ekstrüzyon")   # the cut's runtime name
+    assert p2["direction"] == "Z" and p2["flip"] is True
+    assert p2["feature_name"].startswith("DairPatern")   # the FIRST pattern's runtime name
+
+
+def test_linear_pattern_validation_rejections():
+    # Bad direction; non-positive spacing; count < 2; seeding on a non-feature-producer (a bare
+    # sketch) — all rejected at plan time, zero execution.
+    box = {"id": "b1", "type": "box", "width": 0.05, "depth": 0.05, "height": 0.01}
+    sk = {"id": "s1", "type": "sketch", "ref": {"datum": "front"},
+          "profile": [{"kind": "circle", "diameter": 0.02}]}
+    bads = [
+        [box, {"id": "lp1", "type": "linear_pattern", "feature": "b1", "direction": "w",
+               "spacing": 0.01, "count": 3}],
+        [box, {"id": "lp1", "type": "linear_pattern", "feature": "b1", "direction": "x",
+               "spacing": 0.0, "count": 3}],
+        [box, {"id": "lp1", "type": "linear_pattern", "feature": "b1", "direction": "x",
+               "spacing": 0.01, "count": 1}],
+        [sk, {"id": "lp1", "type": "linear_pattern", "feature": "s1", "direction": "x",
+              "spacing": 0.01, "count": 3}],
+    ]
+    for nodes in bads:
+        port = FakePort()
+        r = compile_and_run(port, {"schema_version": "0.7.0-draft", "units": "meters", "nodes": nodes})
+        assert r.status == "FAILED" and r.error["code"] == "VALIDATION_FAILED", r.to_dict()
+        assert port.calls == []
+
+
+def test_ellipse_and_spline_profile_params():
+    # Reader-shaped primitives pass through verbatim: ellipse = centre + major/minor points;
+    # spline = flat through-points as a REAL array (the C# case reads a JArray — the MCP adapter
+    # pre-parses its string param, and the IR door posts directly; live-caught 2026-07-16).
+    g = {
+        "schema_version": "0.7.0-draft", "units": "meters",
+        "nodes": [
+            {"id": "s1", "type": "sketch", "ref": {"datum": "top"},
+             "profile": [
+                 {"kind": "ellipse", "cx": 0.0, "cy": 0.0, "x1": 0.02, "y1": 0.0,
+                  "x2": 0.0, "y2": 0.01},
+                 {"kind": "spline", "points": [-0.02, 0.0, -0.01, 0.005, 0.0, 0.0],
+                  "construction": True},
+             ]},
+            {"id": "e1", "type": "extrude", "sketch": "s1", "operation": "boss", "depth": 0.01},
+        ],
+    }
+    port = FakePort()
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()
+    ell = port.calls[1][1]
+    assert ell == {"entity_type": "ellipse", "cx": 0.0, "cy": 0.0,
+                   "x1": 0.02, "y1": 0.0, "x2": 0.0, "y2": 0.01}
+    spl = port.calls[2][1]
+    assert spl["entity_type"] == "spline" and spl["construction"] is True
+    assert spl["points"] == [-0.02, 0.0, -0.01, 0.005, 0.0, 0.0]  # a real list, not a JSON string
+
+
+def test_ellipse_spline_frame_transform_mirror():
+    # A mirrored measured frame (v -> -v): the spline's flat points remap PAIRWISE through the
+    # same affine (no extra flip — the points define the curve); the ellipse rides the standard
+    # coordinate pairs (centre + major + minor all map).
+    declared = {"origin": [0.0, 0.0, 0.0], "xdir": [1.0, 0.0, 0.0], "ydir": [0.0, 0.0, 1.0]}
+    measured = {"origin": [0.0, 0.0, 0.0], "xdir": [1.0, 0.0, 0.0], "ydir": [0.0, 0.0, -1.0]}
+    g = {
+        "schema_version": "0.7.0-draft", "units": "meters",
+        "nodes": [
+            {"id": "s1", "type": "sketch", "ref": {"datum": "top"}, "frame": declared,
+             "profile": [
+                 {"kind": "spline", "points": [0.0, 0.01, 0.01, 0.02, 0.02, 0.01]},
+                 {"kind": "ellipse", "cx": 0.0, "cy": 0.005, "x1": 0.02, "y1": 0.005,
+                  "x2": 0.0, "y2": 0.008},
+             ]},
+            {"id": "e1", "type": "extrude", "sketch": "s1", "operation": "boss", "depth": 0.01},
+        ],
+    }
+    port = FakePort(sketch_frame=measured)
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()
+    spl = next(p for (t, p) in port.calls if p.get("entity_type") == "spline")
+    assert spl["points"] == [0.0, -0.01, 0.01, -0.02, 0.02, -0.01]
+    ell = next(p for (t, p) in port.calls if p.get("entity_type") == "ellipse")
+    assert (ell["cy"], ell["y1"], ell["y2"]) == (-0.005, -0.005, -0.008)
+
+
+def test_material_applied_after_last_node():
+    # Graph-level material -> ONE set_part_material AFTER the geometry (document state, not a
+    # tree feature); logged as the synthetic node '_material'; library passes through when given.
+    g = {
+        "schema_version": "0.7.0-draft", "units": "meters",
+        "material": {"name": "1060 Alloy"},
+        "nodes": [
+            {"id": "b1", "type": "box", "width": 0.05, "depth": 0.05, "height": 0.01},
+        ],
+    }
+    port = FakePort()
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()
+    last = port.calls[-1]
+    assert last[0] == "set_part_material"
+    assert last[1] == {"material_name": "1060 Alloy"}     # library omitted -> tool default
+    assert r.node_log[-1]["id"] == "_material" and r.node_log[-1]["status"] == "COMPLETED"
+    assert r.exec_calls == 4   # sketch + rectangle + boss + material
+    g2 = json.loads(json.dumps(g))
+    g2["material"] = {"name": "AISI 1020", "library": "SolidWorks Materials"}
+    port2 = FakePort()
+    compile_and_run(port2, g2)
+    assert port2.calls[-1][1] == {"material_name": "AISI 1020", "library": "SolidWorks Materials"}
+
+
+def test_material_failure_and_validation():
+    # A failing set_part_material is a loud, clean FAILED on the synthetic node (the geometry
+    # itself completed); assembly graphs and empty names are rejected at plan time.
+    g = {
+        "schema_version": "0.7.0-draft", "units": "meters",
+        "material": {"name": "Unobtainium"},
+        "nodes": [{"id": "b1", "type": "box", "width": 0.05, "depth": 0.05, "height": 0.01}],
+    }
+    port = FakePort(fail_on=("set_part_material", 1))
+    r = compile_and_run(port, g)
+    assert r.status == "FAILED" and r.error["node_id"] == "_material"
+    assert r.nodes_completed == 1
+    bads = [
+        {"schema_version": "0.7.0-draft", "units": "meters", "material": {"name": "1060 Alloy"},
+         "nodes": [{"id": "c1", "type": "component",
+                    "source": {"path": "C:\\p\\Body.SLDPRT"}, "transform": _IDENTITY}]},
+        {"schema_version": "0.7.0-draft", "units": "meters", "material": {"name": ""},
+         "nodes": [{"id": "b1", "type": "box", "width": 0.05, "depth": 0.05, "height": 0.01}]},
+    ]
+    for bad in bads:
+        port = FakePort()
+        r = compile_and_run(port, bad)
+        assert r.status == "FAILED" and r.error["code"] == "VALIDATION_FAILED", r.to_dict()
+        assert port.calls == []
+
+
+def test_edge_flange_length_mode_single_call():
+    # MODE B (the forward mode): `length` instead of frame+profile -> ONE simple edge_flange
+    # call with the anchor-resolved edge INDEX (v0.7.0 C# extension) — never the fragile
+    # coordinate pick (KNOWN-LIMITATIONS #6).
+    g = {
+        "schema_version": "0.7.0-draft", "units": "meters",
+        "nodes": [
+            {"id": "s1", "type": "sketch", "ref": {"datum": "top"},
+             "profile": [{"kind": "rectangle", "width": 0.1, "height": 0.06}]},
+            {"id": "sm1", "type": "sheet_metal", "sketch": "s1", "thickness": 0.002},
+            {"id": "ef1", "type": "edge_flange",
+             "edge": {"near": [-0.208219, 0.236714, -0.15089], "hint": "left top edge"},
+             "angle": 1.570796, "length": 0.02},
+        ],
+    }
+    port = FakePort(edges=_EF_EDGES)
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()
+    assert _tools(port) == ["create_sketch", "add_sketch_entity", "sheet_metal_feature",
+                            "analyze_model", "sheet_metal_feature"]
+    ef = port.calls[-1][1]
+    assert ef["feature_type"] == "edge_flange" and ef["edge_index"] == 170
+    assert ef["flange_length"] == 0.02 and abs(ef["angle"] - 90.0) < 1e-4
+    assert "ex" not in ef
+
+
+def test_edge_flange_length_mode_validation():
+    # length XOR frame/profile; no position/radius/flip overrides in length mode; length > 0.
+    ident = {"origin": [0, 0, 0], "xdir": [1, 0, 0], "ydir": [0, 1, 0]}
+    prof = [{"kind": "line", "x1": 0, "y1": 0, "x2": 0.1, "y2": 0}]
+    base = [{"id": "s1", "type": "sketch", "ref": {"datum": "top"},
+             "profile": [{"kind": "rectangle", "width": 0.1, "height": 0.06}]},
+            {"id": "sm1", "type": "sheet_metal", "sketch": "s1", "thickness": 0.002}]
+    bads = [
+        base + [{"id": "ef1", "type": "edge_flange", "edge": {"near": [0, 0, 0]},
+                 "length": 0.02, "frame": ident, "profile": prof}],
+        base + [{"id": "ef1", "type": "edge_flange", "edge": {"near": [0, 0, 0]},
+                 "length": 0.02, "position": "bend_outside"}],
+        base + [{"id": "ef1", "type": "edge_flange", "edge": {"near": [0, 0, 0]},
+                 "length": 0.02, "radius": 0.003}],
+        base + [{"id": "ef1", "type": "edge_flange", "edge": {"near": [0, 0, 0]}, "length": 0}],
+    ]
+    for nodes in bads:
+        port = FakePort()
+        r = compile_and_run(port, {"schema_version": "0.7.0-draft", "units": "meters", "nodes": nodes})
+        assert r.status == "FAILED" and r.error["code"] == "VALIDATION_FAILED", r.to_dict()
+        assert port.calls == []
+
+
+def test_rib_reverse_thickness_dir_passthrough():
+    # Single-sided rib thickening the opposite side of the sketch normal (tool-surface
+    # completeness, v0.7.0) — both flags pass through only when set.
+    g = {
+        "schema_version": "0.7.0-draft", "units": "meters",
+        "nodes": [
+            {"id": "s1", "type": "sketch", "ref": {"datum": "right"},
+             "profile": [{"kind": "line", "x1": 0.03, "y1": 0.005, "x2": 0.005, "y2": 0.03}]},
+            {"id": "r1", "type": "rib", "sketch": "s1", "thickness": 0.005,
+             "two_sided": False, "reverse_thickness_dir": True},
+        ],
+    }
+    port = FakePort()
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()
+    rib = port.calls[-1][1]
+    assert rib == {"thickness": 0.005, "two_sided": False, "reverse_thickness_dir": True}
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 

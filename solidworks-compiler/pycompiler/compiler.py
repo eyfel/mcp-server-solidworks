@@ -148,6 +148,36 @@ def compile_and_run(port, graph):
             result.final_state_version = sv
             return result
 
+    # 4) Graph-level material (v0.7.0) — document state, applied AFTER the geometry so a
+    # material failure never aborts the build mid-tree. Part graphs only (validation enforced).
+    material = graph.get("material")
+    if material is not None:
+        rec = {"id": "_material", "type": "material", "status": "PENDING", "ops": []}
+        try:
+            for op in lowering.lower_material(material):
+                resp = port.execute(op.tool, op.params, sv)
+                result.exec_calls += 1
+                sv = _advance(resp, sv, "_material", "material", op)
+                rec["ops"].append({"tool": op.tool, "note": op.note, "state_version": sv})
+            rec["status"] = "COMPLETED"
+            result.node_log.append(rec)
+        except FeatureError as fe:
+            rec["status"] = "FAILED"
+            result.node_log.append(rec)
+            result.status = "FAILED"
+            result.error = {"code": fe.code, "message": fe.message,
+                            "node_id": "_material", "node_type": "material", "step": fe.step}
+            result.final_state_version = sv
+            return result
+        except Exception as ex:  # never let a bug crash the host
+            rec["status"] = "FAILED"
+            result.node_log.append(rec)
+            result.status = "FAILED"
+            result.error = {"code": "NODE_UNEXPECTED", "message": str(ex),
+                            "node_id": "_material", "node_type": "material"}
+            result.final_state_version = sv
+            return result
+
     result.final_state_version = sv
     return result
 
@@ -184,8 +214,14 @@ def _plan_node(port, node, state_version, node_features):
         return lowering.lower_extrude(node)
     if ntype == "revolve":
         return lowering.lower_revolve(node)
+    if ntype == "sweep":
+        # The PROFILE is the active sketch (immediately preceding node); the PATH sketch's
+        # runtime name flows via the node_feature sentinel (filled at execute time).
+        return lowering.lower_sweep(node)
     if ntype == "rib":
         return lowering.lower_rib(node)
+    if ntype == "linear_pattern":
+        return lowering.lower_linear_pattern(node)
     if ntype == "circular_pattern":
         return lowering.lower_circular_pattern(node)
     if ntype == "hole":
@@ -334,11 +370,21 @@ _ENTITY_COORD_PAIRS = (("x1", "y1"), ("x2", "y2"), ("xm", "ym"), ("cx", "cy"), (
 
 def _transform_entity_params(params, frame_fn, mirrored):
     """Apply the sketch-frame transform to an add_sketch_entity op's 2D coordinates.
-    A mirror also flips arc_center's sweep sense (direction) — radii/distances are invariant."""
+    A mirror also flips arc_center's sweep sense (direction) — radii/distances are invariant.
+    Ellipse rides the coordinate pairs (centre + major/minor points all map); a spline's flat
+    through-point JSON string is parsed, mapped pairwise and re-dumped (the points themselves
+    define the curve, so a mirror needs no extra flip there)."""
     out = dict(params)
     for kx, ky in _ENTITY_COORD_PAIRS:
         if kx in out and ky in out:
             out[kx], out[ky] = frame_fn(out[kx], out[ky])
+    if out.get("entity_type") == "spline" and "points" in out:
+        flat = out["points"]  # a REAL flat number list (see lowering's spline note)
+        moved = []
+        for i in range(0, len(flat) - 1, 2):
+            u, v = frame_fn(flat[i], flat[i + 1])
+            moved.extend((u, v))
+        out["points"] = moved
     if mirrored and out.get("entity_type") == "arc_center" and "direction" in out:
         out["direction"] = -out["direction"]
     return out

@@ -79,7 +79,7 @@ python server.py
 2. Add its lowering rule and any required reference resolution in `solidworks-compiler`.
 3. It reuses existing low-level tools; usually no new execution tool is needed.
 
-> **The two IR doors:** the mainline IR entry point is the `rebuild_from_ir` tool (rebuilds a part/assembly from its analysis artifact's IR block). A second, direct-IR **test tool** — `submit_feature_graph` — is kept fully **commented out** in `adapters/claude/server.py` (zero MCP token cost); its comment block contains self-contained re-enable instructions. Both doors run through the same `pycompiler` — never fork the compiler.
+> **The two IR doors:** `rebuild_from_ir` is the **reverse** door (rebuilds a part/assembly from its analysis artifact's IR block — the round-trip that verifies an LLM-proposed IR). `submit_feature_graph` is the **forward** door (builds from a Feature Graph the model supplies directly, from design intent, with no original to copy); it is **live and gate-free**. Both doors run through the same `pycompiler` — **never fork the compiler**. Note the different failure surface: the reverse door can warn `source_stale` because it has an artifact hash to check, whereas the forward door takes a raw graph and has nothing to compare against — so a forward run must self-verify by computing its expected outcome (see `get_recipe('forward')`).
 
 ---
 

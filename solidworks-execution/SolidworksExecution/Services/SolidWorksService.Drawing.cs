@@ -627,13 +627,25 @@ namespace SolidworksExecution.Services
                     {
                         var dj = new JObject();
                         dj["name"] = dim.FullName;
+                        // value_si must be SI (meters/radians) for EVERY dim. GetSystemValue3(swThisConfiguration)
+                        // is correct for MODEL dims shown in the drawing, but for reference dims CREATED in the
+                        // drawing (RD*@Drawing View…) it resolves no configuration and the value falls through in
+                        // DOCUMENT units (live on level-2-2: RD4 read 125.864691 "meters" = the 125.86 mm block
+                        // width). SystemValue is the configuration-independent SI accessor (the same one
+                        // modify_dimension writes through) — prefer it here; drawings have no configurations, so
+                        // nothing is lost. GetSystemValue3 stays as the fallback, raw Value as the last resort.
                         double val = dim.Value;
-                        try
+                        bool gotSi = false;
+                        try { val = dim.SystemValue; gotSi = true; } catch { }
+                        if (!gotSi)
                         {
-                            var sv = dim.GetSystemValue3(1, null) as double[]; // 1 = swThisConfiguration (inlined)
-                            if (sv != null && sv.Length > 0) val = sv[0];
+                            try
+                            {
+                                var sv = dim.GetSystemValue3(1, null) as double[]; // 1 = swThisConfiguration (inlined)
+                                if (sv != null && sv.Length > 0) val = sv[0];
+                            }
+                            catch { }
                         }
-                        catch { }
                         dj["value_si"] = R6(val);
 
                         // --- Ø flag (the reliable dimension-kind signal) ---
@@ -831,24 +843,57 @@ namespace SolidworksExecution.Services
                 if (d != null && d.Length >= 12)
                 {
                     // Same column reading as ReadSketchPlane: normal = mapped view-Z (d[2],d[5],d[8]);
-                    // in-plane axes xdir = d[0..2], ydir = d[3..5]; origin (view 0,0,0 → model) = d[9..11].
+                    // in-plane axes xdir = d[0..2], ydir = d[3..5].
                     double nx = d[2], ny = d[5], nz = d[8];
                     double nlen = Math.Sqrt(nx * nx + ny * ny + nz * nz);
                     if (nlen > 1e-9) { nx /= nlen; ny /= nlen; nz /= nlen; }
                     sj["cut_normal"] = new JArray { R6(nx), R6(ny), R6(nz) };
                     string ax = PrincipalAxis(nx, ny, nz);
                     if (ax != null) sj["axis"] = ax;
-                    sj["frame"] = new JObject
-                    {
-                        ["origin"] = new JArray { R6(d[9]), R6(d[10]), R6(d[11]) },
-                        ["xdir"] = new JArray { R6(d[0]), R6(d[1]), R6(d[2]) },
-                        ["ydir"] = new JArray { R6(d[3]), R6(d[4]), R6(d[5]) },
-                    };
                 }
+                // Frame origin: the raw v2m translation (view 0,0,0 → model) is NOT the reference the
+                // view's projected geometry uses (live on level-2-2 Section C-C it landed half a meter
+                // off the part), so the frame is computed by ViewModelFrame — origin = the model-space
+                // point of the view geometry's (0,0) — and shared with the geometry read.
+                var fr = ViewModelFrame(view);
+                if (fr != null) sj["frame"] = fr;
             }
             catch { }
 
             return sj.Count > 0 ? sj : null;
+        }
+
+        // The model-space frame of a drawing view's PROJECTED 2D geometry: p_model = origin + u*xdir +
+        // v*ydir for a (u,v) from ReadViewGeometry (model-scale meters, centered on the view anchor).
+        // xdir/ydir = the view→model rotation columns (same column convention as ReadSketchPlane, proven
+        // on the section axis classification). origin = the view's sheet-space anchor (IView.Position)
+        // mapped through the view→model transform via IMathUtility (MultiplyTransform applies the
+        // transform's scale component, so the 1:viewscale sheet→model scaling is handled) — the raw v2m
+        // translation is the model point of SHEET (0,0), not of the view anchor, which is why it read
+        // half a meter off the part. Verified live on level-2-2 (block corners / bore heights map exactly).
+        private JObject ViewModelFrame(IView view)
+        {
+            try
+            {
+                var m2v = view.ModelToViewTransform;
+                var v2m = m2v != null ? m2v.IInverse() : null;
+                double[] d = v2m != null ? v2m.ArrayData as double[] : null;
+                if (d == null || d.Length < 12) return null;
+                var pos = view.Position as double[];
+                if (pos == null || pos.Length < 2) return null;
+                var mu = _solidWorks.GetMathUtility() as IMathUtility;
+                var pt = mu != null ? mu.CreatePoint(new double[] { pos[0], pos[1], 0.0 }) as IMathPoint : null;
+                var mapped = pt != null ? pt.MultiplyTransform(v2m) as IMathPoint : null;
+                double[] o = mapped != null ? mapped.ArrayData as double[] : null;
+                if (o == null || o.Length < 3) return null;
+                return new JObject
+                {
+                    ["origin"] = new JArray { R6(o[0]), R6(o[1]), R6(o[2]) },
+                    ["xdir"] = new JArray { R6(d[0]), R6(d[1]), R6(d[2]) },
+                    ["ydir"] = new JArray { R6(d[3]), R6(d[4]), R6(d[5]) },
+                };
+            }
+            catch { return null; }
         }
 
         // Read a drawing view's PROJECTED 2D geometry as clean primitives — the "clean shape" needed to
@@ -892,10 +937,17 @@ namespace SolidworksExecution.Services
                 else i++;
             }
 
-            // Curves: tolerant walk for N>=3 point-runs (tessellated arcs/circles) -> start/mid/end.
+            // Curves: tolerant walk for N>=3 point-runs (tessellated arcs/circles). Every run gets a
+            // fitted CENTER + RADIUS (circumcenter of three spread tessellation points — exact for any
+            // circular arc, independent of tessellation uniformity). A CLOSED run (start == end) is a
+            // FULL CIRCLE and is emitted into `circles` as {cx, cy, r} — explicit, so a reader never has
+            // to decode the "x1=+r, xm=-r" start/mid/end pattern (the Sonnet benchmark read that pattern
+            // as "the tool doesn't report centers" and mis-placed every bore). Open runs stay in `curves`
+            // as {n, start, mid, end} + {cx, cy, r}.
             // Points are (x, y, depth); require all points in a run to share one depth (planar) — this is
             // the validity filter (a header's stray values are not consistently planar).
             var curves = new JArray();
+            var circles = new JArray();
             for (int j = 0; j < nlen - 1;)
             {
                 int N = -1, basep = -1;
@@ -916,19 +968,56 @@ namespace SolidworksExecution.Services
                 }
                 if (basep < 0) { j++; continue; }
                 int mid = N / 2;
-                var cj = new JObject();
-                cj["n"] = N;
-                cj["x1"] = R6(arr[basep]); cj["y1"] = R6(arr[basep + 1]);
-                cj["xm"] = R6(arr[basep + 3 * mid]); cj["ym"] = R6(arr[basep + 3 * mid + 1]);
-                cj["x2"] = R6(arr[basep + 3 * (N - 1)]); cj["y2"] = R6(arr[basep + 3 * (N - 1) + 1]);
-                curves.Add(cj);
+                double sx = arr[basep], sy = arr[basep + 1];
+                double ex = arr[basep + 3 * (N - 1)], ey = arr[basep + 3 * (N - 1) + 1];
+                // Center fit from three spread points (0, N/3, 2N/3) — for a closed run the endpoints
+                // coincide, so start/mid/end would be only two distinct points; the spread triple is
+                // always three distinct points on the arc.
+                int i1 = N / 3, i2 = (2 * N) / 3;
+                double[] cc = Circumcenter(
+                    sx, sy,
+                    arr[basep + 3 * i1], arr[basep + 3 * i1 + 1],
+                    arr[basep + 3 * i2], arr[basep + 3 * i2 + 1]);
+                bool closed = Math.Abs(sx - ex) < 1e-6 && Math.Abs(sy - ey) < 1e-6;
+                if (closed && cc != null)
+                {
+                    circles.Add(new JObject { ["cx"] = R6(cc[0]), ["cy"] = R6(cc[1]), ["r"] = R6(cc[2]) });
+                }
+                else
+                {
+                    var cj = new JObject();
+                    cj["n"] = N;
+                    cj["x1"] = R6(sx); cj["y1"] = R6(sy);
+                    cj["xm"] = R6(arr[basep + 3 * mid]); cj["ym"] = R6(arr[basep + 3 * mid + 1]);
+                    cj["x2"] = R6(ex); cj["y2"] = R6(ey);
+                    if (cc != null) { cj["cx"] = R6(cc[0]); cj["cy"] = R6(cc[1]); cj["r"] = R6(cc[2]); }
+                    curves.Add(cj);
+                }
                 j = basep + 3 * N;
             }
 
             g["lines"] = lines;
             g["curves"] = curves;
-            g["frame"] = "model-scale meters (x,y in the view plane), centered on view centroid";
+            g["circles"] = circles;
+            // Model-space frame: p_model = origin + x*xdir + y*ydir for every coordinate above (and for
+            // the circle centers) — the deterministic view-2D → model-3D mapping. Falls back to the
+            // legacy prose note when the view exposes no transform (e.g. the sheet container).
+            var vfr = ViewModelFrame(view);
+            if (vfr != null) g["frame"] = vfr;
+            else g["frame"] = "model-scale meters (x,y in the view plane), centered on view centroid";
             return g;
+        }
+
+        // Circumcenter + radius of the circle through three 2D points; null when degenerate (collinear).
+        private static double[] Circumcenter(double ax, double ay, double bx, double by, double cx, double cy)
+        {
+            double dd = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+            if (Math.Abs(dd) < 1e-12) return null;
+            double a2 = ax * ax + ay * ay, b2 = bx * bx + by * by, c2 = cx * cx + cy * cy;
+            double ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / dd;
+            double uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / dd;
+            double r = Math.Sqrt((ux - ax) * (ux - ax) + (uy - ay) * (uy - ay));
+            return new double[] { ux, uy, r };
         }
 
         private static bool Z(double v) { return Math.Abs(v) < 1e-6; }

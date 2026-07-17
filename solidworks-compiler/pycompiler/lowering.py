@@ -138,6 +138,25 @@ def _profile_op(prim):
         if construction:
             params["construction"] = True
         return Op("add_sketch_entity", params, "construction arc" if construction else "arc")
+    if kind == "ellipse":
+        # Centre + major-axis point + minor-axis point — the reader's exact shape, verbatim.
+        params = {"entity_type": "ellipse",
+                  "cx": float(prim["cx"]), "cy": float(prim["cy"]),
+                  "x1": float(prim["x1"]), "y1": float(prim["y1"]),
+                  "x2": float(prim["x2"]), "y2": float(prim["y2"])}
+        if construction:
+            params["construction"] = True
+        return Op("add_sketch_entity", params, "construction ellipse" if construction else "ellipse")
+    if kind == "spline":
+        # Flat through-points as a REAL JSON array. UNLIKE edge_indices/profiles/features_json
+        # (JSON-string params parsed C#-side), the C# spline case reads `points` as a JArray —
+        # the MCP adapter pre-parses its string param before POSTing, and the IR door posts
+        # straight to /api/tool/execute, so it must send the parsed form (live-caught 2026-07-16).
+        params = {"entity_type": "spline",
+                  "points": [float(v) for v in prim["points"]]}
+        if construction:
+            params["construction"] = True
+        return Op("add_sketch_entity", params, "construction spline" if construction else "spline")
     raise ValueError("unsupported profile kind %r (ir_schema should have rejected it)" % kind)
 
 
@@ -177,11 +196,55 @@ def lower_rib(node):
     params = {"thickness": float(node["thickness"])}
     if node.get("two_sided") is False:
         params["two_sided"] = False
+    if node.get("reverse_thickness_dir") is True:
+        # Single-sided ribs only (two_sided=false): thicken the opposite side of the sketch
+        # normal. Passthrough added v0.7.0 for tool-surface completeness.
+        params["reverse_thickness_dir"] = True
     if node.get("reverse_material_dir") is True:
         params["reverse_material_dir"] = True
     if node.get("is_norm_to_sketch") is True:
         params["is_norm_to_sketch"] = True
     return [Op("create_rib", params, "rib t=%g" % float(node["thickness"]))]
+
+
+def lower_sweep(node):
+    """sweep -> ONE extrude_feature(sweep). The PROFILE is the ACTIVE sketch (the immediately
+    preceding sketch node — the tool captures its name and exits it, like extrude); the PATH
+    sketch is selected BY NAME, so `path_sketch` carries the node_feature sentinel and the
+    compiler substitutes the path node's RUNTIME sketch name (recorded from create_sketch's
+    activeSketch — localization/numbering-proof, same principle as loft's profiles).
+    Boss-only: the execution surface has no sweep cut."""
+    return [Op("extrude_feature",
+               {"feature_type": "sweep", "path_sketch": node_feature(node["path"])},
+               "sweep along path node %s" % node["path"])]
+
+
+def lower_linear_pattern(node):
+    """linear_pattern -> ONE create_pattern(linear). The seed feature's RUNTIME name flows via
+    node_feature (circular_pattern's mechanism). direction is the canonical axis letter (the
+    tool selects the default plane whose normal is that axis); 'flip' (v0.7.0 tool extension)
+    patterns toward the NEGATIVE axis. Single direction by design — the tool's documented D2 is
+    unwired in C# (recorded gap); grids compose as a pattern OF a pattern."""
+    params = {"pattern_type": "linear",
+              "feature_name": node_feature(node["feature"]),
+              "direction": node["direction"].upper(),
+              "spacing": float(node["spacing"]),
+              "count": int(node["count"])}
+    if node.get("flip") is True:
+        params["flip"] = True
+    return [Op("create_pattern", params,
+               "linear pattern %dx @ %g m along %s%s (seed = node %s)"
+               % (int(node["count"]), float(node["spacing"]), node["direction"].upper(),
+                  " (flipped)" if node.get("flip") is True else "", node["feature"]))]
+
+
+def lower_material(material):
+    """graph-level material -> ONE set_part_material AFTER the last node (material is document
+    state, not a tree feature; part graphs only — validation enforces it)."""
+    params = {"material_name": material["name"]}
+    if material.get("library"):
+        params["library"] = material["library"]
+    return [Op("set_part_material", params, "material '%s'" % material["name"])]
 
 
 def lower_revolve(node):
@@ -285,7 +348,16 @@ def lower_sketched_bend(node):
 
 
 def lower_edge_flange(node, edge_index):
-    """edge_flange (CUSTOM profile) -> SolidWorks' documented three-phase flow:
+    """edge_flange — TWO MODES (v0.7.0):
+
+    SIMPLE LENGTH mode (`length` given, no frame/profile — the FORWARD mode): ONE
+    sheet_metal_feature(edge_flange) call with the anchor-resolved edge_index (v0.7.0 C#
+    extension — the coordinate pick misses real edges, KNOWN-LIMITATIONS #6) — a
+    full-edge-width flange of that length. Position/radius stay the tool defaults
+    (material_inside / sheet default); validation already rejected overrides.
+
+    CUSTOM PROFILE mode (frame+profile given — the reverse-replay mode) ->
+    SolidWorks' documented three-phase flow:
     (1) sheet_metal_feature(edge_flange_sketch): select the attach edge BY INDEX (the compiler
         resolves the node's edge anchor via resolve_edges_by_anchor — the coordinate pick misses
         real edges, KNOWN-LIMITATIONS #6, proven live on 4-1's slanted EF2 edge), generate the
@@ -300,6 +372,12 @@ def lower_edge_flange(node, edge_index):
         read-back values (IR-ADR-014); radius OMITTED => the sheet default; position OMITTED =>
         material_inside (the tool default). Angle: IR RADIANS -> tool-boundary DEGREES (C4)."""
     angle_deg = math.degrees(float(node.get("angle") or (math.pi / 2.0)))
+    if node.get("length") is not None:
+        return [Op("sheet_metal_feature",
+                   {"feature_type": "edge_flange", "edge_index": int(edge_index),
+                    "flange_length": float(node["length"]), "angle": angle_deg},
+                   "edge flange (simple): length %g on edge #%d"
+                   % (float(node["length"]), int(edge_index)))]
     gen = {"feature_type": "edge_flange_sketch", "edge_index": int(edge_index),
            "angle": angle_deg}
     if node.get("flip") is True:

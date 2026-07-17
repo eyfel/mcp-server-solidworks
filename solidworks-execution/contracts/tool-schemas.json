@@ -64,6 +64,17 @@
   },
   "output": "→ see execution-response.json (add_sketch_entity additionally returns result_geometry: the real created segment geometry, read-only — does NOT affect state_version)"
  },
+ "add_sketch_entities": {
+  "description": "Batch form of add_sketch_entity: creates MANY sketch entities in the active sketch in ONE call. 'segments' is an array of entity records, each record = add_sketch_entity's params for one entity (entity_type + its coordinates; per-record 'construction' supported; a spline record's 'points' is a plain number array). Records are created in array order under ONE AddToDB bracket. NOT transactional: on the first failing record the call returns FAILED naming segments[i] and how many earlier records were created (they remain in the sketch); state_version bumps only on COMPLETED. result_geometry echoes a compact {segment_count, counts per entity_type} — no per-segment geometry (use analyze_model sketch mode for exact readback).",
+  "input": {
+   "operation_id": "string (required, unique idempotency key)",
+   "state_version": "integer (required, must match current execution state)",
+   "params": {
+    "segments": "string (required — JSON array of entity records '[{\"entity_type\":\"line\",\"x1\":0,...},...]'; parsed by the adapter into an object array)"
+   }
+  },
+  "output": "→ see execution-response.json (add_sketch_entities returns result_geometry: {segment_count, counts})"
+ },
  "add_sketch_constraint": {
   "description": "Applies a geometric constraint to sketch entities in the active sketch. Single-entity constraints (horizontal, vertical) need only px1/py1. Two-entity constraints (coincident, parallel, perpendicular, tangent, equal, midpoint) also require px2/py2. entity_type1/2 defaults to 'SKETCHSEGMENT'; use 'SKETCHPOINT' for point-based constraints.",
   "input": {
@@ -414,8 +425,9 @@
     "spacing": "number (linear only — spacing between instances in meters, default 0.01)",
     "count": "integer (number of instances including seed, default 2)",
     "direction": "string (linear only — 'X', 'Y', or 'Z', default 'X')",
-    "count2": "integer (linear only — instances in second direction, default 1 = no D2 pattern)",
-    "spacing2": "number (linear only — spacing in second direction, default 0.01)",
+    "flip": "boolean (linear only, default false — pattern toward the NEGATIVE axis; FeatureLinearPattern3's FlipDir1, exposed v0.7.0)",
+    "count2": "integer (linear only — accepted but NON-FUNCTIONAL: no second-direction entity is wired to FeatureLinearPattern3 (recorded gap, 2026-07-16); compose a grid as a pattern OF a pattern instead. Default 1)",
+    "spacing2": "number (linear only — see count2: non-functional until D2 is wired, default 0.01)",
     "axis_name": "string (circular only — reference axis name, e.g. 'Axis1')",
     "angle": "number (circular only — degrees; with equal_spacing=true this is the TOTAL spread (use 360 for a full ring), with equal_spacing=false it is the angle BETWEEN adjacent instances)",
     "equal_spacing": "boolean (circular only, default true — true: angle=total spread, evenly divided; false: angle=per-instance spacing, may wrap/overlap)",
@@ -439,7 +451,7 @@
   "output": "→ see execution-response.json — applied material and library in CadState.Features"
  },
  "sheet_metal_feature": {
-  "description": "Creates sheet metal features on the active part. feature_type='base_flange': converts active sketch profile to sheet metal base (exits sketch automatically). feature_type='edge_flange': adds a flange to the edge at (ex,ey,ez). feature_type='sketched_bend': bends the sheet about the bend line(s) in the ACTIVE sketch (IFeatureManager.InsertSheetMetal3dBend, CHM-verified; the pre-selected FIXED face stays put — pick it by fixed_face_index (analyze faces numbering, preferred) or fixed_x/y/z; a sketch with multiple bend lines yields one feature with one bend per line). feature_type='flat_pattern': unfolds all bends (requires existing base_flange).",
+  "description": "Creates sheet metal features on the active part. feature_type='base_flange': converts active sketch profile to sheet metal base (exits sketch automatically). feature_type='edge_flange': adds a default-profile flange to an edge — select it by edge_index (preferred) or a point (ex,ey,ez). feature_type='sketched_bend': bends the sheet about the bend line(s) in the ACTIVE sketch (IFeatureManager.InsertSheetMetal3dBend, CHM-verified; the pre-selected FIXED face stays put — pick it by fixed_face_index (analyze faces numbering, preferred) or fixed_x/y/z; a sketch with multiple bend lines yields one feature with one bend per line). feature_type='flat_pattern': unfolds all bends (requires existing base_flange).",
   "input": {
    "operation_id": "string (required, unique idempotency key)",
    "state_version": "integer (required, must match current execution state)",
@@ -463,7 +475,7 @@
     "reverse_thickness": "boolean (base_flange only, default false — thicken to the OPPOSITE side of the sketch plane; derive from which side the original blank's faces sit, e.g. feature_map's SMBaseFlange created faces)",
     "symmetric_thickness": "boolean (base_flange only, default false — thicken BOTH ways off the sketch plane (±t/2, mid-plane style); reproduce the original's own flag — it also sets the intrinsic sheet orientation downstream bend directions fold against)",
     "clear_profile": "boolean (edge_flange_sketch only, default true — wipe the generated default rectangle so the caller redraws the ORIGINAL's custom profile via add_sketch_entity; the op leaves the generated sketch ACTIVE and echoes its MEASURED frame in result_geometry, then edge_flange_finish creates the flange from it — SW's documented custom-profile flow; the flange API accepts only a sketch IT generated)",
-    "edge_index": "integer (edge_flange_sketch/edge_flange_finish, optional — the attach edge's stable index from analyze_model(edges); PREFERRED over ex/ey/ez, whose coordinate pick can miss a real edge (KNOWN-LIMITATIONS #6). Pass the SAME index to both calls — the sketch step adds no solid geometry, so edge enumeration is stable)"
+    "edge_index": "integer (edge_flange/edge_flange_sketch/edge_flange_finish, optional — the attach edge's stable index from analyze_model(edges); PREFERRED over ex/ey/ez, whose coordinate pick can miss a real edge (KNOWN-LIMITATIONS #6). Since v0.7.0 the simple edge_flange accepts it too (shared SelectFlangeEdge). For the two-call custom-profile flow pass the SAME index to both calls — the sketch step adds no solid geometry, so edge enumeration is stable)"
    }
   },
   "output": "→ see execution-response.json"
@@ -510,7 +522,7 @@
    "operation_id": "n/a — pure file read, no execution call",
    "state_version": "n/a — pure file read, no execution call",
    "params": {
-    "section": "string enum (default 'index' — TOC + version header): 'contract' | 'canonicalization' | 'mapping' | 'mapping_part' | 'mapping_sheet_metal' | 'mapping_assembly' | 'verification' | 'coverage' | 'drawing' | 'feature_graph_schema' (IR schema JSON) | 'analysis_artifact_schema' (artifact contract JSON)"
+    "section": "string enum (default 'index' — TOC + version header): 'contract' | 'canonicalization' | 'forward' (intent→IR authoring for submit_feature_graph) | 'mapping' | 'mapping_part' | 'mapping_sheet_metal' | 'mapping_assembly' | 'verification' | 'reverse' (drawing→part reading discipline) | 'coverage' | 'drawing' | 'feature_graph_schema' (IR schema JSON) | 'analysis_artifact_schema' (artifact contract JSON)"
    }
   },
   "output": "The requested recipe section as markdown (or the raw contract JSON for the two schema sections)."
@@ -527,7 +539,7 @@
   "output": "Token-frugal summary string: artifact path + feature/parameter counts + topology counts + linked-drawing count + hash prefix. The artifact JSON itself stays on disk — read it from there when the full content is needed."
  },
  "rebuild_from_ir": {
-  "description": "ADAPTER-ONLY orchestration (no ToolController/SolidWorksService case) — the analysis pipeline's IR door (IR-ADR-005: two doors, ONE pycompiler). Reads an analysis artifact JSON, takes ir.graph, optionally opens a fresh part, and executes the graph through the SAME deterministic pycompiler as the (disabled) submit_feature_graph test tool, over the existing /api/tool/execute + /state endpoints. Reports a stale source hash informatively (cache discipline, ADR-040); resyncs the adapter's state_version after the run (many state-bumping sub-ops happen outside the normal _call path).",
+  "description": "ADAPTER-ONLY orchestration (no ToolController/SolidWorksService case) — the analysis pipeline's IR door (IR-ADR-005: two doors, ONE pycompiler). Reads an analysis artifact JSON, takes ir.graph, optionally opens a fresh part, and executes the graph through the SAME deterministic pycompiler as the forward door submit_feature_graph (two doors, one compiler), over the existing /api/tool/execute + /state endpoints. Reports a stale source hash informatively (cache discipline, ADR-040); resyncs the adapter's state_version after the run (many state-bumping sub-ops happen outside the normal _call path).",
   "input": {
    "operation_id": "n/a at this level — each lowered sub-op carries its own operation_id (uuid4) and state_version on /api/tool/execute",
    "state_version": "n/a at this level — the adapter resyncs its local state_version from GET /state after the run",
@@ -537,6 +549,18 @@
    }
   },
   "output": "The compiler's per-node summary string: COMPLETED n/n nodes (+ artifact name, + source_stale flag when the source file changed since analysis) or FAILED with the feature-level error and how far it got (partial geometry may remain — CAD ops are not transactional)."
+ },
+ "submit_feature_graph": {
+  "description": "ADAPTER-ONLY orchestration (no ToolController/SolidWorksService case) — the FORWARD Feature Graph IR door (re-enabled gate-free 2026-07-16, IR-ADR-017): builds a part or assembly from a CAD-neutral Feature Graph IR in ONE call. The adapter's deterministic pycompiler (solidworks-compiler/pycompiler — the SAME compiler rebuild_from_ir uses; two doors, one compiler, IR-ADR-005) lowers each IR node to ordered calls on the EXISTING low-level tools over /api/tool/execute + /state, and resolves references (geometric anchors, runtime feature names) against live geometry. Vocabulary = cad-planner/contracts/feature-graph.schema.json 0.7.0-draft (the capability registry; served to the model via get_recipe). fresh_document=true opens a new blank document first — the graph's node types decide part vs assembly. Resyncs the adapter's state_version after every run (many state-bumping sub-ops happen outside the normal _call path).",
+  "input": {
+   "operation_id": "n/a at this level — each lowered sub-op carries its own operation_id (uuid4) and state_version on /api/tool/execute",
+   "state_version": "n/a at this level — the adapter resyncs its local state_version from GET /state after the run",
+   "params": {
+    "graph": "string (required — JSON Feature Graph IR per cad-planner/contracts/feature-graph.schema.json; lengths in METERS, angles in RADIANS)",
+    "fresh_document": "boolean (optional, default true — open a new blank document first: part graphs a part, assembly graphs an assembly; false = build into the current active document)"
+   }
+  },
+  "output": "Per-node report string: COMPLETED (nodes built) or FAILED (feature-level error + how far it got). Partial geometry may remain on failure (CAD ops are not transactional). Not itself in the state_version/idempotency envelope; its sub-ops are."
  },
  "compare_parts": {
   "description": "ADAPTER-ONLY orchestration (no ToolController/SolidWorksService case) — the objective two-part diff / round-trip verifier (ADR-040, A0). Each doc argument is either an absolute .SLDPRT path (opened from disk) or an open document's TITLE (e.g. an unsaved rebuild). Activates each in turn and runs analyze_model(geometry + mass_properties); compares topology (bodies/faces/edges/vertices), volume, surface area, CG. Reports the DECIDED verified-criteria verdict (topology EXACT and |dV| <= 1% and |dA| <= 1%) — writing ir.verification into an artifact stays the caller's job. Geometry-read-only; doc_b is left active. bbox comparison pending (analyze does not expose it).",

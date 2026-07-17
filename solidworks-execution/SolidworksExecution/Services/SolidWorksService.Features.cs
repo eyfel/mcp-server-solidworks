@@ -898,6 +898,7 @@ namespace SolidworksExecution.Services
                     int count = p?.Value<int?>("count") ?? 2;
                     int count2 = p?.Value<int?>("count2") ?? 1;
                     double spacing2 = p?.Value<double?>("spacing2") ?? 0.01;
+                    bool flip = p?.Value<bool?>("flip") ?? false;
 
                     // Select seed feature with mark=4
                     modelDoc.ClearSelection2(true);
@@ -923,10 +924,15 @@ namespace SolidworksExecution.Services
                             "DIRECTION_NOT_FOUND",
                             $"Direction plane '{dirPlane}' not found. Ensure default planes exist in the document.");
 
+                    // FeatureLinearPattern3(Num1, Spacing1, Num2, Spacing2, FlipDir1, FlipDir2,
+                    // DName1, DName2, GeometryPattern, VaryInstance) — reflection-verified
+                    // (ADR-035). FlipDir1 exposed as 'flip' (v0.7.0): pattern toward the NEGATIVE
+                    // axis. FlipDir2 stays false — the D2 direction entity is not wired (count2
+                    // is accepted but has no direction-2 selection; see the contract note).
                     feature = featureMgr.FeatureLinearPattern3(
                         count, spacing,
                         count2, spacing2,
-                        false, false,
+                        flip, false,
                         null, null,
                         false, false) as IFeature; // geometryPattern=false (SW default). NOTE: disjoint instances warn & are skipped — see KNOWN-LIMITATIONS.md; geometryPattern=true returns null here, not a safe blanket default.
                 }

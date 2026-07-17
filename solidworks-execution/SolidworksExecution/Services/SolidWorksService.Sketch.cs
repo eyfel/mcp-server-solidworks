@@ -168,6 +168,352 @@ namespace SolidworksExecution.Services
             }
         }
 
+        // The single-entity CREATE core shared by add_sketch_entity and add_sketch_entities (Batch-3):
+        // one switch, never forked. Creates ONE entity record (entity_type + its params, incl. the
+        // per-record construction flag) in the ACTIVE sketch. Returns null on success (createdSeg /
+        // createdSegs populated) or "CODE|message" on failure — the caller maps it into its own
+        // response shape. The caller owns the AddToDB bracket (ADR-042) and the guard preamble.
+        private string CreateSketchEntityCore(IModelDoc2 modelDoc, JObject p, string entityType,
+            string sketchName, out ISketchSegment createdSeg, out object[] createdSegs)
+        {
+            createdSeg = null;
+            createdSegs = null;
+            bool created = false;
+            switch (entityType.ToLowerInvariant())
+            {
+                case "rectangle":
+                {
+                    double? x1 = p?.Value<double?>("x1");
+                    double? y1 = p?.Value<double?>("y1");
+                    double? x2 = p?.Value<double?>("x2");
+                    double? y2 = p?.Value<double?>("y2");
+                    if (x1 == null || y1 == null || x2 == null || y2 == null)
+                        return "MISSING_PARAMETER|rectangle requires x1, y1, x2, y2.";
+                    var segs = modelDoc.SketchManager.CreateCornerRectangle(
+                        x1.Value, y1.Value, 0, x2.Value, y2.Value, 0) as object[];
+                    createdSegs = segs;
+                    created = segs != null && segs.Length > 0;
+                    break;
+                }
+                case "circle":
+                {
+                    double? cx = p?.Value<double?>("cx");
+                    double? cy = p?.Value<double?>("cy");
+                    double? radius = p?.Value<double?>("radius");
+                    if (cx == null || cy == null || radius == null)
+                        return "MISSING_PARAMETER|circle requires cx, cy, radius.";
+                    var arc = modelDoc.SketchManager.CreateCircleByRadius(cx.Value, cy.Value, 0, radius.Value);
+                    createdSeg = arc as ISketchSegment;
+                    created = arc != null;
+                    break;
+                }
+                case "line":
+                {
+                    double? x1 = p?.Value<double?>("x1");
+                    double? y1 = p?.Value<double?>("y1");
+                    double? x2 = p?.Value<double?>("x2");
+                    double? y2 = p?.Value<double?>("y2");
+                    if (x1 == null || y1 == null || x2 == null || y2 == null)
+                        return "MISSING_PARAMETER|line requires x1, y1, x2, y2.";
+                    var seg = modelDoc.SketchManager.CreateLine(x1.Value, y1.Value, 0, x2.Value, y2.Value, 0);
+                    createdSeg = seg as ISketchSegment;
+                    created = seg != null;
+                    break;
+                }
+                case "arc":
+                {
+                    // 3-point arc: start (x1,y1), end (x2,y2), mid-arc point (xm,ym)
+                    double? x1 = p?.Value<double?>("x1");
+                    double? y1 = p?.Value<double?>("y1");
+                    double? x2 = p?.Value<double?>("x2");
+                    double? y2 = p?.Value<double?>("y2");
+                    double? xm = p?.Value<double?>("xm");
+                    double? ym = p?.Value<double?>("ym");
+                    if (x1 == null || y1 == null || x2 == null || y2 == null || xm == null || ym == null)
+                        return "MISSING_PARAMETER|arc requires x1, y1 (start), x2, y2 (end), xm, ym (mid-arc point).";
+                    var arc = modelDoc.SketchManager.Create3PointArc(
+                        x1.Value, y1.Value, 0,
+                        x2.Value, y2.Value, 0,
+                        xm.Value, ym.Value, 0);
+                    createdSeg = arc as ISketchSegment;
+                    created = arc != null;
+                    break;
+                }
+                case "arc_center":
+                {
+                    // Center-based arc: exact center (cx,cy) + start (x1,y1), end (x2,y2), direction
+                    // (+1 CCW, -1 CW). Guarantees the radius; numerically stable for shallow arcs.
+                    double? cx = p?.Value<double?>("cx");
+                    double? cy = p?.Value<double?>("cy");
+                    double? x1 = p?.Value<double?>("x1");
+                    double? y1 = p?.Value<double?>("y1");
+                    double? x2 = p?.Value<double?>("x2");
+                    double? y2 = p?.Value<double?>("y2");
+                    if (cx == null || cy == null || x1 == null || y1 == null || x2 == null || y2 == null)
+                        return "MISSING_PARAMETER|arc_center requires cx, cy (center), x1, y1 (start), x2, y2 (end).";
+                    // direction: +1 CCW / -1 CW, applied VERBATIM when given. When OMITTED (or 0),
+                    // pick the MINOR (<=180°) arc deterministically — a corner round / fillet arc is
+                    // virtually always the minor one, and a wrong sign silently draws the 270°
+                    // complement (live benchmark failure: R2 90° corner came out as the other side).
+                    // Callers that really want the major arc pass the explicit sign (the analyze/IR
+                    // round-trip always does — its 'dir' is read from the original geometry).
+                    double dirRaw = p?.Value<double?>("direction") ?? 0.0;
+                    short direction;
+                    if (Math.Abs(dirRaw) >= 0.5)
+                        direction = (short)(dirRaw >= 0 ? 1 : -1);
+                    else
+                    {
+                        double a1 = Math.Atan2(y1.Value - cy.Value, x1.Value - cx.Value);
+                        double a2 = Math.Atan2(y2.Value - cy.Value, x2.Value - cx.Value);
+                        double ccwSweep = a2 - a1;
+                        while (ccwSweep < 0) ccwSweep += 2 * Math.PI;
+                        while (ccwSweep >= 2 * Math.PI) ccwSweep -= 2 * Math.PI;
+                        direction = (short)(ccwSweep <= Math.PI ? 1 : -1);
+                    }
+                    // Endpoints passed VERBATIM (shared exactly with neighbours — the closed contour is
+                    // preserved). The caller's AddToDB bracket keeps SW inference off the exact radius.
+                    var arc = modelDoc.SketchManager.CreateArc(
+                        cx.Value, cy.Value, 0,
+                        x1.Value, y1.Value, 0,
+                        x2.Value, y2.Value, 0,
+                        direction);
+                    createdSeg = arc;
+                    created = arc != null;
+                    break;
+                }
+                case "ellipse":
+                {
+                    // Center-based ellipse: cx,cy (center), x1,y1 (major-axis point), x2,y2 (minor-axis point).
+                    double? cx = p?.Value<double?>("cx");
+                    double? cy = p?.Value<double?>("cy");
+                    double? x1 = p?.Value<double?>("x1");
+                    double? y1 = p?.Value<double?>("y1");
+                    double? x2 = p?.Value<double?>("x2");
+                    double? y2 = p?.Value<double?>("y2");
+                    if (cx == null || cy == null || x1 == null || y1 == null || x2 == null || y2 == null)
+                        return "MISSING_PARAMETER|ellipse requires cx, cy (center), x1, y1 (major-axis point), x2, y2 (minor-axis point).";
+                    var ell = modelDoc.SketchManager.CreateEllipse(
+                        cx.Value, cy.Value, 0,
+                        x1.Value, y1.Value, 0,
+                        x2.Value, y2.Value, 0);
+                    createdSeg = ell as ISketchSegment;
+                    created = ell != null;
+                    break;
+                }
+                case "spline":
+                {
+                    // Through-point spline: 'points' = flat [x1,y1,x2,y2,...] (>= 2 points), z=0.
+                    var ptsTok = p?["points"] as JArray;
+                    if (ptsTok == null || ptsTok.Count < 4 || ptsTok.Count % 2 != 0)
+                        return "MISSING_PARAMETER|spline requires 'points': a flat list [x1,y1,x2,y2,...] of >= 2 (x,y) pairs.";
+                    int nPts = ptsTok.Count / 2;
+                    var pointData = new double[nPts * 3];
+                    for (int i = 0; i < nPts; i++)
+                    {
+                        pointData[i * 3] = ptsTok[i * 2].Value<double>();
+                        pointData[i * 3 + 1] = ptsTok[i * 2 + 1].Value<double>();
+                        pointData[i * 3 + 2] = 0.0;
+                    }
+                    var spl = modelDoc.SketchManager.CreateSpline(pointData);
+                    createdSeg = spl as ISketchSegment;
+                    created = spl != null;
+                    break;
+                }
+                case "fillet":
+                {
+                    // Sketch fillet: rounds the corner between two segments meeting at vertex (vx, vy).
+                    double? vx = p?.Value<double?>("vx");
+                    double? vy = p?.Value<double?>("vy");
+                    double? radius = p?.Value<double?>("radius");
+                    if (vx == null || vy == null || radius == null)
+                        return "MISSING_PARAMETER|fillet requires vx, vy (vertex coordinates) and radius.";
+                    modelDoc.ClearSelection2(true);
+                    bool vertexSelected = modelDoc.Extension.SelectByID2(
+                        "", "SKETCHPOINT", vx.Value, vy.Value, 0, false, 0, null, 0);
+                    if (!vertexSelected)
+                        return $"VERTEX_NOT_FOUND|No sketch vertex found at or near ({vx.Value}, {vy.Value}).";
+                    var fillet = modelDoc.SketchManager.CreateFillet(radius.Value,
+                        (int)swConstrainedCornerAction_e.swConstrainedCornerDeleteGeometry);
+                    createdSeg = fillet as ISketchSegment;
+                    created = fillet != null;
+                    if (created) RegenerateSketchInPlace(modelDoc, sketchName);
+                    break;
+                }
+                case "chamfer":
+                {
+                    // Sketch chamfer: cuts the corner between two adjacent segments at vertex (vx, vy).
+                    double? vx = p?.Value<double?>("vx");
+                    double? vy = p?.Value<double?>("vy");
+                    double? distance = p?.Value<double?>("distance");
+                    if (vx == null || vy == null || distance == null)
+                        return "MISSING_PARAMETER|chamfer requires vx, vy (vertex coordinates) and distance.";
+                    modelDoc.ClearSelection2(true);
+                    bool vertexSelected = modelDoc.Extension.SelectByID2(
+                        "", "SKETCHPOINT", vx.Value, vy.Value, 0, false, 0, null, 0);
+                    if (!vertexSelected)
+                        return $"VERTEX_NOT_FOUND|No sketch vertex found at or near ({vx.Value}, {vy.Value}).";
+                    var chamfer = modelDoc.SketchManager.CreateChamfer(
+                        (int)swSketchChamferType_e.swSketchChamfer_DistanceEqual,
+                        distance.Value, distance.Value);
+                    createdSeg = chamfer as ISketchSegment;
+                    created = chamfer != null;
+                    if (created) RegenerateSketchInPlace(modelDoc, sketchName);
+                    break;
+                }
+                default:
+                    return $"UNSUPPORTED_ENTITY_TYPE|entity_type '{entityType}' is not supported. Supported: rectangle, circle, line, arc, arc_center, ellipse, spline, fillet, chamfer.";
+            }
+
+            if (!created)
+                return $"ENTITY_CREATION_FAILED|Failed to create sketch entity of type '{entityType}'.";
+
+            // construction=true converts the created segment(s) to construction/reference geometry
+            // (centerlines, symmetry axes, hole-position scaffolding). Applied post-create because
+            // SketchManager has no construction-aware create calls.
+            bool asConstruction = p?.Value<bool?>("construction") ?? false;
+            if (asConstruction)
+            {
+                try
+                {
+                    if (createdSeg != null) createdSeg.ConstructionGeometry = true;
+                    if (createdSegs != null)
+                        foreach (var o in createdSegs)
+                        {
+                            var s = o as ISketchSegment;
+                            if (s != null) s.ConstructionGeometry = true;
+                        }
+                }
+                catch (Exception ex)
+                {
+                    return $"CONSTRUCTION_FLAG_FAILED|Entity created but could not be converted to construction geometry: {ex.Message}";
+                }
+            }
+            return null;
+        }
+
+        // Batch-3: add_sketch_entities — N entity records in ONE call. The single-entity tool's calls
+        // were the largest call-count item in both level-2-2 benchmark runs (62 and 16 calls); a batch
+        // cuts both the round-trips and the per-call context echo. Same JSON-string idiom as ADR-022
+        // (the adapter parses `segments` into a JArray of records, each = add_sketch_entity's params).
+        // NOT transactional (IR-ADR-001 failure isolation): on the first failing record the run STOPS
+        // and reports FAILED with the record index + how many records were already created (they remain
+        // in the sketch — the caller decides whether to continue, fix, or discard). state_version bumps
+        // only on COMPLETED. The echo is a compact per-type count, NOT per-segment result_geometry —
+        // read the sketch back with analyze_model(sketch) when exact readback is needed.
+        public ExecutionResponse AddSketchEntities(ToolRequest request)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (!_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                var p = request.Params as JObject;
+                var segsTok = p?["segments"] as JArray;
+                if (segsTok == null || segsTok.Count == 0)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "MISSING_PARAMETER",
+                        "segments is required: a JSON array of entity records, each with entity_type + its add_sketch_entity params.");
+
+                var modelDoc = _solidWorks.IActiveDoc2 as IModelDoc2;
+                if (modelDoc == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "NO_ACTIVE_DOCUMENT", "No active document found in SolidWorks.");
+
+                var activeSketch = modelDoc.SketchManager.ActiveSketch;
+                if (activeSketch == null)
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        "SKETCH_NOT_ACTIVE", "No active sketch. Call create_sketch first.");
+                string sketchName = (activeSketch as IFeature)?.Name ?? "Sketch";
+
+                int done = 0;
+                var counts = new Dictionary<string, int>();
+                // ONE AddToDB bracket around the whole batch (ADR-042 — frozen-exact coordinates, no
+                // pixel-tolerance snapping) and ONE redraw at the end, instead of per segment.
+                bool prevAddToDb = modelDoc.SketchManager.AddToDB;
+                modelDoc.SketchManager.AddToDB = true;
+                try
+                {
+                    for (int i = 0; i < segsTok.Count; i++)
+                    {
+                        var sp = segsTok[i] as JObject;
+                        string et = sp?.Value<string>("entity_type");
+                        if (sp == null || string.IsNullOrEmpty(et))
+                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                                "MISSING_PARAMETER",
+                                $"segments[{i}] must be an object with entity_type. {done} segment(s) before it were created and remain in the sketch.");
+
+                        ISketchSegment seg; object[] segs;
+                        string err = CreateSketchEntityCore(modelDoc, sp, et, sketchName, out seg, out segs);
+                        if (err != null)
+                        {
+                            var parts = err.Split(new[] { '|' }, 2);
+                            string code = parts[0];
+                            string msg = parts.Length > 1 ? parts[1] : err;
+                            ExecLog.Write($"add_sketch_entities: FAILED at segments[{i}] ({et}) after {done} created — {code}");
+                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(), code,
+                                $"segments[{i}] ({et}): {msg} {done} segment(s) before it were created and remain in the sketch.");
+                        }
+                        done++;
+                        string key = et.ToLowerInvariant();
+                        counts[key] = counts.TryGetValue(key, out var c) ? c + 1 : 1;
+                    }
+                }
+                finally
+                {
+                    modelDoc.SketchManager.AddToDB = prevAddToDb;
+                }
+                modelDoc.GraphicsRedraw2();
+
+                ExecLog.Write($"add_sketch_entities: created {done} segment(s) in {sketchName}");
+
+                var countsJson = new JObject();
+                foreach (var kv in counts) countsJson[kv.Key] = kv.Value;
+
+                var response = new ExecutionResponse
+                {
+                    OperationId = request.OperationId,
+                    Status = "COMPLETED",
+                    Verified = true,
+                    StateVersion = _guard.GetCurrentStateVersion() + 1,
+                    CadState = new CadState
+                    {
+                        StateVersion = _guard.GetCurrentStateVersion() + 1,
+                        ActiveDocument = modelDoc.GetTitle(),
+                        DocumentType = "PART",
+                        ActiveSketch = sketchName,
+                        Features = new List<string>(),
+                        Dimensions = new List<string>()
+                    },
+                    ResultGeometry = new JObject
+                    {
+                        ["segment_count"] = done,
+                        ["counts"] = countsJson
+                    },
+                    Error = null
+                };
+                _guard.RegisterCompleted(request.OperationId, response);
+                return response;
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
         public ExecutionResponse AddSketchEntity(ToolRequest request)
         {
             if (_guard.IsDuplicate(request.OperationId))
@@ -199,261 +545,36 @@ namespace SolidworksExecution.Services
                     return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
                         "SKETCH_NOT_ACTIVE", "No active sketch. Call create_sketch first.");
 
-                bool created = false;
-                // Capture the created segment(s) so the response can echo the REAL resulting geometry
-                // (Task 2 / result_geometry) — read back from SW, never the input, so snapping/inference
-                // drift is visible. createdSeg = single-segment types; createdSegs = rectangle (4 lines).
-                ISketchSegment createdSeg = null;
-                object[] createdSegs = null;
+                // The entity switch lives in CreateSketchEntityCore — ONE switch shared with
+                // add_sketch_entities (Batch-3), never forked. The core also applies the per-record
+                // construction flag. Captured segment(s) feed the result_geometry echo below
+                // (read back from SW, never the input, so snapping/inference drift is visible).
+                //
                 // AddToDB for the WHOLE create (generalizes ADR-022's arc_center-only toggle): all
                 // coordinates arrive frozen-exact (analyze round-trip / IR lowering), so SW's input
                 // inference/snapping must never touch them. Found live on the 1-2 flange rebuild: a
                 // 1.59mm line (raised-face step) built fine in one document, then CreateLine returned
                 // NULL for the same coords in the next — the pixel-based snap tolerance depends on the
                 // window's zoom, so short segments nondeterministically collapse without AddToDB.
+                ISketchSegment createdSeg;
+                object[] createdSegs;
+                string coreErr;
                 bool prevAddToDbAll = modelDoc.SketchManager.AddToDB;
                 modelDoc.SketchManager.AddToDB = true;
                 try
                 {
-                switch (entityType.ToLowerInvariant())
-                {
-                    case "rectangle":
-                    {
-                        double? x1 = p?.Value<double?>("x1");
-                        double? y1 = p?.Value<double?>("y1");
-                        double? x2 = p?.Value<double?>("x2");
-                        double? y2 = p?.Value<double?>("y2");
-                        if (x1 == null || y1 == null || x2 == null || y2 == null)
-                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                                "MISSING_PARAMETER", "rectangle requires x1, y1, x2, y2.");
-                        var segs = modelDoc.SketchManager.CreateCornerRectangle(
-                            x1.Value, y1.Value, 0, x2.Value, y2.Value, 0) as object[];
-                        createdSegs = segs;
-                        created = segs != null && segs.Length > 0;
-                        break;
-                    }
-                    case "circle":
-                    {
-                        double? cx = p?.Value<double?>("cx");
-                        double? cy = p?.Value<double?>("cy");
-                        double? radius = p?.Value<double?>("radius");
-                        if (cx == null || cy == null || radius == null)
-                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                                "MISSING_PARAMETER", "circle requires cx, cy, radius.");
-                        var arc = modelDoc.SketchManager.CreateCircleByRadius(cx.Value, cy.Value, 0, radius.Value);
-                        createdSeg = arc as ISketchSegment;
-                        created = arc != null;
-                        break;
-                    }
-                    case "line":
-                    {
-                        double? x1 = p?.Value<double?>("x1");
-                        double? y1 = p?.Value<double?>("y1");
-                        double? x2 = p?.Value<double?>("x2");
-                        double? y2 = p?.Value<double?>("y2");
-                        if (x1 == null || y1 == null || x2 == null || y2 == null)
-                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                                "MISSING_PARAMETER", "line requires x1, y1, x2, y2.");
-                        var seg = modelDoc.SketchManager.CreateLine(x1.Value, y1.Value, 0, x2.Value, y2.Value, 0);
-                        createdSeg = seg as ISketchSegment;
-                        created = seg != null;
-                        break;
-                    }
-                    case "arc":
-                    {
-                        // 3-point arc: start (x1,y1), end (x2,y2), mid-arc point (xm,ym)
-                        double? x1 = p?.Value<double?>("x1");
-                        double? y1 = p?.Value<double?>("y1");
-                        double? x2 = p?.Value<double?>("x2");
-                        double? y2 = p?.Value<double?>("y2");
-                        double? xm = p?.Value<double?>("xm");
-                        double? ym = p?.Value<double?>("ym");
-                        if (x1 == null || y1 == null || x2 == null || y2 == null || xm == null || ym == null)
-                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                                "MISSING_PARAMETER", "arc requires x1, y1 (start), x2, y2 (end), xm, ym (mid-arc point).");
-                        var arc = modelDoc.SketchManager.Create3PointArc(
-                            x1.Value, y1.Value, 0,
-                            x2.Value, y2.Value, 0,
-                            xm.Value, ym.Value, 0);
-                        createdSeg = arc as ISketchSegment;
-                        created = arc != null;
-                        break;
-                    }
-                    case "arc_center":
-                    {
-                        // Center-based arc: exact center (cx,cy) + radius, start (x1,y1), end (x2,y2),
-                        // direction (+1 CCW, -1 CW). Unlike the 3-point arc, this guarantees the radius
-                        // and is numerically stable for shallow arcs (no circle-fit through near-collinear
-                        // points). Use when the exact center/radius are known (e.g. from analyze_model).
-                        double? cx = p?.Value<double?>("cx");
-                        double? cy = p?.Value<double?>("cy");
-                        double? x1 = p?.Value<double?>("x1");
-                        double? y1 = p?.Value<double?>("y1");
-                        double? x2 = p?.Value<double?>("x2");
-                        double? y2 = p?.Value<double?>("y2");
-                        if (cx == null || cy == null || x1 == null || y1 == null || x2 == null || y2 == null)
-                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                                "MISSING_PARAMETER", "arc_center requires cx, cy (center), x1, y1 (start), x2, y2 (end).");
-                        // Direction defaults to +1; pass -1 to sweep clockwise. The caller picks the
-                        // direction that yields the intended (usually minor) arc.
-                        short direction = (short)((p?.Value<double?>("direction") ?? 1.0) >= 0 ? 1 : -1);
-                        // Endpoints are passed VERBATIM (they already lie on the radius circle and are
-                        // shared EXACTLY with adjacent arcs, so the closed contour is preserved — any
-                        // re-projection would nudge a shared junction off its neighbour and open the loop).
-                        // The key to an exact radius is disabling SolidWorks input inference/snapping via
-                        // AddToDB: otherwise SW snaps the new arc's endpoints to nearby existing geometry
-                        // and skews the fitted radius (catastrophically for shallow, near-collinear arcs —
-                        // e.g. a 7.6° root arc came out r=19mm instead of 68.75mm via the 3-point path).
-                        bool prevAddToDB = modelDoc.SketchManager.AddToDB;
-                        modelDoc.SketchManager.AddToDB = true;
-                        ISketchSegment arc;
-                        try
-                        {
-                            arc = modelDoc.SketchManager.CreateArc(
-                                cx.Value, cy.Value, 0,
-                                x1.Value, y1.Value, 0,
-                                x2.Value, y2.Value, 0,
-                                direction);
-                        }
-                        finally
-                        {
-                            modelDoc.SketchManager.AddToDB = prevAddToDB;
-                        }
-                        createdSeg = arc;
-                        created = arc != null;
-                        break;
-                    }
-                    case "ellipse":
-                    {
-                        // Center-based ellipse: cx,cy (center), x1,y1 (a point on the MAJOR axis),
-                        // x2,y2 (a point on the MINOR axis). Reuses the existing scalar params (no new
-                        // schema params) and round-trips exactly with analyze's ellipse segment read.
-                        double? cx = p?.Value<double?>("cx");
-                        double? cy = p?.Value<double?>("cy");
-                        double? x1 = p?.Value<double?>("x1");
-                        double? y1 = p?.Value<double?>("y1");
-                        double? x2 = p?.Value<double?>("x2");
-                        double? y2 = p?.Value<double?>("y2");
-                        if (cx == null || cy == null || x1 == null || y1 == null || x2 == null || y2 == null)
-                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                                "MISSING_PARAMETER", "ellipse requires cx, cy (center), x1, y1 (major-axis point), x2, y2 (minor-axis point).");
-                        var ell = modelDoc.SketchManager.CreateEllipse(
-                            cx.Value, cy.Value, 0,
-                            x1.Value, y1.Value, 0,
-                            x2.Value, y2.Value, 0);
-                        createdSeg = ell as ISketchSegment;
-                        created = ell != null;
-                        break;
-                    }
-                    case "spline":
-                    {
-                        // Through-point spline: 'points' is a flat list [x1,y1,x2,y2,...] (>= 2 points),
-                        // all at z=0 in the active sketch plane. NOTE: a spline rebuilt from through-
-                        // points is visually faithful but NOT bit-identical to one authored via control
-                        // points (SW keeps tangency/curvature) — see KNOWN-LIMITATIONS. Use for rebuild,
-                        // not for an exact round-trip guarantee.
-                        var ptsTok = p?["points"] as JArray;
-                        if (ptsTok == null || ptsTok.Count < 4 || ptsTok.Count % 2 != 0)
-                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                                "MISSING_PARAMETER", "spline requires 'points': a flat list [x1,y1,x2,y2,...] of >= 2 (x,y) pairs.");
-                        int nPts = ptsTok.Count / 2;
-                        var pointData = new double[nPts * 3];
-                        for (int i = 0; i < nPts; i++)
-                        {
-                            pointData[i * 3] = ptsTok[i * 2].Value<double>();
-                            pointData[i * 3 + 1] = ptsTok[i * 2 + 1].Value<double>();
-                            pointData[i * 3 + 2] = 0.0;
-                        }
-                        var spl = modelDoc.SketchManager.CreateSpline(pointData);
-                        createdSeg = spl as ISketchSegment;
-                        created = spl != null;
-                        break;
-                    }
-                    case "fillet":
-                    {
-                        // Sketch fillet: rounds the corner between two selected segments at vertex (vx, vy)
-                        double? vx = p?.Value<double?>("vx");
-                        double? vy = p?.Value<double?>("vy");
-                        double? radius = p?.Value<double?>("radius");
-                        if (vx == null || vy == null || radius == null)
-                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                                "MISSING_PARAMETER", "fillet requires vx, vy (vertex coordinates) and radius.");
-                        // Select the vertex point
-                        modelDoc.ClearSelection2(true);
-                        bool vertexSelected = modelDoc.Extension.SelectByID2(
-                            "", "SKETCHPOINT", vx.Value, vy.Value, 0, false, 0, null, 0);
-                        if (!vertexSelected)
-                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                                "VERTEX_NOT_FOUND", $"No sketch vertex found at or near ({vx.Value}, {vy.Value}).");
-                        var fillet = modelDoc.SketchManager.CreateFillet(radius.Value,
-                            (int)swConstrainedCornerAction_e.swConstrainedCornerDeleteGeometry);
-                        createdSeg = fillet as ISketchSegment;
-                        created = fillet != null;
-                        if (created) RegenerateSketchInPlace(modelDoc, (activeSketch as IFeature)?.Name);
-                        break;
-                    }
-                    case "chamfer":
-                    {
-                        // Sketch chamfer: cuts the corner between two adjacent segments at vertex (vx, vy)
-                        double? vx = p?.Value<double?>("vx");
-                        double? vy = p?.Value<double?>("vy");
-                        double? distance = p?.Value<double?>("distance");
-                        if (vx == null || vy == null || distance == null)
-                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                                "MISSING_PARAMETER", "chamfer requires vx, vy (vertex coordinates) and distance.");
-                        modelDoc.ClearSelection2(true);
-                        bool vertexSelected = modelDoc.Extension.SelectByID2(
-                            "", "SKETCHPOINT", vx.Value, vy.Value, 0, false, 0, null, 0);
-                        if (!vertexSelected)
-                            return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                                "VERTEX_NOT_FOUND", $"No sketch vertex found at or near ({vx.Value}, {vy.Value}).");
-                        var chamfer = modelDoc.SketchManager.CreateChamfer(
-                            (int)swSketchChamferType_e.swSketchChamfer_DistanceEqual,
-                            distance.Value, distance.Value);
-                        createdSeg = chamfer as ISketchSegment;
-                        created = chamfer != null;
-                        if (created) RegenerateSketchInPlace(modelDoc, (activeSketch as IFeature)?.Name);
-                        break;
-                    }
-                    default:
-                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "UNSUPPORTED_ENTITY_TYPE",
-                            $"entity_type '{entityType}' is not supported. Supported: rectangle, circle, line, arc, arc_center, ellipse, spline, fillet, chamfer.");
-                }
+                    coreErr = CreateSketchEntityCore(modelDoc, p, entityType,
+                        (activeSketch as IFeature)?.Name, out createdSeg, out createdSegs);
                 }
                 finally
                 {
                     modelDoc.SketchManager.AddToDB = prevAddToDbAll;
                 }
-
-                if (!created)
-                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                        "ENTITY_CREATION_FAILED", $"Failed to create sketch entity of type '{entityType}'.");
-
-                // construction=true converts the created segment(s) to construction/reference geometry
-                // (centerlines, symmetry axes, hole-position scaffolding). Closes the "analyze ⊆ create"
-                // gap: ReadSegment already REPORTS the flag, this lets a rebuild REPRODUCE it. Applied
-                // post-create because SketchManager has no construction-aware create calls; the
-                // result_geometry echo below reads the segment back AFTER the flip, so the caller sees it.
-                bool asConstruction = p?.Value<bool?>("construction") ?? false;
-                if (asConstruction)
+                if (coreErr != null)
                 {
-                    try
-                    {
-                        if (createdSeg != null) createdSeg.ConstructionGeometry = true;
-                        if (createdSegs != null)
-                            foreach (var o in createdSegs)
-                            {
-                                var s = o as ISketchSegment;
-                                if (s != null) s.ConstructionGeometry = true;
-                            }
-                    }
-                    catch (Exception ex)
-                    {
-                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "CONSTRUCTION_FLAG_FAILED",
-                            $"Entity created but could not be converted to construction geometry: {ex.Message}");
-                    }
+                    var coreParts = coreErr.Split(new[] { '|' }, 2);
+                    return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                        coreParts[0], coreParts.Length > 1 ? coreParts[1] : coreErr);
                 }
 
                 string activeSketchName = (activeSketch as IFeature)?.Name ?? "Sketch";

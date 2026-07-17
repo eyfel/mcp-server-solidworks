@@ -29,3 +29,7 @@ jobs:
       - name: pycompiler offline suite (lowering/resolver against a fake port)
         working-directory: solidworks-compiler
         run: python -m pycompiler.tests.test_compiler
+
+      - name: IR contract test (feature-graph.schema.json <-> ir_schema.py drift)
+        working-directory: solidworks-compiler
+        run: python -m pycompiler.tests.test_ir_schema_contract

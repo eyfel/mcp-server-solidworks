@@ -1,8 +1,8 @@
 {
  "_meta": {
   "name": "feature-graph",
-  "version": "0.6.0-draft",
-  "status": "DRAFT — v0.5 vocabulary grown from the REAL production parts in drawing-samples/ (IR-ADR-007): the 1-1 bracket's recorded VOCABULARY_GAP list (path sketch profile, offset datum plane, up_to_surface end condition, edge fillet + edge reference model, construction geometry); v0.5.1 adds the 1-2 flange's gap list (revolve with in-sketch axis, circular_pattern with datum-intersection axis + runtime seed-feature reference). Do NOT freeze before the MAT v1 validation set arrives; v0.6.0 adds the ASSEMBLY sub-vocabulary (component + mate — Phase B, ADR-047), grown from the real assembly samples in drawing-samples/assembly/.",
+  "version": "0.7.1-draft",
+  "status": "DRAFT — v0.5 vocabulary grown from the REAL production parts in drawing-samples/ (IR-ADR-007): the 1-1 bracket's recorded VOCABULARY_GAP list (path sketch profile, offset datum plane, up_to_surface end condition, edge fillet + edge reference model, construction geometry); v0.5.1 adds the 1-2 flange's gap list (revolve with in-sketch axis, circular_pattern with datum-intersection axis + runtime seed-feature reference). Do NOT freeze before the MAT v1 validation set arrives; v0.6.0 adds the ASSEMBLY sub-vocabulary (component + mate — Phase B, ADR-047), grown from the real assembly samples in drawing-samples/assembly/. v0.7.0 (the FORWARD Feature Graph session, IR-ADR-017) deliberately overrides the grow-from-real-parts mantra ONCE to cover the FULL existing part tool surface: sweep, linear_pattern, ellipse/spline profile primitives, graph-level material, edge_flange simple length mode. Known tool-surface limits recorded there (revolve/sweep/loft are boss-only; linear pattern D2 unwired). v0.7.1 (audit-A1) adds NO vocabulary — it PROMOTES eight closed vocabulary sets that existed only as prose (assembly_node_types, mate_types, mate_alignments, anchor_kinds_face/edge, pattern_directions, chamfer_types, bend_positions, edge_flange_positions) plus the two grammar sets (body_producers, feature_producers) into covered_subset as real arrays, so the schema<->ir_schema.py contract test can machine-diff them. Motivation: circular_pattern's seed list had silently rotted to five stale types since 0.7.0 — prose cannot be tested.",
   "role": "CAD-NEUTRAL intermediate representation (IR). The host AI (Planner) emits this; the deterministic solidworks-compiler lowers it to tool calls. The model NEVER emits raw tool sequences.",
   "doubles_as": "Capability registry — the set of supported feature node types + params IS the capability list. The Planner validates intent against this single artifact (no separate chatty discovery protocol)."
  },
@@ -10,6 +10,7 @@
   "schema_version": "string (required — IR schema version this graph targets)",
   "units": "string (fixed: 'meters' — all lengths are SI meters, matching execution layer)",
   "nodes": "array of feature nodes (ordered; order defines build sequence — tree order is law, recipe.md C1)",
+  "material": "object (optional, PART graphs only — {name: 'exact library material name, e.g. 1060 Alloy', library?: 'material database, default SolidWorks Materials'}. Material is DOCUMENT state, not a tree feature, so it lives at graph level, never as a node; the compiler applies it via ONE set_part_material call AFTER the last node. Rejected on assembly graphs.)",
   "_params": "object (optional, additive, IGNORED by the compiler — the lifted parameter map {param_name: {node, field, value_si}} per recipe.md C3)"
  },
  "node_common": {
@@ -35,28 +36,37 @@
    "hint": "string (optional — semantic description for P1.3 data collection, e.g. 'slot inner corner'; NOT read by the compiler)"
   }
  },
- "v05_covered_subset": {
-  "_note": "The subset pycompiler compiles today. Outside it the compiler rejects the graph at structural-validation time (no silent gaps). Superset of the v0-exp subset (box+hole fixture still compiles unchanged).",
+ "covered_subset": {
+  "_note": "The subset pycompiler compiles today (key renamed from v05_covered_subset at 0.7.0 — the version lives in _meta, not the key). Outside it the compiler rejects the graph at structural-validation time (no silent gaps). Superset of the v0-exp subset (box+hole fixture still compiles unchanged). CONTRACT (0.7.1, audit-A1): every ARRAY in this block is machine-diffed against the matching frozenset in solidworks-compiler/pycompiler/ir_schema.py by pycompiler/tests/test_ir_schema_contract.py — both directions, exact set equality. Adding a token on one side alone FAILS CI. The prose keys (_note, datum_offset, assumptions) are deliberately NOT contract; per-param types/ranges live in ir_schema.py code and are exercised by the pycompiler suite, not by string-parsing this file.",
   "node_types": [
    "box",
    "sketch",
    "extrude",
    "revolve",
+   "sweep",
    "rib",
    "hole",
    "fillet",
    "chamfer",
    "loft",
+   "linear_pattern",
    "circular_pattern",
    "sheet_metal",
    "sketched_bend",
-   "mirror"
+   "mirror",
+   "edge_flange"
+  ],
+  "assembly_node_types": [
+   "component",
+   "mate"
   ],
   "profile_kinds": [
    "rectangle",
    "circle",
    "line",
-   "arc"
+   "arc",
+   "ellipse",
+   "spline"
   ],
   "profile_flags": [
    "construction"
@@ -82,10 +92,81 @@
    "up_to_surface",
    "mid_plane"
   ],
+  "pattern_directions": [
+   "x",
+   "y",
+   "z"
+  ],
+  "chamfer_types": [
+   "distance_angle",
+   "distance_distance"
+  ],
+  "bend_positions": [
+   "centerline",
+   "material_inside",
+   "material_outside",
+   "bend_outside"
+  ],
+  "edge_flange_positions": [
+   "centerline",
+   "material_inside",
+   "material_outside",
+   "bend_outside",
+   "bend_sharp"
+  ],
+  "mate_types": [
+   "coincident",
+   "concentric",
+   "perpendicular",
+   "parallel",
+   "tangent",
+   "distance",
+   "angle",
+   "lock"
+  ],
+  "mate_alignments": [
+   "aligned",
+   "anti_aligned",
+   "closest"
+  ],
+  "anchor_kinds_face": [
+   "plane",
+   "cylinder",
+   "cone",
+   "sphere"
+  ],
+  "anchor_kinds_edge": [
+   "line",
+   "circle"
+  ],
+  "body_producers": [
+   "box",
+   "extrude",
+   "revolve",
+   "sweep"
+  ],
+  "feature_producers": [
+   "box",
+   "extrude",
+   "revolve",
+   "sweep",
+   "rib",
+   "hole",
+   "fillet",
+   "chamfer",
+   "loft",
+   "linear_pattern",
+   "circular_pattern",
+   "sheet_metal",
+   "sketched_bend",
+   "mirror",
+   "edge_flange"
+  ],
+  "_grammar_note": "body_producers = node types whose body a 'hole' may reference (ref.node_face.node). feature_producers = node types that CREATE a named feature, so they are valid seeds for linear_pattern/circular_pattern/mirror (the compiler substitutes the seed's runtime feature name). Patterns are producers themselves — that is what lets a grid compose as a pattern OF a pattern.",
   "assumptions": "box centred on the datum origin ('center' -> sketch (0,0)); 'top' bound to global +Y; single body. Path-profile sketches carry EXACT 2D coordinates (from analyze_model(sketch)) — the sketch plane's 2D frame is assumed identical between original and rebuild (same datum/offset => same frame). General 3D-point->sketch-2D resolution for arbitrary faces remains P1.5 option B."
  },
- "feature_types_v05": {
-  "_note": "Profile and operation are SEPARATED on purpose (avoids combinatorial type explosion like 'extruded_circle' + 'extruded_rectangle' + 'revolved_circle'...).",
+ "feature_types": {
+  "_note": "Profile and operation are SEPARATED on purpose (avoids combinatorial type explosion like 'extruded_circle' + 'extruded_rectangle' + 'revolved_circle'...). Key renamed from feature_types_v05 at 0.7.0 — the version lives in _meta.",
   "box": {
    "description": "Rectangular boss convenience node — a single IR node that the compiler lowers to many tool calls (create_sketch on the datum + a centred rectangle + a boss extrude). The clearest demonstration of one feature -> many ops.",
    "ref": "datum (the base plane the box is built on; default 'top')",
@@ -128,6 +209,21 @@
      "y2": "number (end Y)",
      "dir": "1 (CCW) | -1 (CW) — sweep sense, REQUIRED (centre+start+end alone describe two arcs); mirrors analyze_model(sketch)'s 'dir' and add_sketch_entity(arc_center)'s 'direction'"
     },
+    "ellipse": {
+     "kind": "ellipse",
+     "cx": "number (centre X)",
+     "cy": "number (centre Y)",
+     "x1": "number (X of a point on the MAJOR axis)",
+     "y1": "number (Y of that major-axis point)",
+     "x2": "number (X of a point on the MINOR axis)",
+     "y2": "number (Y of that minor-axis point)",
+     "_note": "COVERED since v0.7.0. Exactly the shape analyze_model(sketch) reports and add_sketch_entity(ellipse) consumes — round-trips verbatim."
+    },
+    "spline": {
+     "kind": "spline",
+     "points": "array of FLAT through-point coordinates [x1, y1, x2, y2, ...] — >= 2 points (4 numbers), even count",
+     "_note": "COVERED since v0.7.0. Mirrors analyze_model(sketch)'s spline 'points' (flat x,y list). HONEST CAVEAT (KNOWN-LIMITATIONS): recreating a spline from through-points is VISUALLY equivalent, not bit-identical (SW stores control points + tangency, not interpolation points) — volume/area round-trips within tolerance, never byte-exact."
+    },
     "_common_flag": "any primitive may carry construction: true — created as CONSTRUCTION/reference geometry (mirrors analyze_model's per-segment flag)"
    }
   },
@@ -145,17 +241,31 @@
    "axis": "{ x1, y1, x2, y2 } — the axis SEGMENT's exact 2D sketch coordinates (meters), from analyze_model(sketch); normally the sketch's construction centerline",
    "angle": "number — RADIANS (default 6.283185 = 360°, matching the recipe's SI dimension; the compiler converts to the tool boundary's degrees, C4)"
   },
+  "sweep": {
+   "description": "Swept solid (boss) along a path sketch (COVERED since v0.7.0 — forward-vocabulary session, IR-ADR-017). Lowers to extrude_feature(sweep). GRAMMAR: the PROFILE sketch node must IMMEDIATELY precede the sweep (the tool consumes the ACTIVE sketch as the profile, like extrude); the PATH is an EARLIER sketch node referenced by id — the compiler substitutes its RUNTIME sketch name (node_feature mechanism, localization/numbering-proof, same as loft's profiles). So the node order is: path sketch, ..., profile sketch, sweep. Boss-only (the execution surface has no sweep cut).",
+   "sketch": "string — id of the PROFILE sketch node (must be the immediately preceding node)",
+   "path": "string — id of an EARLIER sketch node holding the sweep path (an open line/arc chain; must not be the profile sketch)"
+  },
   "rib": {
    "description": "Rib feature from an OPEN profile sketch (COVERED since v0.5.2 — grown for the 2-1 angle bracket; required the NEW create_rib execution tool). The profile is typically a single line whose extensions hit existing walls (e.g. the diagonal between an L-bracket's legs); SolidWorks extends and thickens it.",
    "sketch": "string — id of a sketch node (must be the immediately preceding node — the rib consumes the ACTIVE sketch)",
    "thickness": "number — meters (> 0)",
    "two_sided": "boolean (optional, default true — thicken symmetrically about the sketch)",
+   "reverse_thickness_dir": "boolean (optional, default false — SINGLE-SIDED ribs only (two_sided=false): thicken the opposite side of the sketch normal; passthrough added v0.7.0)",
    "reverse_material_dir": "boolean (optional, default false — which side the rib fills toward; a wrong value is auto-recovered by the tool's flipped retry)",
    "is_norm_to_sketch": "boolean (optional, default false — false = extrusion parallel to the sketch, the classic line rib)"
   },
+  "linear_pattern": {
+   "description": "Linear feature pattern along a canonical axis (COVERED since v0.7.0 — forward-vocabulary session, IR-ADR-017). Lowers to create_pattern(linear); the seed is an earlier feature-producing node whose RUNTIME feature name the compiler substitutes (node_feature, same as circular_pattern). SINGLE direction by design: the execution tool's documented count2/spacing2 second direction was never wired in C# (no D2 entity is selected — recorded tool-surface gap); a GRID composes as a pattern OF a pattern (linear_pattern seeding on an earlier linear_pattern node).",
+   "feature": "string — id of an earlier feature-producing node: the pattern seed",
+   "direction": "string — 'x' | 'y' | 'z' (canonical model axis; the tool selects the default plane whose normal is that axis)",
+   "spacing": "number — meters (> 0): distance between adjacent instances",
+   "count": "integer >= 2 — total instances incl. the seed",
+   "flip": "boolean (optional, default false — pattern toward the NEGATIVE axis; exposed v0.7.0 via FeatureLinearPattern3's FlipDir1)"
+  },
   "circular_pattern": {
    "description": "Circular feature pattern (COVERED since v0.5.1). References an EARLIER feature-producing node as the seed — the compiler substitutes that node's RUNTIME-created feature name (localization-proof, same principle as the offset-plane name) — and creates the pattern axis from two datum planes' intersection.",
-   "feature": "string — id of an earlier feature-producing node (box | extrude | revolve | hole | fillet): the pattern seed",
+   "feature": "string — id of an earlier feature-producing node (see covered_subset.feature_producers for the registered list): the pattern seed",
    "axis": "{ datums: [d1, d2] } — two DISTINCT canonical datums ('front'|'top'|'right') whose intersection is the pattern axis (front∩right = the Y axis, etc.); the compiler creates the reference axis and threads its runtime name",
    "count": "integer >= 2 — total instances incl. the seed",
    "angle_deg": "number — DEGREES; with equal_spacing=true the TOTAL spread (360 = full ring), else the spacing BETWEEN instances (reproduce the recipe's CirPattern verbatim: count=instances, angle_deg=spacing_deg, equal_spacing as reported — see create_pattern's round-trip guidance)",
@@ -209,14 +319,15 @@
    "features": "array of >= 1 earlier feature-producing node ids — the features to mirror, in tree order"
   },
   "edge_flange": {
-   "description": "Edge flange with a CUSTOM profile (EdgeFlange; COVERED since v0.5.6 — 4-1's last vocabulary gap). SELF-CONTAINED node: no preceding sketch node — the flange API only accepts a profile sketch IT generated (InsertSketchForEdgeFlange), so the compiler generates it, CLEARS the default rectangle, redraws `profile`, then creates the flange (sheet_metal_feature edge_flange_sketch → add_sketch_entity* → edge_flange_finish). The generated sketch's frame is UNPREDICTABLE, hence `frame` is REQUIRED (IR-ADR-010 transform).",
+   "description": "Edge flange (EdgeFlange; COVERED since v0.5.6 — 4-1's last vocabulary gap). TWO MODES since v0.7.0: (A) CUSTOM PROFILE (the reverse-replay mode) — frame + profile given. SELF-CONTAINED node: no preceding sketch node — the flange API only accepts a profile sketch IT generated (InsertSketchForEdgeFlange), so the compiler generates it, CLEARS the default rectangle, redraws `profile`, then creates the flange (sheet_metal_feature edge_flange_sketch → add_sketch_entity* → edge_flange_finish). The generated sketch's frame is UNPREDICTABLE, hence `frame` is REQUIRED there (IR-ADR-010 transform). (B) SIMPLE LENGTH (the forward mode, v0.7.0/IR-ADR-017) — `length` given INSTEAD of frame+profile: a full-edge-width flange of that length, lowered to ONE sheet_metal_feature(edge_flange) call with the anchor-resolved edge_index. Length mode accepts only edge + angle + length (position stays the tool default material_inside, radius = the sheet default, flip unsupported — use mode A when you need those).",
    "edge": "{ near: [x,y,z], hint?: string } — a 3D point (meters) ON the attach edge, in the geometry state when this node executes (the reader's edge_flange.edges[].mid — ground-truth readback, IR-ADR-014)",
    "angle": "number — RADIANS (default 1.570796 = 90°; the compiler converts to the tool boundary's degrees, C4)",
-   "radius": "number (optional — bend radius in meters; OMITTED = the sheet's default radius)",
-   "position": "string (optional — 'material_inside' (tool default) | 'material_outside' | 'bend_outside' | 'centerline' | 'bend_sharp'; replay the recipe edge_flange block's `position` verbatim — 4-1's Edge-Flange1 is bend_outside)",
-   "flip": "boolean (optional, default false — InsertSketchForEdgeFlange's FlipDir; at 90° the flange plane is flip-invariant and the frame transform absorbs the orientation, but replay it when read)",
-   "frame": "{ origin, xdir, ydir } — the ORIGINAL profile sketch's frame (REQUIRED)",
-   "profile": "array of profile primitives — the ORIGINAL profile sketch's segments, original 2D coords (line/arc/circle + construction flags, same grammar as sketch.profile)"
+   "length": "number — meters (> 0; MODE B only, mutually exclusive with frame/profile): the flange length along the bend direction",
+   "radius": "number (optional, MODE A only — bend radius in meters; OMITTED = the sheet's default radius)",
+   "position": "string (optional, MODE A only — 'material_inside' (tool default) | 'material_outside' | 'bend_outside' | 'centerline' | 'bend_sharp'; replay the recipe edge_flange block's `position` verbatim — 4-1's Edge-Flange1 is bend_outside)",
+   "flip": "boolean (optional, MODE A only, default false — InsertSketchForEdgeFlange's FlipDir; at 90° the flange plane is flip-invariant and the frame transform absorbs the orientation, but replay it when read)",
+   "frame": "{ origin, xdir, ydir } — the ORIGINAL profile sketch's frame (REQUIRED in mode A, ABSENT in mode B)",
+   "profile": "array of profile primitives — the ORIGINAL profile sketch's segments, original 2D coords (line/arc/circle + construction flags, same grammar as sketch.profile; REQUIRED in mode A, ABSENT in mode B)"
   }
  },
  "validation_split": {

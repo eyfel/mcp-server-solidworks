@@ -119,31 +119,20 @@ namespace SolidworksExecution.Services
                     // CreateFeature (ADR-016). Param values reverse-engineered from a manual edge flange:
                     // OffsetType/OffsetDistance is the Flange LENGTH group (OffsetDistance = flange_length);
                     // PositionType=1 = swFlangePositionTypeMaterialInside.
-                    double? ex = p?.Value<double?>("ex");
-                    double? ey = p?.Value<double?>("ey");
-                    double? ez = p?.Value<double?>("ez");
                     double flangeLength = p?.Value<double?>("flange_length") ?? 0.02;
                     double angleDeg = p?.Value<double?>("angle") ?? 90.0;
                     double angleRad = angleDeg * Math.PI / 180.0;
 
-                    if (ex == null || ey == null || ez == null)
-                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "MISSING_PARAMETER",
-                            "edge_flange requires ex, ey, ez (3D coordinates of a point on the target edge).");
-
-                    modelDoc.ClearSelection2(true);
-                    bool sel = modelDoc.Extension.SelectByID2("", "EDGE", ex.Value, ey.Value, ez.Value, false, 0, null, 0);
-                    if (!sel)
-                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "EDGE_NOT_FOUND",
-                            $"No edge found at ({ex.Value}, {ey.Value}, {ez.Value}). Coordinates must be on or very near the edge.");
-
-                    var efSelMgr = modelDoc.SelectionManager as ISelectionMgr;
-                    var flangeEdge = efSelMgr?.GetSelectedObject6(1, -1) as Edge;
+                    // Edge selection shares SelectFlangeEdge with the sketch/finish phases
+                    // (v0.7.0): edge_index (from analyze_model(edges)) PREFERRED — the raw
+                    // coordinate pick can miss a real edge (KNOWN-LIMITATIONS #6); ex/ey/ez
+                    // stay the fallback. The IR's length-mode flange lowers to edge_index.
+                    var flangeEdge = SelectFlangeEdge(modelDoc, p,
+                        p?.Value<double?>("ex"), p?.Value<double?>("ey"), p?.Value<double?>("ez"),
+                        out string efSimpleEdgeErr);
                     if (flangeEdge == null)
                         return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
-                            "EDGE_NOT_FOUND",
-                            $"Entity at ({ex.Value}, {ey.Value}, {ez.Value}) is not an edge.");
+                            "EDGE_NOT_FOUND", efSimpleEdgeErr);
 
                     // Edge flange is a TWO-step API: (1) IModelDoc2.InsertSketchForEdgeFlange generates the
                     // default flange profile sketch on the selected edge, then (2) InsertSheetMetalEdgeFlange2
@@ -162,9 +151,10 @@ namespace SolidworksExecution.Services
 
                     if (efSketch != null)
                     {
-                        // Re-select the edge (sketch creation/exit can clear the selection list).
+                        // Re-select the edge (sketch creation/exit can clear the selection list) —
+                        // via the entity OBJECT so it works for edge_index and coordinate callers alike.
                         modelDoc.ClearSelection2(true);
-                        modelDoc.Extension.SelectByID2("", "EDGE", ex.Value, ey.Value, ez.Value, false, 0, null, 0);
+                        (flangeEdge as IEntity)?.Select4(false, null);
 
                         feature = featureMgr.InsertSheetMetalEdgeFlange2(
                             new Edge[] { flangeEdge }, new Feature[] { (Feature)efSketch },
