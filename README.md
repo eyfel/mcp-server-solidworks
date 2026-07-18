@@ -201,7 +201,9 @@ Add the following entry under `mcpServers`:
 
 ```json
 "SolidPilot": {
-  "args": ["C:\\Users\\<username>\\Desktop\\MCP Server\\adapters\\claude\\server.py"]
+  "command": "C:\\Users\\<username>\\AppData\\Local\\python\\bin\\python.exe",
+  "args": ["C:\\Users\\<username>\\Desktop\\MCP Server\\adapters\\claude\\server.py"],
+  "cwd": "C:\\Users\\<username>\\Desktop\\MCP Server\\adapters\\claude"
 }
 ```
 

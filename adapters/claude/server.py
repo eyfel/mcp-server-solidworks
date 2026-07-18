@@ -943,7 +943,7 @@ def analyze_model(
 # Tool: analyze_drawing
 # ---------------------------------------------------------------------------
 @mcp.tool()
-def analyze_drawing(include_geometry: bool = False) -> str:
+def analyze_drawing(include_geometry: bool = False, include_relations: bool = False) -> str:
     """Analyze the ACTIVE drawing document (read-only, does NOT change state) — the drawing-side sibling
     of analyze_model. Returns a JSON object {view_count, dimension_count, views:[{name, type, scale, pos,
     dimensions:[...], section?}]}: each view's name, type (swDrawingViewTypes_e int), scale, sheet
@@ -979,9 +979,36 @@ def analyze_drawing(include_geometry: bool = False) -> str:
         = a loft/cone/taper). curves are partial arcs (fillets etc.) as start/mid/end + fitted center.
         The line segments carry the UP/DOWN / which-face profile structure a dimension VALUE alone cannot.
         Source: IView.GetPolylines7. Heavier payload — use when you need the shape, not for a dim check.
+        Each frame also carries normal_axis (the view's viewing direction as a SIGNED principal axis,
+        e.g. 'Y'/'-Z'): a CIRCLE in a view is the cross-section of a feature whose axis runs along that
+        view's normal — circles in different-normal_axis views are DIFFERENT features unless a section
+        proves otherwise. Do NOT chain circles across views into one feature by radius alone.
+        Axis-aligned views also carry geometry.extent {axis:[min,max]} — the SERVER-computed model-space
+        span of all primitives (frame signs applied). Read it BEFORE any "no material beyond X" claim;
+        never re-derive a view's span from raw 2D coordinates (frame direction components can be negative).
+
+    include_relations (default False; forces include_geometry): ADDITIVE deterministic enrichment for
+        reverse reading — pass BOTH flags True for a drawing→part reconstruction. Ids are positional,
+        per-read: each view gets vid ('v<views[] index>'); within a view c<i>=circles[i],
+        a<i>=curves[i], l<i>=lines[i]. Every relation carries source (closed enum) + residual (max
+        deviation, meters 6dp) — "why is this concentric?" is answerable by reading the field. Adds:
+      relations per view — concentric:{members,center,radii} (TRUST these shared centers — never
+        re-derive), equal_diameter:{members,r,centers} (same Ø at distinct centers = twin bores),
+        tangent (circle/arc/line contacts), touches (shared-endpoint junctions + T-contacts; projected
+        X-crossings deliberately NOT listed — a 2D crossing has no same-depth guarantee).
+      measures per dimension — the primitive id(s) the dim measures, resolved from its anchors
+        (measure_src anchor_at_center|anchor_on_primitive); a dim with unattached:true resolved to NO
+        primitive — a loud gap to close from geometry, never dropped.
+      stations at root — cross-view JOIN KEYS: per model axis, coordinate values shared by ≥2 views
+        with the candidate entities per view {vid:[ids]}. Candidates only: resolve which candidate is
+        the same physical entity via dimensions; >1 candidate = state the ambiguity explicitly.
+      center_marks / centerlines per view — which circles carry center marks (on:[ids]), centerline
+        segments (through:[ids]); a view reporting centerlines it cannot expose emits
+        {centerlines_reported, unreadable:true} instead of a guess.
 
     Requires an active drawing document (call create_drawing first)."""
-    return _call("analyze_drawing", {"include_geometry": include_geometry})
+    return _call("analyze_drawing", {"include_geometry": include_geometry,
+                                     "include_relations": include_relations})
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # recipe-usage.md — The IR Generation Recipe (usage edition)
 
-**Version: 0.10.0** · Owner: cad-planner · Served to the model section-by-section via the
+**Version: 0.13.0** · Owner: cad-planner · Served to the model section-by-section via the
 `get_recipe` MCP tool. This is the operational rule set for turning an analysis artifact's
 recipe into a Feature Graph IR (and for producing reconstructable drawings). Sections are
 addressed by the slug in each `##` header.
@@ -288,22 +288,58 @@ that into data, not guesswork.
 
 **Reading order — dimensions are the skeleton, vectors close the gaps:**
 
-1. Call `analyze_drawing(include_geometry=True)` ONCE and extract everything from this FIRST
-   read: all dimensions (value_si + anchors + diametric + owning view), all per-view vector
-   geometry (lines / curves / circles), every view's `frame`, and each section view's `section`
-   block. Corner counts, sharp-vs-filleted vertices and exact rectangles are all in this first
-   read — count arcs by radius/region BEFORE sketching, so a miss isn't discovered later via the
-   round-trip.
+1. Call `analyze_drawing(include_geometry=True, include_relations=True)` ONCE and extract
+   everything from this FIRST read: all dimensions (value_si + anchors + diametric + `measures`
+   + owning view), all per-view vector geometry (lines / curves / circles) with their positional
+   ids (`c<i>`/`a<i>`/`l<i>` per view `vid`), the relation groups, the root `stations` table,
+   `center_marks`, every view's `frame` (+ `normal_axis`) and `extent`, and each section view's
+   `section` block. Corner counts,
+   sharp-vs-filleted vertices and exact rectangles are all in this first read — count arcs by
+   radius/region BEFORE sketching, so a miss isn't discovered later via the round-trip.
 2. Build the DIMENSION SKELETON first: place and size every feature that has a dimension from
-   that dimension (an engineer reads the dimension "edge-to-edge 35", not coordinates). A
-   dimension's `anchors` are MODEL-space 3D points — they locate what the value measures.
+   that dimension (an engineer reads the dimension "edge-to-edge 35", not coordinates). Read a
+   dimension's `measures` FIRST — it names the primitive id(s) the value measures, with
+   `measure_src` (anchor_at_center = a Ø/R on that circle/arc) and `measure_residual`; fall back
+   to `anchors` arithmetic only when `measures` is absent. A dimension flagged `unattached:true`
+   is a LOUD gap — resolve what it measures from geometry (typical: an angle dim or an
+   offset-plane dim whose anchors sit off the projected geometry); never drop it.
 3. Close the UNDIMENSIONED gaps from the vectors: engineers deliberately leave out derivable
-   dimensions and twins. An undimensioned feature identical in the vectors to a dimensioned one
-   (same radius circle, mirrored position) INHERITS its twin's size; anything else is measured
-   from the vector geometry through the view frame.
+   dimensions and twins. Twin-hood is DATA now — an `equal_diameter` group (same Ø, distinct
+   centers) states which circles are twins, so the undimensioned twin INHERITS the dimensioned
+   one's size; anything else is measured from the vector geometry through the view frame.
 4. Never guess a coordinate the frame arithmetic can give: for ANY view-2D coordinate (u,v) —
    line endpoints, circle centers, section geometry — `p_model = origin + u*xdir + v*ydir` with
    that view's `frame`.
+
+**MANDATORY PRE-BUILD GATE — write these four tables out BEFORE the first create call.** The
+payload's relations/stations/measures only help if consumed; this gate forces the consumption.
+A build that starts while any row is unresolved is a discipline violation, not a shortcut:
+
+- **G1 — Per-view inventory.** For each view (with its `frame.normal_axis`): every circle, every
+  arc group (by radius), every isolated closed line/arc cluster, tallied and classified as
+  feature section / silhouette / duplicate-of-another-view. A CIRCLE in a view is the
+  cross-section of a feature whose axis runs along that view's normal — circles in
+  different-`normal_axis` views are DIFFERENT features unless a section proves otherwise; never
+  chain circles across views into one feature by radius alone. An isolated closed cluster is a
+  FEATURE (boss or pocket — decide from section/hidden-line evidence), never decoration.
+- **G2 — Dimension coverage table.** EVERY dimension in EVERY view gets a row: value → target
+  feature (from `measures`) or an explicit resolution or a declared gap. `unattached:true` rows
+  MUST appear and MUST end in a resolution or a written C5 gap — an ignored unattached dim is
+  the exact failure mode this gate exists for. Pair same-feature dims by name
+  (`D1@Chamfer1` distance + `D2@Chamfer1` angle describe ONE chamfer).
+- **G3 — Profile decisions per concentric stack.** Concentric circles are WEAK evidence for
+  shape; section/adjacent-view PROFILES are STRONG evidence. When both exist, the section view
+  dominates the geometric interpretation — the concentric circles serve primarily as
+  dimensional and correspondence evidence: they size and locate whatever the profile shows,
+  they do not say WHAT it is (a loft, stepped cylinders, a counterbore and independent coaxial
+  features all project the same circles). For every differing-radii `concentric` group: map the
+  profile geometry through the frame WITH COMPONENT SIGNS (`p = origin + u*xdir + v*ydir` —
+  direction components can be negative) and write the mapped evidence line BEFORE building
+  anything over the group.
+- **G4 — Feature tally, before and after.** Before building: expected counts (holes per axis,
+  fillets per radius, chamfers, lofts/bosses, pockets). After building: list every
+  expected-but-unbuilt item EXPLICITLY (C5). A silently dropped feature is the worst outcome —
+  an explicit "not built: X, because Y" line is acceptable; silence is not.
 
 **Signal rules (each from a real benchmark failure):**
 
@@ -320,11 +356,33 @@ that into data, not guesswork.
   EXTENDS there — an offset-plane feature, a loft/boss nose. Find that feature (an offset-plane
   dimension like `D1@Plane1` plus profile circles usually names it) instead of discarding the
   dimension as inconsistent.
+- **Read `extent` before any "no material beyond X" claim.** `geometry.extent` is the
+  server-computed model-space span of a view's primitives along its resolved axes, with the
+  frame's signs applied. Never re-derive a view's span from raw 2D coordinates — a frame
+  direction component can be negative, and a dropped sign silently mirrors the axis.
+- **Trust the relation groups — never re-derive what they state.** `relations` are deterministic
+  reads, each carrying `source` (a closed enum: why the relation was called) and `residual` (the
+  max measured deviation in meters). A `concentric` group IS the shared center — do not
+  re-compare circle coordinates; `tangent` records state line/arc contacts (a slot's line-arc
+  chain); `touches` gives the wireframe's junction points (shared endpoints + T-contacts;
+  projected X-crossings are deliberately NOT listed — a 2D crossing has no same-depth
+  guarantee, so never infer contact from crossing lines).
 - **Loft/cone/taper signal.** CONCENTRIC full circles of DIFFERING diameter in a plan view plus
   slanted silhouette lines in an adjacent or section view = a loft/cone between those two
   profiles (the circles are its end sections; a third concentric circle is typically a coaxial
-  hole through it). TRUST the geometry read's explicit circle centers (`circles: {cx, cy, r}`) —
-  a shared center is data, not coincidence.
+  hole through it). The `concentric` relation group hands you this stack directly (members +
+  radii + residual) — a shared center is data, not coincidence. This is a SIGNAL, not a verdict:
+  per G3 the section/adjacent-view PROFILE decides the shape; the circles size and locate it.
+- **Resolve cross-view identity from the `stations` table + dimensions.** A primitive's model-axis
+  station lists the CANDIDATE entities at the same coordinate in the other views
+  (`{v, members:{vid:[ids]}}`) — join a plan-view circle to its side-view silhouette lines
+  (center and center±r stations) through them, and use `frame.normal_axis` to know WHICH axis a
+  circle's feature runs along before joining. Candidates are candidates: when a station lists
+  more than one plausible entity and the dimensions don't disambiguate, STATE the ambiguity
+  explicitly — never silently pick one.
+- **A center mark is the drafter's declared feature center.** `center_marks` names the circles
+  (`on:[ids]`) the drafter marked as hole/boss axes — prioritize those circles as real feature
+  sections (not silhouette artifacts) and take their centers as feature positions.
 - **A section view may BE the standard view.** When the side/top view is given AS a section
   (e.g. front + top + Section C-C instead of a plain side view), read the section's OUTER outline
   as that view's profile and its INTERIOR contours as the internal geometry exposed by the cut;
