@@ -10,6 +10,10 @@
 !architecture.md
 !recipe-usage.md
 
+# CI workflow stays LOCAL-ONLY (project decision 2026-07-19) — private dev artifact,
+# not published to GitHub. File is kept locally; only untracked from the repo.
+.github/workflows/ci.yml
+
 .vs/
 
 [Bb]in/
