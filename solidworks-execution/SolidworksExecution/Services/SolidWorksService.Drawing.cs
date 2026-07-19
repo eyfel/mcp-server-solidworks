@@ -1049,6 +1049,23 @@ namespace SolidworksExecution.Services
             catch (Exception ex) { g.Err = ex.Message; return g; }
             int nlen = (arr == null) ? 0 : arr.Length;
 
+            // Hidden-edge filtering (ORTHO views only). GetPolylines7 returns visible AND obscured
+            // (hidden) edges; each record's 6-double "display block" immediately before its point-count
+            // distinguishes them — VISIBLE carries [.,.,-1,1,-1,0], HIDDEN (obscured) carries
+            // [2,1,1,0,-1,0]. Pinned empirically on the 'test' cube (Ø25 blind hole from the top: its
+            // hidden walls + bottom circle) and confirmed 100% clean across level-2-2's lines+curves via
+            // an A/B against a hand-cleaned copy (2026-07-19): every record classified, zero ambiguous.
+            // Ortho views must not leak hidden edges — a hidden bore's circle otherwise reads as a phantom
+            // feature section and the model mis-reconstructs (run #4/#5 "hidden-line confusion"). Section
+            // views (Type==2 / owning an IDrSection) are EXEMPT: the cut face is visible geometry and, as
+            // the A/B showed, carries no hidden records anyway. Hidden straight LINES were already dropped
+            // (the line-scan below requires the visible display block d0==d1==0); this adds the same
+            // discipline to the curve walk, which previously kept obscured arcs/circles.
+            bool _isSection = false;
+            try { _isSection = (view.Type == 2); } catch { }
+            if (!_isSection) { try { _isSection = (view.GetSection() != null); } catch { } }
+            bool filterHidden = !_isSection;
+
             // Line-record signature: arr[i..i+3]==0, arr[i+7]==0, arr[i+8]==2.0, then two points. Each point
             // is (x, y, depth); the 3rd coord is the view DEPTH — CONSTANT per record (0 for some views,
             // non-zero for others), not necessarily 0. Require the two points to share the same depth.
@@ -1092,6 +1109,18 @@ namespace SolidworksExecution.Services
                     if (ok) { N = Ni; basep = b; break; }
                 }
                 if (basep < 0) { j++; continue; }
+                // Drop hidden (obscured) curves/circles from ortho views. The 6-double display block sits
+                // immediately before the point-count (which is at basep-1), i.e. arr[basep-7 .. basep-2];
+                // HIDDEN == [2,1,1,0,-1,0]. Matching the FULL signature is fail-safe — the VISIBLE block
+                // [.,.,-1,1,-1,0] differs in the first field, so a visible edge is never dropped.
+                if (filterHidden && basep >= 7
+                    && Math.Abs(arr[basep - 7] - 2) < 0.5 && Math.Abs(arr[basep - 6] - 1) < 0.5
+                    && Math.Abs(arr[basep - 5] - 1) < 0.5 && Math.Abs(arr[basep - 4]) < 0.5
+                    && Math.Abs(arr[basep - 3] + 1) < 0.5 && Math.Abs(arr[basep - 2]) < 0.5)
+                {
+                    j = basep + 3 * N;   // hidden run — skip entirely
+                    continue;
+                }
                 int mid = N / 2;
                 double sx = arr[basep], sy = arr[basep + 1];
                 double ex = arr[basep + 3 * (N - 1)], ey = arr[basep + 3 * (N - 1) + 1];
@@ -1571,6 +1600,11 @@ namespace SolidworksExecution.Services
                         var owners = new List<string>();
                         foreach (int i in cl) if (!owners.Contains(epOwner[i])) owners.Add(epOwner[i]);
                         if (owners.Count < 2) continue;   // both endpoints of one degenerate primitive
+                        // Payload trim (ADR-057): keep only junctions involving an arc/circle; plain
+                        // line-line corners are corroborating (obvious from the shared line coords).
+                        bool _seHasFeat = false;
+                        foreach (var o in owners) if (o[0] == 'a' || o[0] == 'c') { _seHasFeat = true; break; }
+                        if (!_seHasFeat) continue;
                         double mx = 0, my = 0;
                         foreach (int i in cl) { mx += epx[i]; my += epy[i]; }
                         mx /= cl.Count; my /= cl.Count;
@@ -1629,6 +1663,10 @@ namespace SolidworksExecution.Services
                 for (int i = 0; i < tRecords.Count; i++)
                 {
                     SortPrimitiveIds(tMembers[i]);
+                    // Payload trim (ADR-057): keep only arc/circle T-contacts (line-on-line is corroborating).
+                    bool _tHasFeat = false;
+                    foreach (var mm in tMembers[i]) if (mm[0] == 'a' || mm[0] == 'c') { _tHasFeat = true; break; }
+                    if (!_tHasFeat) continue;
                     touches.Add(new JObject
                     {
                         ["at"] = new JArray { R6(tRecords[i][0]), R6(tRecords[i][1]) },
@@ -1754,18 +1792,29 @@ namespace SolidworksExecution.Services
                             if (!membersByVid.ContainsKey(vid)) membersByVid[vid] = new List<string>();
                             if (!membersByVid[vid].Contains(id)) membersByVid[vid].Add(id);
                         }
-                        var membersJ = new JObject();
+                        // Payload trim (ADR-057): only emit a station that joins a FEATURE axis (some
+                        // circle/arc member); all-line coincidences (block/slot edges) are corroborating.
+                        bool _stHasFeat = false;
                         foreach (var kv in membersByVid)
                         {
-                            SortPrimitiveIds(kv.Value);
-                            membersJ[kv.Key] = new JArray(kv.Value.ToArray());
+                            foreach (var id in kv.Value) if (id[0] == 'c' || id[0] == 'a') { _stHasFeat = true; break; }
+                            if (_stHasFeat) break;
                         }
-                        values.Add(new JObject
+                        if (_stHasFeat)
                         {
-                            ["v"] = R6(mean),
-                            ["members"] = membersJ,
-                            ["residual"] = R6(resid)
-                        });
+                            var membersJ = new JObject();
+                            foreach (var kv in membersByVid)
+                            {
+                                SortPrimitiveIds(kv.Value);
+                                membersJ[kv.Key] = new JArray(kv.Value.ToArray());
+                            }
+                            values.Add(new JObject
+                            {
+                                ["v"] = R6(mean),
+                                ["members"] = membersJ,
+                                ["residual"] = R6(resid)
+                            });
+                        }
                     }
                     i0 = i1 + 1;
                 }

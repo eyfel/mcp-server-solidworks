@@ -235,6 +235,7 @@ The open problem — and the project's real research risk — is a **durable ref
 
 Notes:
 - The Python MCP adapter does not hot-reload while running; after editing `server.py`, the MCP server must be reconnected.
+- Because SolidPilot drives a live SolidWorks GUI session, the analysis tools may occasionally wait for a click in SolidWorks before proceeding, and after a very long analysis the MCP tools can start returning errors (a client-side limit); in either case, tell the assistant to retry and it will continue.
 
 ---
 

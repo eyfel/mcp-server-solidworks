@@ -1,6 +1,6 @@
 # recipe-usage.md — The IR Generation Recipe (usage edition)
 
-**Version: 0.13.0** · Owner: cad-planner · Served to the model section-by-section via the
+**Version: 0.15.0** · Owner: cad-planner · Served to the model section-by-section via the
 `get_recipe` MCP tool. This is the operational rule set for turning an analysis artifact's
 recipe into a Feature Graph IR (and for producing reconstructable drawings). Sections are
 addressed by the slug in each `##` header.
@@ -71,6 +71,13 @@ original — these rules replace the readback discipline there. C1–C5 still ap
   centred on the sketch origin; extrude runs toward +normal (`reversed` flips). A missed
   anchor fails LOUD with the nearest distance — read it, correct the coordinate ONCE (the miss
   distance usually names the mistake, e.g. exactly one sheet thickness), never iterate blindly.
+- **Build direction from the datum.** A boss/extrude on a canonical datum builds toward the
+  datum's +normal — Front→+Z, Top→+Y, Right→+X — unless `reversed`. Material stacks along
+  +normal: a feature built ON TOP of that boss sits at +normal, and a CUT into the material runs
+  −normal (into the solid) — pick the cut sign from this, never by guessing. An `EXTRUSION_FAILED`
+  (or a cut that removes nothing) is almost always the WRONG SIGN — flip the direction ONCE and
+  resubmit; do not re-guess the geometry or iterate blindly (the loud failure IS the sign
+  correction). Fixes the recurring top-hole-drilled-the-wrong-way bug.
 - **Prefer the forward-friendly forms:** `edge_flange` with `length` (not frame+profile —
   those exist for verbatim replay); `material {name, library?}` at graph level; a GRID as a
   pattern OF a pattern (a `linear_pattern` seeding on an earlier `linear_pattern` — the tool
@@ -286,7 +293,30 @@ a topology delta). Real drawings carry the MINIMUM view set (often 2–3 views, 
 section view REPLACING a standard view) and only the necessary dimensions — the rules below turn
 that into data, not guesswork.
 
+**EVIDENCE DISCIPLINE (added 0.14.0 — binding, governs the whole reverse path):**
+
+- **Every build decision is resolved by deterministic evidence, or declared a gap.** A
+  coordinate, a cut depth / end condition, a fillet or chamfer target edge, a feature type —
+  each is fixed by a dimension + its `measures`, a relation group + its `source`/`residual`, a
+  `station`, a `center_mark`, or a frame-mapped coordinate; OR it is written up as an explicit
+  C5 gap. No decision may rest on plausibility. "I assumed / probably / most likely / looks
+  like / appears to be / seems to" are SMELLS, not reasoning: if a decision needs one of them
+  it is NOT yet resolved — find the evidence or declare the gap. (The rule bans the MOVE —
+  deciding without evidence — not the words; honestly describing a projection is fine.)
+- **Unknown stays unknown.** Never substitute the most plausible geometry for missing evidence,
+  and never fall back to a DEFAULT (`through_all`, origin-centred, a "typical" size) in place of
+  evidence — a default is just a guess wearing a familiar value.
+- **A C5 gap must be EARNED.** "unknown / not modeled: X" is legal ONLY after you have shown the
+  deterministic channels that could resolve X were consumed (the relevant
+  concentric/equal_diameter group, the RD and reference dims, the section contours, the stations
+  for that feature). An unchecked "no evidence exists" is itself the violation — on a real
+  drawing the evidence is almost always present and simply unread.
+
 **Reading order — dimensions are the skeleton, vectors close the gaps:**
+
+> Ortho views now carry ONLY VISIBLE edges — the reader drops obscured/hidden edges — so internal
+> and blind-depth evidence comes SOLELY from dimensions + section contours; an ortho outline never
+> shows a hidden internal feature anymore.
 
 1. Call `analyze_drawing(include_geometry=True, include_relations=True)` ONCE and extract
    everything from this FIRST read: all dimensions (value_si + anchors + diametric + `measures`
@@ -313,7 +343,15 @@ that into data, not guesswork.
 
 **MANDATORY PRE-BUILD GATE — write these four tables out BEFORE the first create call.** The
 payload's relations/stations/measures only help if consumed; this gate forces the consumption.
-A build that starts while any row is unresolved is a discipline violation, not a shortcut:
+A build that starts while any row is unresolved is a discipline violation, not a shortcut.
+
+**Terminal-state rule (added 0.14.0).** Every primitive (each circle, arc group, isolated closed
+cluster) AND every dimension (INCLUDING RD reference dims) must end the gate in exactly ONE state:
+(i) consumed by a named feature, (ii) an explicit duplicate/silhouette of a named feature, or
+(iii) a written C5 gap. "Bound to no feature", "decorative", "unmodeled detail" and "ignored" are
+NOT legal terminal states — they are the precise failure this gate exists to stop. The four
+G-tables below ARE that one compact evidence table; no per-decision prose citation is required
+beyond naming the evidence in the row.
 
 - **G1 — Per-view inventory.** For each view (with its `frame.normal_axis`): every circle, every
   arc group (by radius), every isolated closed line/arc cluster, tallied and classified as
@@ -321,7 +359,7 @@ A build that starts while any row is unresolved is a discipline violation, not a
   cross-section of a feature whose axis runs along that view's normal — circles in
   different-`normal_axis` views are DIFFERENT features unless a section proves otherwise; never
   chain circles across views into one feature by radius alone. An isolated closed cluster is a
-  FEATURE (boss or pocket — decide from section/hidden-line evidence), never decoration.
+  FEATURE (boss or pocket — decide from section/adjacent-view evidence), never decoration.
 - **G2 — Dimension coverage table.** EVERY dimension in EVERY view gets a row: value → target
   feature (from `measures`) or an explicit resolution or a declared gap. `unattached:true` rows
   MUST appear and MUST end in a resolution or a written C5 gap — an ignored unattached dim is
@@ -335,11 +373,21 @@ A build that starts while any row is unresolved is a discipline violation, not a
   features all project the same circles). For every differing-radii `concentric` group: map the
   profile geometry through the frame WITH COMPONENT SIGNS (`p = origin + u*xdir + v*ydir` —
   direction components can be negative) and write the mapped evidence line BEFORE building
-  anything over the group.
-- **G4 — Feature tally, before and after.** Before building: expected counts (holes per axis,
-  fillets per radius, chamfers, lofts/bosses, pockets). After building: list every
-  expected-but-unbuilt item EXPLICITLY (C5). A silently dropped feature is the worst outcome —
-  an explicit "not built: X, because Y" line is acceptable; silence is not.
+  anything over the group. Resolve the group as a WHOLE (added 0.14.0): every member circle
+  maps to a feature or a written gap — consuming some members and silently dropping the rest is
+  forbidden. A differing-radius partner is itself evidence: a Ø equal to another Ø + 2·R (R a
+  fillet/chamfer radius) is that round's RIM, coaxial with the hole — e.g. a Ø19 concentric with
+  a Ø15 hole, Δr = R2 = `D1@Fillet2`, is the R2 fillet's rim, not an orphan circle. The section
+  profile decides round-vs-step-vs-counterbore; the concentric pair sizes and locates it.
+- **G4 — Feature tally + DEPTH SOURCE, before and after (depth source added 0.14.0).** Before
+  building: expected counts (holes per axis, fillets per radius, chamfers, lofts/bosses, pockets)
+  AND, for every cut or hole, its depth / end-condition WITH the evidence that fixes it — a
+  section RD/depth dim (via `measures`), or the dimension-OWNERSHIP through-rule, or a written C5
+  gap. `through_all` (and any blind default) may NEVER be assumed: if a section exists it MUST be
+  read for the feature's depth contour before any depth is set, and reference dims (RD*) are
+  evidence, not clutter. After building: list every expected-but-unbuilt item EXPLICITLY (C5). A
+  silently dropped feature is the worst outcome — an explicit "not built: X, because Y" line is
+  acceptable; silence is not.
 
 **Signal rules (each from a real benchmark failure):**
 
@@ -347,10 +395,17 @@ A build that starts while any row is unresolved is a discipline violation, not a
   CORNER chamfer, not a hole chamfer; `@Fillet2` may sit on a feature-INTERSECTION edge (hole ∩
   slot), not a rim. When a fillet/chamfer target is ambiguous, let the round-trip topology delta
   pin it — never infer the target face/edge from the dimension name alone.
-- **Through-vs-blind: trust dimension OWNERSHIP.** A hole/slot whose POSITION dims are owned by
-  the base sketch (`@Sketch1`) is a loop IN that sketch → it goes THROUGH the base extrude. Do not
-  override this from an ambiguous section-view "looks blind" read. One-datum confirmation: the
-  feature's hidden outline spans the FULL depth in an ortho view.
+- **Through-vs-blind: dimension OWNERSHIP proves THROUGH, the section RD dim proves BLIND.** A
+  hole/slot whose POSITION dims are owned by the base sketch (`@Sketch1`) is a loop IN that sketch
+  → it goes THROUGH the base extrude. A BLIND depth is fixed by the section's depth contour and its
+  RD/reference dim (via `measures`) — read them; NEVER default to `through_all` because "there was
+  no plain depth dim", the RD dims carry it (run #3 cut two blind holes through_all after declaring
+  "no depth dims existed" — RD2=0.055 and RD3=0.095 were in Section C-C, measuring the hole
+  bottoms). The SECTION is the arbiter of blind-vs-through (ortho views no longer carry hidden
+  outlines): a section that covers the feature's axis and shows a terminating contour (floor /
+  cone) + its RD depth dim ⇒ BLIND, take the depth from there; a section that covers the axis but
+  shows NO terminating contour ⇒ nothing stops it ⇒ THROUGH; NO section covering that axis ⇒ the
+  depth is a declared C5 gap (per G4), never a `through_all` default.
 - **An anchor beyond the base body is a FEATURE, not bad data.** A dimension anchor whose
   coordinate lies BEYOND the base extrude's depth (e.g. z=65.1 mm on a 45 mm body) means the part
   EXTENDS there — an offset-plane feature, a loft/boss nose. Find that feature (an offset-plane
@@ -373,6 +428,8 @@ A build that starts while any row is unresolved is a discipline violation, not a
   hole through it). The `concentric` relation group hands you this stack directly (members +
   radii + residual) — a shared center is data, not coincidence. This is a SIGNAL, not a verdict:
   per G3 the section/adjacent-view PROFILE decides the shape; the circles size and locate it.
+  (An INTERNAL taper/cone's silhouette is a hidden edge — no longer emitted in ortho views — so
+  read it from the SECTION; only EXTERNAL loft/cone silhouettes still appear as visible outlines.)
 - **Resolve cross-view identity from the `stations` table + dimensions.** A primitive's model-axis
   station lists the CANDIDATE entities at the same coordinate in the other views
   (`{v, members:{vid:[ids]}}`) — join a plan-view circle to its side-view silhouette lines
@@ -438,6 +495,9 @@ plane; an axis PERPENDICULAR to the plane shows only its cross-section outline. 
 left) → Hidden Lines Visible (hidden edges SHOWN for reference, NEVER dimensioned to);
 `add_drawing_view` already defaults ortho views to HLV. Isometric and SECTION views are
 EXCLUDED from the HLV rule — isometric keeps the document default, sections show the cut face.
+HLV is now HUMAN-FACING only: the reverse reader drops hidden edges, so a drawing must carry a
+SECTION for every internal-depth axis (per the section-coverage rule above) — hidden lines can no
+longer stand in for a missing section.
 
 **View sourcing — always pass `model_path` explicitly.** `add_drawing_view` without
 `model_path` projects the FIRST OPEN part, not the drawing's referenced model. Before building

@@ -2028,6 +2028,17 @@ def submit_feature_graph(graph: str, fresh_document: bool = True) -> str:
     compiler lowers each IR node to the right low-level tool sequence and resolves references
     (geometric anchors, runtime feature names) against live geometry.
 
+    ★ PRIMARY BUILD PATH — prefer this whenever you are CREATING a part/assembly (including a
+    reverse reconstruction from a drawing). Assemble the WHOLE feature graph and submit it ONCE;
+    do NOT hand-build feature-by-feature with the individual low-level tools
+    (create_sketch/extrude_feature/add_edge_feature/…). One graph keeps tree order intact, lets
+    the compiler resolve anchors + runtime feature names deterministically, and takes far fewer
+    round-trips. The low-level tools are for RECOVERY (re-doing one failed node), a genuine
+    one-off edit, or a feature the IR vocabulary cannot yet express — not for routine
+    construction. If you truly cannot express the whole part in one graph yet, still submit the
+    LARGEST coherent batches (fresh_document=True for the first, append with fresh_document=False),
+    never one node at a time.
+
     graph: the Feature Graph as a JSON STRING. Authoring from DESIGN INTENT: read
         get_recipe('forward') FIRST (grammar, anchor design, self-verification), plus
         get_recipe(section='feature_graph_schema') — the schema IS the capability registry.
