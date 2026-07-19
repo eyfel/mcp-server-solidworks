@@ -1,6 +1,6 @@
 # recipe-usage.md — The IR Generation Recipe (usage edition)
 
-**Version: 0.15.0** · Owner: cad-planner · Served to the model section-by-section via the
+**Version: 0.16.0** · Owner: cad-planner · Served to the model section-by-section via the
 `get_recipe` MCP tool. This is the operational rule set for turning an analysis artifact's
 recipe into a Feature Graph IR (and for producing reconstructable drawings). Sections are
 addressed by the slug in each `##` header.
@@ -415,6 +415,18 @@ beyond naming the evidence in the row.
   server-computed model-space span of a view's primitives along its resolved axes, with the
   frame's signs applied. Never re-derive a view's span from raw 2D coordinates — a frame
   direction component can be negative, and a dropped sign silently mirrors the axis.
+- **Map view coordinates through MODEL space — verify the SIGN, not just the axis.** When you read
+  a feature's position from a drawing view (a corner fillet/chamfer, an off-centre hole), NEVER
+  carry the view-local (u,v) straight onto a sketch's local axes: first map view→MODEL with the
+  view frame (`p_model = origin + u*xdir + v*ydir`, signs applied), then express it in the target
+  sketch's own frame. The view frame and the sketch-plane frame have INDEPENDENT sign conventions —
+  the classic top-plane mirror: a Top-plane sketch's +vertical is the top-VIEW's −vertical, so
+  taking view-y>0 directly as sketch +v flips top↔bottom. A dropped sign builds VALID geometry (no
+  loud error — it self-heals nothing; only a round-trip catches it), unlike an axis-IDENTITY error
+  which fails loud (`REFERENCE_UNRESOLVED`). CORNER fillets/chamfers are the sign CANARY — the only
+  asymmetric features, so a vertical mirror surfaces there first (a top-right round landing
+  bottom-right, a top-left chamfer landing bottom-left). Verify each corner feature's mapped
+  position against the outline vertex it sits on before building.
 - **Trust the relation groups — never re-derive what they state.** `relations` are deterministic
   reads, each carrying `source` (a closed enum: why the relation was called) and `residual` (the
   max measured deviation in meters). A `concentric` group IS the shared center — do not
