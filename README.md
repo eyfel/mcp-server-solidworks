@@ -2,7 +2,9 @@
 
 **AI-driven CAD automation for SolidWorks — an MCP (Model Context Protocol) server.**
 
-![SolidPilot Demo](sample.gif)
+<p align="center">
+  <img src="assets/demo.gif" alt="SolidPilot Demo">
+</p>
 
 SolidPilot lets an AI model work with SolidWorks at the **CAD feature level**. The goal is for the model to reason in terms of "which CAD intent am I realizing?" instead of "which API method should I call?". Intent is converted into a CAD-neutral intermediate representation, and a deterministic compiler lowers that representation into concrete SolidWorks operations.
 
