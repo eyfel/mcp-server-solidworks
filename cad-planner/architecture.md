@@ -2,7 +2,7 @@
 
 Role: **AI Planning / Intent Layer (CAD-NEUTRAL)**
 
-> Renamed from `solidworks-planner`. It is deliberately **CAD-neutral** — it knows feature *intent*, not SolidWorks. The SolidWorks-specific work lives in `solidworks-compiler` + `solidworks-execution`.
+> Renamed from `solidworks-planner`. It is deliberately **CAD-neutral** — it knows feature *intent*, not SolidWorks. The SolidWorks-specific work lives in `compiler/solidworks` + `execution/solidworks`.
 
 This layer turns user intent into a **CAD-neutral Feature Graph IR**. It operates at the **CAD feature level, NOT the tool level** — the shift that defines this architecture:
 
@@ -10,7 +10,7 @@ This layer turns user intent into a **CAD-neutral Feature Graph IR**. It operate
 - ✅ new: "which CAD intent am I realizing?"
 
 ```
-User intent ─▶ Planner (intent → Feature Graph IR) ─▶ [IR] ─▶ solidworks-compiler ─▶ execution ─▶ SolidWorks
+User intent ─▶ Planner (intent → Feature Graph IR) ─▶ [IR] ─▶ compiler/solidworks ─▶ execution ─▶ SolidWorks
 ```
 
 ## Phase 1 vs Phase 2 (important)
@@ -41,7 +41,7 @@ User intent ─▶ Planner (intent → Feature Graph IR) ─▶ [IR] ─▶ soli
 ## Contracts
 
 - `contracts/feature-graph.schema.json` — the neutral IR **and** capability registry (single source of truth, DRAFT v0).
-- The SolidWorks-specific low-level contracts (`tool-schemas.json`, `state-format.json`, `execution-response.json`) now live under `solidworks-execution/contracts/` — the Planner does not depend on them.
+- The SolidWorks-specific low-level contracts (`tool-schemas.json`, `state-format.json`, `execution-response.json`) now live under `execution/solidworks/contracts/` — the Planner does not depend on them.
 
 ## Open design question (flagged, not solved)
 

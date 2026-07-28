@@ -477,7 +477,9 @@ namespace SolidworksExecution.Services
             }
         }
 
-        // analyze_drawing — read the ACTIVE drawing structurally (the drawing-side sibling of analyze_model):
+        // analyze_slddrw_test (was analyze_drawing until 2026-07-27) — read the ACTIVE NATIVE .SLDDRW
+        // structurally. TEST/REFERENCE ONLY: the shipping reverse path is moving to a DXF/DWG reader;
+        // the fields below (measures/section/normal_axis/relations/extent) are COM constructs a DXF lacks.:
         // every view's {name, type, scale, pos} + its dimensions {name, value_si}. Read-only, does NOT bump
         // state_version (same pattern as AnalyzeModel/VerifyState). Feeds the objective Stage-1 check (do the
         // drawing's dims match the model?) and the Stage-2 re-modeling input. Packs one JSON string into
@@ -604,8 +606,8 @@ namespace SolidworksExecution.Services
                 root["views"] = viewsArr;
                 if (includeRelations)
                 {
-                    var st = ComputeStations(stationViews);
-                    if (st != null) root["stations"] = st;
+                    // stations table DROPPED (2026-07-19 trim) — the benchmark data-consumption report
+                    // showed it unconsumed (the model cross-references views by dimension, not this table).
                     if (relSkippedVids.Count > 0) root["relations_skipped_views"] = relSkippedVids;
                 }
 
@@ -1563,125 +1565,12 @@ namespace SolidworksExecution.Services
                 }
             }
 
-            // touches: shared-endpoint junctions + endpoint-on-curve T-contacts (no X-crossings).
-            var touches = new JArray();
-            {
-                var epx = new List<double>(); var epy = new List<double>(); var epOwner = new List<string>();
-                for (int i = 0; i < g.Lines.Count; i++)
-                {
-                    epx.Add(g.Lines[i].X1); epy.Add(g.Lines[i].Y1); epOwner.Add("l" + i);
-                    epx.Add(g.Lines[i].X2); epy.Add(g.Lines[i].Y2); epOwner.Add("l" + i);
-                }
-                for (int i = 0; i < g.Curves.Count; i++)
-                {
-                    epx.Add(g.Curves[i].SX); epy.Add(g.Curves[i].SY); epOwner.Add("a" + i);
-                    epx.Add(g.Curves[i].EX); epy.Add(g.Curves[i].EY); epOwner.Add("a" + i);
-                }
-                int m = epx.Count;
-                if (m >= 2)
-                {
-                    var uf = new UF(m);
-                    for (int i = 0; i < m; i++)
-                        for (int j = i + 1; j < m; j++)
-                            if (Dist2D(epx[i], epy[i], epx[j], epy[j]) <= RelTol)
-                                uf.Union(i, j);
-                    var clusters = new Dictionary<int, List<int>>();
-                    for (int i = 0; i < m; i++)
-                    {
-                        int r = uf.Find(i);
-                        if (!clusters.ContainsKey(r)) clusters[r] = new List<int>();
-                        clusters[r].Add(i);
-                    }
-                    var ordered = new List<List<int>>();
-                    foreach (var kv in clusters) if (kv.Value.Count >= 2) ordered.Add(kv.Value);
-                    ordered.Sort((a, b) => a[0].CompareTo(b[0]));
-                    foreach (var cl in ordered)
-                    {
-                        var owners = new List<string>();
-                        foreach (int i in cl) if (!owners.Contains(epOwner[i])) owners.Add(epOwner[i]);
-                        if (owners.Count < 2) continue;   // both endpoints of one degenerate primitive
-                        // Payload trim (ADR-057): keep only junctions involving an arc/circle; plain
-                        // line-line corners are corroborating (obvious from the shared line coords).
-                        bool _seHasFeat = false;
-                        foreach (var o in owners) if (o[0] == 'a' || o[0] == 'c') { _seHasFeat = true; break; }
-                        if (!_seHasFeat) continue;
-                        double mx = 0, my = 0;
-                        foreach (int i in cl) { mx += epx[i]; my += epy[i]; }
-                        mx /= cl.Count; my /= cl.Count;
-                        double resid = 0;
-                        foreach (int i in cl) resid = Math.Max(resid, Dist2D(epx[i], epy[i], mx, my));
-                        SortPrimitiveIds(owners);
-                        touches.Add(new JObject
-                        {
-                            ["at"] = new JArray { R6(mx), R6(my) },
-                            ["members"] = new JArray(owners.ToArray()),
-                            ["source"] = "shared_endpoint",
-                            ["residual"] = R6(resid)
-                        });
-                    }
-                }
-
-                // endpoint_on_curve: an endpoint lying on ANOTHER primitive's INTERIOR (T-contact).
-                var tRecords = new List<double[]>();     // {x, y, residual}
-                var tMembers = new List<List<string>>();
-                for (int e = 0; e < m; e++)
-                {
-                    string owner = epOwner[e];
-                    double px = epx[e], py = epy[e];
-                    for (int li = 0; li < g.Lines.Count; li++)
-                    {
-                        if (owner == "l" + li) continue;
-                        var l = g.Lines[li];
-                        double segLen = Dist2D(l.X1, l.Y1, l.X2, l.Y2);
-                        if (segLen < 1e-12) continue;
-                        double tolT = RelTol / segLen;
-                        double tRaw;
-                        double dseg = SegDist(px, py, l.X1, l.Y1, l.X2, l.Y2, out tRaw);
-                        if (dseg > RelTol) continue;
-                        if (tRaw < tolT || tRaw > 1 - tolT) continue;   // endpoint region ⇒ shared_endpoint's turf
-                        AddTContact(tRecords, tMembers, px, py, dseg, owner, "l" + li);
-                    }
-                    for (int ci = 0; ci < nc; ci++)
-                    {
-                        double dev = Math.Abs(Dist2D(px, py, g.Circles[ci].CX, g.Circles[ci].CY) - g.Circles[ci].R);
-                        if (dev > RelTol) continue;
-                        AddTContact(tRecords, tMembers, px, py, dev, owner, "c" + ci);
-                    }
-                    for (int ai = 0; ai < g.Curves.Count; ai++)
-                    {
-                        if (owner == "a" + ai) continue;
-                        var a = g.Curves[ai];
-                        if (!a.HasCenter) continue;
-                        double dev = Math.Abs(Dist2D(px, py, a.CX, a.CY) - a.R);
-                        if (dev > RelTol) continue;
-                        if (!AngOnArc(a, px, py)) continue;
-                        // near the arc's own endpoints it is a shared_endpoint junction, not a T
-                        if (Dist2D(px, py, a.SX, a.SY) <= RelTol || Dist2D(px, py, a.EX, a.EY) <= RelTol) continue;
-                        AddTContact(tRecords, tMembers, px, py, dev, owner, "a" + ai);
-                    }
-                }
-                for (int i = 0; i < tRecords.Count; i++)
-                {
-                    SortPrimitiveIds(tMembers[i]);
-                    // Payload trim (ADR-057): keep only arc/circle T-contacts (line-on-line is corroborating).
-                    bool _tHasFeat = false;
-                    foreach (var mm in tMembers[i]) if (mm[0] == 'a' || mm[0] == 'c') { _tHasFeat = true; break; }
-                    if (!_tHasFeat) continue;
-                    touches.Add(new JObject
-                    {
-                        ["at"] = new JArray { R6(tRecords[i][0]), R6(tRecords[i][1]) },
-                        ["members"] = new JArray(tMembers[i].ToArray()),
-                        ["source"] = "endpoint_on_curve",
-                        ["residual"] = R6(tRecords[i][2])
-                    });
-                }
-            }
-
+            // touches DROPPED (2026-07-19 trim) — the benchmark data-consumption report showed it
+            // fully redundant with `tangent` for corner/junction identification and otherwise unused.
             var rel = new JObject();
             if (concentric.Count > 0) rel["concentric"] = concentric;
             if (equalDia.Count > 0) rel["equal_diameter"] = equalDia;
             if (tangent.Count > 0) rel["tangent"] = tangent;
-            if (touches.Count > 0) rel["touches"] = touches;
             return rel.Count > 0 ? rel : null;   // empty buckets dropped
         }
 

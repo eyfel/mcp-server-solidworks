@@ -1,10 +1,10 @@
 """pycompiler — deterministic Feature Graph IR compiler (EXPERIMENTAL, P1.4/P1.7).
 
 Lowers a CAD-neutral Feature Graph IR (cad-planner/contracts/feature-graph.schema.json,
-v0-exp subset) into ordered calls to the EXISTING solidworks-execution low-level tools, and
+v0-exp subset) into ordered calls to the EXISTING execution/solidworks low-level tools, and
 resolves semantic references (top_face / center) against live geometry.
 
-Architectural rules (see solidworks-compiler/architecture.md + master-architecture.md):
+Architectural rules (see compiler/solidworks/architecture.md + master-architecture.md):
   - Deterministic. NO LLM, NO MCP, NO COM.
   - Reaches the execution layer ONLY through an injected ExecutionPort (plain REST behind it),
     never by importing the adapter, FastMCP, or httpx. This is what keeps the module separable:

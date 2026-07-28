@@ -1,11 +1,11 @@
-# solidworks-compiler — Architecture
+# compiler/solidworks — Architecture
 
 Role: **Deterministic CAD Compiler (SolidWorks-specific)**
 
 This layer sits **between the Feature Graph IR and the Execution Layer**. It is **deterministic — it contains NO LLM and NO AI calls.** It is the "second planner," but a deterministic, reproducible one (this is intentional, not the thing we were avoiding — what we avoid is a *second LLM* re-doing the host model's reasoning).
 
 ```
-Feature Graph IR  ──▶  solidworks-compiler  ──▶  Execution Layer (REST)  ──▶ SolidWorks
+Feature Graph IR  ──▶  compiler/solidworks  ──▶  Execution Layer (REST)  ──▶ SolidWorks
                        (compiler + resolver)
 ```
 

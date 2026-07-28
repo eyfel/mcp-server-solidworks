@@ -13,8 +13,8 @@ The system has four layers, and preserving these boundaries is the foundation of
 | Layer | Directory | Responsibility |
 |---|---|---|
 | `cad-planner` | `cad-planner/` | Intent -> CAD-neutral Feature Graph IR. Does not touch COM, does not emit raw tool calls. |
-| `solidworks-compiler` | `solidworks-compiler/` | IR -> tool calls + reference resolution. Deterministic; contains no LLM and no MCP. |
-| `solidworks-execution` | `solidworks-execution/` | The only layer that touches SolidWorks COM (C#, .NET 4.8). |
+| `compiler/solidworks` | `compiler/solidworks/` | IR -> tool calls + reference resolution. Deterministic; contains no LLM and no MCP. |
+| `execution/solidworks` | `execution/solidworks/` | The only layer that touches SolidWorks COM (C#, .NET 4.8). |
 | `adapters/claude` | `adapters/claude/` | MCP protocol bridge (Python, FastMCP). |
 
 Rules that must never be violated:
@@ -40,17 +40,17 @@ Rules that must never be violated:
 Build:
 
 ```
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" solidworks-execution\SolidworksExecution.sln /t:Build /p:Configuration=Debug
+& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" execution\solidworks\SolidworksExecution.sln /t:Build /p:Configuration=Debug
 ```
 
 Restart (headless, `http://localhost:5000`):
 
 ```
 Get-Process SolidworksExecution -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Process solidworks-execution\SolidworksExecution\bin\Debug\SolidworksExecution.exe -WindowStyle Hidden
+Start-Process execution\solidworks\SolidworksExecution\bin\Debug\SolidworksExecution.exe -WindowStyle Hidden
 ```
 
-The server runs headless and must be running while SolidWorks is open (the COM connection is established lazily, on the first tool call). C#-side errors and per-request traces are written to `solidworks-execution\SolidworksExecution\bin\Debug\execution.log`.
+The server runs headless and must be running while SolidWorks is open (the COM connection is established lazily, on the first tool call). C#-side errors and per-request traces are written to `execution\solidworks\SolidworksExecution\bin\Debug\execution.log`.
 
 ### Running the adapter
 
@@ -68,7 +68,7 @@ python server.py
 
 ### A new low-level tool (execution surface)
 
-1. **Contract** — add the tool to `solidworks-execution/contracts/tool-schemas.json`.
+1. **Contract** — add the tool to `execution/solidworks/contracts/tool-schemas.json`.
 2. **Execution** — add a `case "tool_name":` in `ToolController.cs` and implement it in the matching `SolidWorksService.<Family>.cs` **partial class** under `Services/` (one class split by tool family: core / Sketch / Features / SheetMetal / Drawing / Analyze / Assembly; a new file also needs a `<Compile Include>` entry in the csproj). **Verify any SolidWorks COM API signature by reflecting the interop assembly first — never invent a method name or argument list.** The real API frequently differs from what looks plausible (for example, the model-item insertion API lives on `IDrawingDoc`, not `IView`; `GetLines3` returns empty while `GetPolylines7` is the working geometry getter). Decode unknown return shapes empirically against a live document before writing the parser.
 3. **Adapter** — register the MCP tool in `adapters/claude/server.py`. Model-facing guidance lives here (the client never sees `tool-schemas.json`): use `Literal` enums for discriminators, Pydantic `Field` constraints for units and ranges, and real required parameters.
 4. **Verify** — run the contract test (see below), then validate against live SolidWorks.
@@ -76,7 +76,7 @@ python server.py
 ### A new feature (IR level — the strategic direction)
 
 1. Add the feature type to `cad-planner/contracts/feature-graph.schema.json` (this also registers the capability).
-2. Add its lowering rule and any required reference resolution in `solidworks-compiler`.
+2. Add its lowering rule and any required reference resolution in `compiler/solidworks`.
 3. It reuses existing low-level tools; usually no new execution tool is needed.
 
 > **The two IR doors:** `rebuild_from_ir` is the **reverse** door (rebuilds a part/assembly from its analysis artifact's IR block — the round-trip that verifies an LLM-proposed IR). `submit_feature_graph` is the **forward** door (builds from a Feature Graph the model supplies directly, from design intent, with no original to copy); it is **live and gate-free**. Both doors run through the same `pycompiler` — **never fork the compiler**. Note the different failure surface: the reverse door can warn `source_stale` because it has an artifact hash to check, whereas the forward door takes a raw graph and has nothing to compare against — so a forward run must self-verify by computing its expected outcome (see `get_recipe('forward')`).
@@ -107,10 +107,10 @@ python server.py
 
 - **Live testing (manual by design):** tools are verified against live SolidWorks, with the GUI open, case by case. A cohesive batch of tools is chosen together and tested as a batch. When a tool fails, inspect `execution.log` and report the expected result, the API response, and a hypothesis. For drawing tools, the exported **PDF is the ground truth** — some interop counters under-report (e.g. inserted annotations / center marks), so confirm a drawing change by exporting and reading the PDF rather than trusting an in-band count alone.
 
-- **Compiler suite:** `solidworks-compiler/pycompiler/tests/` exercises IR validation, lowering, and reference resolution against a fake execution port — fully offline.
+- **Compiler suite:** `compiler/solidworks/pycompiler/tests/` exercises IR validation, lowering, and reference resolution against a fake execution port — fully offline.
 
   ```
-  cd solidworks-compiler
+  cd compiler/solidworks
   python -m pycompiler.tests.test_compiler
   ```
 

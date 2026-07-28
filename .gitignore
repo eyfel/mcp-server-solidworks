@@ -31,6 +31,8 @@ env/
 
 *.log
 
+dxf-research/
+
 Thumbs.db
 .DS_Store
 
@@ -42,10 +44,10 @@ scratch/
 # Ship the compiled C# execution server so non-developers can run SolidPilot
 # without building it. Debug (not Release): the project is under active development
 # and each build is validated locally before push. Runtime *.log stays out.
-!solidworks-execution/SolidworksExecution/bin/
-solidworks-execution/SolidworksExecution/bin/*
-!solidworks-execution/SolidworksExecution/bin/Debug/
-!solidworks-execution/SolidworksExecution/bin/Debug/**
-solidworks-execution/SolidworksExecution/bin/Debug/*.log
+!execution/solidworks/SolidworksExecution/bin/
+execution/solidworks/SolidworksExecution/bin/*
+!execution/solidworks/SolidworksExecution/bin/Debug/
+!execution/solidworks/SolidworksExecution/bin/Debug/**
+execution/solidworks/SolidworksExecution/bin/Debug/*.log
 
 

@@ -1,0 +1,29 @@
+{
+  "_comment": "User-adjustable drafting/manufacturing conventions. The reader and the recipe read these instead of re-deriving them per drawing — settling a convention here is cheaper and safer than making the model reason about it every time (a wrong guess builds VALID but mirrored geometry).",
+
+  "projection": "first_angle",
+  "_projection": "first_angle (ISO/European, set 2026-07-27) | third_angle (ASME/American). Decides which physical face a placed view shows. FIRST: the view BELOW the front view is the TOP view, and the object's BACK is at that view's TOP edge (adjacent to the front view). THIRD: mirror of that. Samples f-1 = third_angle (drawn before the switch); f-2 / s-2 = first_angle.",
+
+  "sheet_metal": {
+    "k_factor": 0.5,
+    "_k_factor": "Neutral-axis factor used when converting bent-state dimensions to a flat blank and back. 0.5 = the SolidWorks default, VERIFIED on s-1 and s-2 to 6 decimals. If a drawing's own flat pattern disagrees with the arithmetic, the reader FLAGS it (k_factor_mismatch) rather than silently re-deriving.",
+    "bend_note_pattern": "^(UP|DOWN)\\s+([0-9.]+)\\s*(?:°|deg)?\\s*R\\s*([0-9.]+)$",
+    "_bend_note_pattern": "Flat-pattern bend annotation. Locale is NOT translated by SolidWorks (user-confirmed: always UP/DOWN).",
+    "bend_class_map": {"UP": "visible", "DOWN": "hidden"},
+    "_bend_class_map": "Which EDGE CLASS a bend line of each direction is drawn with. SolidWorks views the flat pattern from one side, so a bend folding away is an obscured edge. This is the second, independent channel that identifies WHICH line a note annotates (recipe R10) — stated here rather than hardcoded because it is a drafting convention, not a law.",
+    "bend_flip_map": {"UP": false, "DOWN": true},
+    "_bend_flip_map": "Which UP/DOWN direction needs the sketched-bend `flip` flag. WHICH WAY SolidWorks folds depends on the sheet's INTRINSIC orientation (set by the base flange's thickness-direction flags, IR-ADR-014), not on anything the drawing says — so this is a build convention that pairs with reverse_thickness=false, verified by rebuilding s-1/s-2 and comparing. Flip these two booleans if a rebuild folds the mirrored way.",
+    "bend_note_max_offset_mm": 25.0,
+    "_bend_note_max_offset_mm": "Safety net: a candidate line further than this (in PAPER mm) from its note is not a candidate at all. Observed offsets on s-1/s-2 are 4.51-4.52 mm, so 25 is ~5x headroom.",
+    "note_above_bend_line": true,
+    "_note_above_bend_line": "The UP/DOWN annotation sits ABOVE the line it annotates, along the note's own local up axis (its DXF rotation). Candidates are therefore restricted to lines PARALLEL to the note's baseline on the NEGATIVE side of that axis. VERIFIED 6/6 on s-1 + s-2 (all offsets 4.51-4.52 mm, rotation 0). The ROTATED-note case is untested — see logs.md KNOWN RISKS."
+  },
+
+  "tolerance": {
+    "coord_eps_mm": 0.001,
+    "cluster_gap_mm": 1.0,
+    "_cluster_gap_mm": "Bounding-box gap below which two primitives are treated as one view cluster.",
+    "chain_eps_mm": 0.01,
+    "_chain_eps_mm": "Endpoint-coincidence tolerance for contour chaining. Deliberately looser than coord_eps_mm (0.001 is inside DXF float noise) and far below any real feature."
+  }
+}

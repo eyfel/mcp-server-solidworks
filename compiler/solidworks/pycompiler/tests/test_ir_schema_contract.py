@@ -23,15 +23,17 @@ Scope — CONTRACT vs PROSE (decided 2026-07-17 with the user):
 
 Run two ways:
   - standalone:  python -m pycompiler.tests.test_ir_schema_contract   (exits non-zero on drift)
-  - pytest:      pytest solidworks-compiler/pycompiler/tests/test_ir_schema_contract.py
+  - pytest:      pytest compiler/solidworks/pycompiler/tests/test_ir_schema_contract.py
 """
 import json
 import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_COMPILER_ROOT = os.path.dirname(os.path.dirname(_HERE))   # solidworks-compiler/
-_REPO_ROOT = os.path.dirname(_COMPILER_ROOT)
+_COMPILER_ROOT = os.path.dirname(os.path.dirname(_HERE))   # compiler/solidworks/
+# The backend compiler lives TWO levels below the repo root (compiler/<backend>/), so the
+# repo root is two dirnames up — not one (2026-07-27 restructure).
+_REPO_ROOT = os.path.dirname(os.path.dirname(_COMPILER_ROOT))
 if _COMPILER_ROOT not in sys.path:
     sys.path.insert(0, _COMPILER_ROOT)
 

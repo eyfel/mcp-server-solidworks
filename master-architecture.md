@@ -21,11 +21,11 @@ The defining idea: the AI works at the **CAD feature level**, not the tool level
    ══════════════ MCP BOUNDARY ══════════════  ← host submits IR via ONE tool: submit_feature_graph(graph)
                   │
                   ▼
-      Deterministic CAD Compiler             ← solidworks-compiler (NO LLM, NO MCP)
+      Deterministic CAD Compiler             ← compiler/solidworks (NO LLM, NO MCP)
         (+ Reference Resolver)
                   │   REST
                   ▼
-          Execution Layer                    ← solidworks-execution (C#, only layer touching COM)
+          Execution Layer                    ← execution/solidworks (C#, only layer touching COM)
                   │   COM
                   ▼
              SolidWorks
@@ -44,14 +44,14 @@ Converts user intent into a CAD-neutral **Feature Graph IR**. Operates at the fe
 - Validates **structure** only (types, params, node references). NOT geometry.
 - Does NOT touch SolidWorks, does NOT execute, does NOT emit raw tool sequences.
 
-### 2. solidworks-compiler (SolidWorks-specific) — Deterministic CAD Compiler
+### 2. compiler/solidworks (SolidWorks-specific) — Deterministic CAD Compiler
 Lowers the IR into ordered execution-layer tool calls. **Deterministic — no LLM, no MCP.**
 - **Reference Resolver:** resolves semantic refs (`top_face`, `center`) to concrete selectors/coords against live B-rep state — the hardest, make-or-break module.
 - Performs **geometric** validation (face exists, fit, selector uniqueness).
 - Maps low-level failures back up to feature-level errors so recovery isn't lost.
 - A different CAD backend = a different compiler; the IR and cad-planner stay unchanged.
 
-### 3. solidworks-execution (SolidWorks-specific) — Execution Layer / Truth Engine
+### 3. execution/solidworks (SolidWorks-specific) — Execution Layer / Truth Engine
 C# .NET 4.8 REST + COM. The **only** layer allowed to touch SolidWorks COM. Deterministic execution, authoritative CAD state, idempotency + `state_version`. NO AI, NO planning. Adapter- and compiler-agnostic.
 
 ### 4. adapters/* — MCP Protocol Bridge
@@ -67,9 +67,9 @@ Exposes the system to a specific AI host over MCP.
 | Contract | Location | Owner | Nature |
 |---|---|---|---|
 | `feature-graph.schema.json` | `cad-planner/contracts/` | Planner | CAD-NEUTRAL IR **+ capability registry** (single artifact) |
-| `tool-schemas.json` | `solidworks-execution/contracts/` | Execution | SolidWorks low-level tool surface |
-| `state-format.json` | `solidworks-execution/contracts/` | Execution | CadState structure |
-| `execution-response.json` | `solidworks-execution/contracts/` | Execution | COMPLETED / FAILED / DUPLICATE |
+| `tool-schemas.json` | `execution/solidworks/contracts/` | Execution | SolidWorks low-level tool surface |
+| `state-format.json` | `execution/solidworks/contracts/` | Execution | CadState structure |
+| `execution-response.json` | `execution/solidworks/contracts/` | Execution | COMPLETED / FAILED / DUPLICATE |
 
 The capability registry **is** the IR schema — the Planner validates intent against that one file; there is no separate discovery protocol.
 

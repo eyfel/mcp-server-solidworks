@@ -41,11 +41,11 @@ flowchart TD
 
     IR["Feature Graph IR<br/>feature-graph.schema.json<br/>(cad-planner · CAD-neutral)"]
 
-    subgraph COMP["solidworks-compiler — deterministic compiler · no LLM"]
+    subgraph COMP["compiler/solidworks — deterministic compiler · no LLM"]
         CO["pycompiler<br/>lowering + reference resolver (geometric anchors v0)"]
     end
 
-    subgraph EXE["solidworks-execution — C# .NET 4.8 · the ONLY COM-touching layer"]
+    subgraph EXE["execution/solidworks — C# .NET 4.8 · the ONLY COM-touching layer"]
         EX["Execution<br/>idempotency · state_version"]
     end
 
@@ -61,7 +61,7 @@ flowchart TD
     EX == "COM" ==> SW
 
     %% Reverse discovery step: read an existing part → propose an IR
-    EX -. "analyze_model / analyze_drawing" .-> IR
+    EX -. "analyze_model / analyze_drawing (DXF/DWG)" .-> IR
 
     %% Planned forward collapse (dashed)
     IR -. "forward: submit_feature_graph" .-> SFG
@@ -75,15 +75,15 @@ The system has four layers:
 | Layer | Directory | Language | Responsibility |
 |---|---|---|---|
 | Planner / Intent | `cad-planner/` | AI model + IR schema | Turns user intent into a CAD-neutral Feature Graph IR. Never touches COM, never emits raw tool calls. |
-| Compiler | `solidworks-compiler/` | Deterministic (no LLM) | Lowers the IR into ordered tool calls; resolves semantic references (e.g. `top_face`, `center`) against live geometry state. |
-| Execution | `solidworks-execution/` | C# (.NET Framework 4.8) | The **only** layer that touches the SolidWorks COM API. The single source of truth for CAD state. |
+| Compiler | `compiler/solidworks/` | Deterministic (no LLM) | Lowers the IR into ordered tool calls; resolves semantic references (e.g. `top_face`, `center`) against live geometry state. |
+| Execution | `execution/solidworks/` | C# (.NET Framework 4.8) | The **only** layer that touches the SolidWorks COM API. The single source of truth for CAD state. |
 | Adapter | `adapters/claude/` | Python (FastMCP) | MCP protocol bridge. The MCP boundary sits at the **top** of the system. |
 
 **MCP sits at the top:** it is the boundary where the AI client meets the system, not an internal transport. Everything below the IR is deterministic and communicates over plain REST.
 
 The `adapters/` layer is provider-specific and replaceable. Because the execution and planner layers do not know which client is calling, adding a new AI client (OpenClaw, OpenAI, a local LLM, etc.) means only writing a new adapter — the IR, compiler, and execution layers stay unchanged.
 
-**Current vs. target:** the Feature Graph IR and the deterministic compiler now **exist and work** — the compiler (`solidworks-compiler/pycompiler`, lowering + a v0 reference resolver) has reproduced **real production parts** end-to-end from their IR to a `verified` match (see Project Status). It is reached today through the **`rebuild_from_ir`** tool (the reverse/reproduce direction). What is still ahead is the *forward* collapse: replacing the low-level surface with a single `submit_feature_graph` tool for building from scratch, and a **durable reference resolver** that survives edits (the make-or-break module). Until then the low-level MCP tools remain the primary path for building.
+**Current vs. target:** the Feature Graph IR and the deterministic compiler now **exist and work** — the compiler (`compiler/solidworks/pycompiler`, lowering + a v0 reference resolver) has reproduced **real production parts** end-to-end from their IR to a `verified` match (see Project Status). It is reached today through the **`rebuild_from_ir`** tool (the reverse/reproduce direction). What is still ahead is the *forward* collapse: replacing the low-level surface with a single `submit_feature_graph` tool for building from scratch, and a **durable reference resolver** that survives edits (the make-or-break module). Until then the low-level MCP tools remain the primary path for building.
 
 ---
 
@@ -154,7 +154,7 @@ The drawing tools were added after the initial part-modeling set and are now a s
 - `add_hole_callout` — adds a hole callout on a hole edge.
 - `add_drawing_dimension` — adds a single dimension by sheet coordinate.
 - `add_section_view` — section view along an existing edge or a drawn cut line — the standard way to expose and dimension internal/blind features (one section per distinct internal-depth axis).
-- `analyze_drawing` — reads the active drawing structurally: per-view name/type/scale/position and its dimensions; with `include_geometry`, it also returns each view's **projected 2D geometry as clean primitives** (lines and curves), which is the clean shape used to reverse-engineer a part from its drawing independently of dimension-line clutter.
+- `analyze_drawing` — reads a **2D technical drawing file (.DXF or .DWG)** and returns it as structured JSON: sheet scale (already applied, so every number is true model mm), detected views with per-primitive edge class (visible / hidden / section cut line / centre), view alignment pairs, true-valued dimensions, and sheet-metal bend notes. A .DWG is converted to DXF automatically. This is the drawing→part front end. _(The older reader for native SolidWorks drawings survives as `analyze_slddrw_test` — test/reference only: a .SLDDRW is model-linked, so if you have one the part already exists.)_
 
 ### Export
 - `export_document` — STEP, IGES, STL, **PDF, DWG, DXF** (PDF/DWG/DXF require a drawing document).
@@ -174,13 +174,13 @@ The drawing tools were added after the initial part-modeling set and are now a s
 Build the solution:
 
 ```
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" solidworks-execution\SolidworksExecution.sln /t:Build /p:Configuration=Debug
+& "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" execution\solidworks\SolidworksExecution.sln /t:Build /p:Configuration=Debug
 ```
 
 Run the server (headless, `http://localhost:5000`):
 
 ```
-Start-Process solidworks-execution\SolidworksExecution\bin\Debug\SolidworksExecution.exe -WindowStyle Hidden
+Start-Process execution\solidworks\SolidworksExecution\bin\Debug\SolidworksExecution.exe -WindowStyle Hidden
 ```
 
 ### Adapter (Python)
@@ -229,13 +229,13 @@ SolidPilot is a **working prototype / early alpha**. The low-level tools have be
 
 **Assembly:** the assembly surface now works end-to-end — creating assemblies, inserting components with full transforms, index-based mating, deep structural readback (`analyze_assembly`), and objective verification (`compare_assemblies`). An assembly IR sub-vocabulary (components + mates) has been added to the Feature Graph schema, and real sample assemblies (up to ~17 components) have been reproduced from their IR to a `verified` match: exact component sets, transforms to sub-micron, matching mate counts and types.
 
-**Feature Graph IR + compiler (the strategic core):** now the project's spine and **working**. The IR schema (`cad-planner/contracts/feature-graph.schema.json`) and a deterministic Python compiler (`solidworks-compiler/pycompiler`, lowering + a **v0 reference resolver** built on geometric anchors) run every rebuild through one code path, with an offline test suite (no live SolidWorks needed). Via the reverse round-trip — `analyze_model` → an LLM-proposed IR → `rebuild_from_ir` → `compare_parts` — real production parts have been reproduced from their IR to a `verified` match, spanning revolves, circular patterns, both chamfer modes, lofts, and multi-bend sheet-metal forms. Each part is rebuilt in a fresh document and checked against the original by exact topology and mass properties before it counts as verified. Growing the IR vocabulary from real parts is how it advances; this effort has its own ledger (`logs-ir.md`).
+**Feature Graph IR + compiler (the strategic core):** now the project's spine and **working**. The IR schema (`cad-planner/contracts/feature-graph.schema.json`) and a deterministic Python compiler (`compiler/solidworks/pycompiler`, lowering + a **v0 reference resolver** built on geometric anchors) run every rebuild through one code path, with an offline test suite (no live SolidWorks needed). Via the reverse round-trip — `analyze_model` → an LLM-proposed IR → `rebuild_from_ir` → `compare_parts` — real production parts have been reproduced from their IR to a `verified` match, spanning revolves, circular patterns, both chamfer modes, lofts, and multi-bend sheet-metal forms. Each part is rebuilt in a fresh document and checked against the original by exact topology and mass properties before it counts as verified. Growing the IR vocabulary from real parts is how it advances; this effort has its own ledger (`logs-ir.md`).
 
 The open problem — and the project's real research risk — is a **durable reference resolver**: the v0 geometric anchors reproduce a part exactly in a fresh document but do **not** survive upstream edits (a changed dimension moves the anchors). Making semantic references (`top_face`, a specific edge) robust across topology changes is the make-or-break module still ahead.
 
 > **Two IR doors, one compiler.** The *reverse* door is `rebuild_from_ir` (reproduce an existing part from its artifact). The *forward* door is `submit_feature_graph` (build from design intent, with no original to copy) — now **live and gate-free**, and proven on real geometry: swept solids matching πr²·L to six digits, composed pattern grids, elliptic prisms, and sheet-metal flanges. Both doors execute through the same `pycompiler`, so every lesson from one improves the other. Note that having the forward door is *not* the same as collapsing the low-level surface beneath it — the 40-odd low-level tools still stand, and retiring them waits on the reference resolver below.
 
-**Testing:** three automated suites run fully offline (no SolidWorks needed) — a **tool contract test** (`adapters/claude/tests/test_schema_contract.py`) that fails on any tool/parameter drift between the adapter (`server.py`) and the execution contract (`tool-schemas.json`); an **IR contract test** (`solidworks-compiler/pycompiler/tests/test_ir_schema_contract.py`) that fails on any vocabulary drift between the IR schema — which doubles as the capability registry — and the validator that enforces it, in both directions; and the **compiler suite** (`solidworks-compiler/pycompiler/tests/`) covering IR validation, lowering, and reference resolution against a fake execution port. Behavioral verification of the CAD operations themselves is manual against live SolidWorks, by design.
+**Testing:** three automated suites run fully offline (no SolidWorks needed) — a **tool contract test** (`adapters/claude/tests/test_schema_contract.py`) that fails on any tool/parameter drift between the adapter (`server.py`) and the execution contract (`tool-schemas.json`); an **IR contract test** (`compiler/solidworks/pycompiler/tests/test_ir_schema_contract.py`) that fails on any vocabulary drift between the IR schema — which doubles as the capability registry — and the validator that enforces it, in both directions; and the **compiler suite** (`compiler/solidworks/pycompiler/tests/`) covering IR validation, lowering, and reference resolution against a fake execution port. Behavioral verification of the CAD operations themselves is manual against live SolidWorks, by design.
 
 Notes:
 - The Python MCP adapter does not hot-reload while running; after editing `server.py`, the MCP server must be reconnected.

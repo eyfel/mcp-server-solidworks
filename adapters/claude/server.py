@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import sys
 import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
@@ -696,7 +697,7 @@ def auto_dimension_drawing(
     (SolidWorks 'Insert Model Items > Dimensions'). This is the PREFERRED way to dimension a
     drawing — far more reliable than add_drawing_dimension's coordinate pick, because the
     dimensions come straight from the model's real parametric dimensions and are placed for you.
-    Call it AFTER create_drawing + add_drawing_view(s); then verify with analyze_drawing
+    Call it AFTER create_drawing + add_drawing_view(s); then verify with analyze_slddrw_test
     (dimension_count should be > 0 and the values should match the model's driving dims).
 
     all_views: insert into all drawing views (True) or only the currently selected view (False). Default True.
@@ -940,21 +941,256 @@ def analyze_model(
 
 
 # ---------------------------------------------------------------------------
-# Tool: analyze_drawing
+# Tool: analyze_drawing  (2026-07-27 — the SHIPPING drawing reader: DXF/DWG)
+# ---------------------------------------------------------------------------
+# The reader is a permanent module of the CAD-neutral planner layer (ADR-064): a drawing is design
+# intent expressed in 2D, so it belongs beside the IR schema and the recipe, not in a research dir.
+_CAD_PLANNER_PKG_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "cad-planner"))
+
+# Imported EAGERLY, at startup, in the MAIN thread -- deliberately, and NOT lazily inside the tool
+# like pycompiler is. ezdxf pulls in numpy, and loading numpy's C extensions from a FastMCP worker
+# thread DEADLOCKS on Windows: the tool hung forever with no error and no traceback (diagnosed by
+# faulthandler thread dump, 2026-07-27 -- stuck in importlib create_module for numpy._core.
+# multiarray). A failure here must still never kill the server, so it degrades to a clean per-call
+# error instead.
+try:
+    if _CAD_PLANNER_PKG_DIR not in sys.path:
+        sys.path.insert(0, _CAD_PLANNER_PKG_DIR)
+    import drawing as _draw
+    _DXF_READER_IMPORT_ERROR = None
+except Exception as _exc:                     # noqa: BLE001 - startup must survive anything
+    _draw = None
+    _DXF_READER_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc} (pip install ezdxf)"
+
+
+def _summarise_direct(art, summary, graph):
+    """The DIRECT_BUILDABLE result: everything needed to JUDGE the build, and nothing else.
+
+    The contour deliberately stays out. A real laser outline is scores of segments; showing it and
+    then having the model echo it back into submit_feature_graph would cost the tokens twice over
+    and invite a transcription error in between — which is the whole reason the lowering exists."""
+    b, th = summary["blank"], summary["thickness"]
+    cuts = ", ".join("%gx%g @ (%g,%g)"
+                     % (c["bbox"][2] - c["bbox"][0], c["bbox"][3] - c["bbox"][1],
+                        round((c["bbox"][0] + c["bbox"][2]) / 2, 2),
+                        round((c["bbox"][1] + c["bbox"][3]) / 2, 2))
+                     for c in b["cutouts"]) or "none"
+    lines = [
+        "DIRECT_BUILDABLE | sheet-metal flat pattern | %s | sha256 %s"
+        % (art["source"]["file"], art["source"]["sha256"][:12]),
+        "  blank      %g x %g mm | outer loop %d segments | cutouts: %s"
+        % (b["size"][0], b["size"][1], b["outer_segments"], cuts),
+        "  thickness  %g mm  (%s)   bend radius %g mm   K %g"
+        % (th["value_mm"], th["source"], summary["bends"][0]["radius_mm"], summary["k_factor"]),
+        "  bends      %d, each corroborated by its line's edge class:" % len(summary["bends"]),
+    ]
+    for r in summary["bends"]:
+        x1, y1, x2, y2 = r["line"]
+        lines.append("               %-4s %g deg R%g  line %s  midpoint (%g, %g)%s"
+                     % (r["dir"], r["angle_deg"], r["radius_mm"], r["class"],
+                        round((x1 + x2) / 2, 4), round((y1 + y2) / 2, 4),
+                        "  [WARNING: in a closed loop]" if r["in_loop"] else ""))
+    for r in summary["skipped_bends"]:
+        lines.append("  SKIPPED    %s note at %s — %s (candidates %s). It will NOT be built."
+                     % (r["dir"], r["at"], r["reason"], r["candidates"]))
+    lines += [
+        "  expected   blank area %g mm^2 -> V = %r m^3  (bending does not change it at K=0.5)"
+        % (b["area_mm2"], summary["expected"]["volume_m3"]),
+        "  graph      %d IR nodes: sketch + sheet_metal, then sketch + sketched_bend per direction"
+        % len(graph["nodes"]),
+        "  NEXT       mode='build' builds it | mode='ir' shows the graph first | mode='full' gives",
+        "             the raw analysis. AFTER building, verify: analyze_model('mass_properties')",
+        "             against the expected volume above, and read one bend face back — a mirrored",
+        "             fold is invisible to volume, area and topology alike (recipe R14).",
+    ]
+    if summary["skipped_bends"]:
+        lines.append("             A skipped bend is invisible to ALL of those (the blank volume is "
+                     "unchanged): add it by hand or declare it as a gap (R15).")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def analyze_drawing(file_path: str, save_analysis: bool = True,
+                    mode: Literal["auto", "full", "ir", "build"] = "auto") -> str:
+    """Read a 2D technical drawing — **.DXF or .DWG** — and either BUILD the part from it or hand
+    you the evidence to build it yourself. This is the drawing→part front end: a real drawing
+    arrives as DXF/DWG (a .SLDDRW is model-linked and nobody ships one), so start here for ANY
+    "build the part from this drawing" job. A .DWG is converted automatically.
+
+    **mode='auto' (default) returns ONE OF TWO SHAPES — the reader decides, not you:**
+
+    (A) `DIRECT_BUILDABLE` — a short plain-text summary. Every decision this drawing needs is
+        forced by the drawing itself (today: sheet-metal flat patterns), so the whole part has
+        already been lowered to Feature Graph IR deterministically. You get the blank size, the
+        thickness and its source, every bend with its edge-class corroboration, and the EXPECTED
+        VOLUME — enough to judge the build — but NOT the contour, on purpose: a real outline is
+        scores of segments and echoing it back would cost the tokens twice. Read it, then call
+        `mode='build'`. Anything the reader could not attribute is listed as SKIPPED and will not
+        be built; completing or declaring it is then yours (recipe R15).
+
+    (B) `NOT_DIRECT | <reason>` followed by the full analysis JSON — the drawing needs real
+        reading. This is the normal path for machined parts. The reason names exactly which
+        decision the drawing left open. Nothing is lost: read the JSON per get_recipe('reverse')
+        and build with submit_feature_graph as before.
+
+    mode='full'  — always the full analysis JSON, even when it is directly buildable.
+    mode='ir'    — the lowered Feature Graph IR, without building. For inspection or saving.
+    mode='build' — lower and BUILD, through the same deterministic pycompiler as
+                   submit_feature_graph. **CHANGES GEOMETRY and bumps state_version.** Opens a new
+                   part. Re-derives from the same file, so it needs no cached graph — but verify
+                   the sha256 in the summary is the file you looked at.
+
+    ⮕ Before reading a `full` payload, call get_recipe('reverse') — it holds the reading discipline
+      (scale, edge classes, projection standard, sheet-metal bend arithmetic) and the
+      self-verification rules that make this small payload sufficient.
+
+    The full JSON:
+      sheet — dxf_version, units, **scale_factor** and the sheet box. `scale_factor` is ALREADY
+        applied to every size/coordinate/dimension below, so all numbers are TRUE model mm.
+      views[] — one per detected view: `vid`, `paper_box` (sheet coords, for reading the LAYOUT),
+        `size` [w,h] in true mm, and `geometry` {lines, arcs, circles} in view-local true mm with
+        the view's own bottom-left as origin. Every primitive carries `c`, its EDGE CLASS:
+        'visible' (near-side edge) | 'hidden' (obscured — a real feature seen through material) |
+        'cut_line' (a section's cutting line, not part geometry) | 'center' (an axis).
+        The sheet border/title block is NOT a view; a cluster INSIDE a view is that view's feature.
+      views[].loops[] — the CLOSED contours, already chained: {id, class, role outer|inner, parent,
+        area (mm^2, arc bulges exact), bbox, seq}. `seq` is [[code, index, dir], …] referencing
+        that view's own geometry arrays — the contour IN ORDER, ready to transcribe as a sketch
+        path profile. Traverse it as given; consecutive entries share an endpoint exactly.
+      views[].open_chains[] — segments belonging to no contour: bend lines, centre lines, and (in
+        an ortho view) silhouette fragments the chainer refused to guess through a T-junction. An
+        open chain you cannot account for is a GAP to declare, never a contour to invent.
+      alignment[] — view pairs sharing a paper axis: shares='x' is a vertical projection pair,
+        'y' a horizontal one. This gives the shared AXIS; the projection standard (config) gives
+        which physical face a placed view shows.
+      dimensions[] — `value` (TRUE), `kind` (linear|aligned|angular|diameter|radius|ordinate),
+        `defpts` (the dimension's own reference points, sheet coords) and the owning `view`.
+        `text` appears only when the drafter overrode it (e.g. '8x <>' = a count).
+      bend_notes[] — sheet metal: {dir UP|DOWN, angle_deg, radius, view} plus either `bend_line`
+        (the line it annotates, that line's edge class, and `in_loop` — true would mean the match
+        landed on outline geometry, which a bend line never is) or `unpaired` with the reason and
+        the candidates. Direction comes from the NOTE; the class corroborates it.
+      notes[] — other free text on the sheet (e.g. a bare '2 mm' thickness note, 'SECTION C-C').
+
+    file_path: absolute path to the .DXF or .DWG.
+    save_analysis (default True): also write `<name>.analysis-v<version>.json` beside the source —
+        a research artifact for cross-part study, versioned by the analyzer. Same version
+        overwrites; you never need to read it back."""
+    src = os.path.abspath(file_path)
+    if not os.path.exists(src):
+        return f"FAILED | FILE_NOT_FOUND | {src}"
+    ext = os.path.splitext(src)[1].lower()
+    if ext not in (".dxf", ".dwg"):
+        return ("FAILED | UNSUPPORTED_TYPE | analyze_drawing reads .DXF or .DWG. "
+                "A native .SLDDRW is a test-only path (analyze_slddrw_test).")
+
+    dxf_path, converted_from = src, None
+    if ext == ".dwg":
+        # DWG is binary; the reader parses DXF only. SolidWorks opens the DWG as a drawing and
+        # exports DXF — measured lossless for geometry, dimensions, DIMLFAC, linetypes and notes.
+        dxf_path = os.path.splitext(src)[0] + ".dwg2dxf.dxf"
+        opened = _call_raw("open_document", {"file_path": src})
+        if opened.get("status") != "COMPLETED":
+            err = opened.get("error") or {}
+            return f"FAILED | DWG_OPEN_FAILED | {err.get('code')}: {err.get('message')}"
+        exported = _call_raw("export_document", {"format": "DXF", "file_path": dxf_path})
+        _call_raw("close_document", {})          # the import is scratch — discard, never save
+        if exported.get("status") != "COMPLETED":
+            err = exported.get("error") or {}
+            return f"FAILED | DWG_CONVERT_FAILED | {err.get('code')}: {err.get('message')}"
+        converted_from = os.path.basename(src)
+
+    if _draw is None:
+        return f"FAILED | READER_UNAVAILABLE | {_DXF_READER_IMPORT_ERROR}"
+    try:
+        cfg = _draw.load_config()
+        art = _draw.read(dxf_path, cfg)
+    except Exception as exc:
+        return f"FAILED | DXF_READ_FAILED | {type(exc).__name__}: {exc}"
+
+    if converted_from:
+        art["source"]["converted_from"] = converted_from
+    if save_analysis:
+        out = os.path.join(os.path.dirname(dxf_path),
+                           "%s.analysis-v%s.json" % (os.path.splitext(os.path.basename(src))[0],
+                                                     art["analysis_version"]))
+        try:
+            with open(out, "w", encoding="utf-8") as fh:
+                json.dump(art, fh, indent=1, ensure_ascii=False)
+        except OSError:
+            pass                                  # the artifact is research-only, never the result
+
+    full = json.dumps(art, ensure_ascii=False)
+    if mode == "full":
+        return full
+
+    # The GATE decides the result shape. The model must never be asked to choose between "give me
+    # the analysis" and "just build it" BEFORE it has seen any geometry — that was the flaw in
+    # making this an opt-in flag (ADR-064).
+    try:
+        verdict = _draw.assess(art, cfg)
+    except Exception as exc:                      # noqa: BLE001 - a gate bug must not lose the read
+        return f"NOT_DIRECT | GATE_ERROR | {type(exc).__name__}: {exc}\n{full}"
+
+    if not verdict["direct"]:
+        if mode in ("ir", "build"):
+            return (f"FAILED | NOT_DIRECTLY_BUILDABLE | {verdict['reason']} | {verdict['detail']} — "
+                    f"call analyze_drawing(mode='full') and build with submit_feature_graph.")
+        return (f"NOT_DIRECT | {verdict['reason']} | {verdict['detail']}\n"
+                f"Read the analysis below per get_recipe('reverse') and build it with "
+                f"submit_feature_graph.\n{full}")
+
+    try:
+        graph = _draw.lower_flat_pattern(art, cfg, verdict)
+    except Exception as exc:                      # noqa: BLE001
+        return f"NOT_DIRECT | LOWERING_ERROR | {type(exc).__name__}: {exc}\n{full}"
+
+    if mode == "ir":
+        return json.dumps(graph, ensure_ascii=False)
+    if mode == "auto":
+        return _summarise_direct(art, verdict["summary"], graph)
+
+    # mode == "build": the THIRD IR door — same _run_graph, same pycompiler (IR-ADR-005).
+    s = verdict["summary"]
+    text, ok, sv = _run_graph(graph, fresh_document=True)
+    if not ok:
+        return text
+    tail = ["", "built from %s (sha256 %s) | state_version=%s"
+            % (art["source"]["file"], art["source"]["sha256"][:12], sv),
+            "VERIFY: analyze_model('mass_properties') should read V = %r m^3 "
+            "(blank %g mm^2 x %g mm)." % (s["expected"]["volume_m3"], s["blank"]["area_mm2"],
+                                          s["thickness"]["value_mm"]),
+            "        then read one bend face back — volume, area and topology cannot see a "
+            "mirrored fold (recipe R14)."]
+    for r in s["skipped_bends"]:
+        tail.append("NOT BUILT: %s bend at %s (%s). The blank volume is unchanged by it, so no "
+                    "measurement will catch it — add it or declare it (R15)."
+                    % (r["dir"], r["at"], r["reason"]))
+    return text + "\n".join(tail)
+
+
+# ---------------------------------------------------------------------------
+# Tool: analyze_slddrw_test  (TEST/REFERENCE ONLY — was analyze_drawing until 2026-07-27)
 # ---------------------------------------------------------------------------
 @mcp.tool()
-def analyze_drawing(include_geometry: bool = False, include_relations: bool = False) -> str:
-    """Analyze the ACTIVE drawing document (read-only, does NOT change state) — the drawing-side sibling
-    of analyze_model. Returns a JSON object {view_count, dimension_count, views:[{name, type, scale, pos,
-    dimensions:[...], section?}]}: each view's name, type (swDrawingViewTypes_e int), scale, sheet
-    position [x,y] in meters, and its display dimensions. The FIRST view is the drawing SHEET (interpret
-    accordingly). Use it to (a) check a drawing you produced — do its dimensions match the model? — and
-    (b) read a drawing back for re-modeling.
+def analyze_slddrw_test(include_geometry: bool = False, include_relations: bool = False) -> str:
+    """TEST/REFERENCE TOOL — reads a NATIVE SolidWorks drawing (.SLDDRW) through COM.
 
-    ⮕ RECONSTRUCTING A PART FROM THIS DRAWING? Call get_recipe('reverse') FIRST (and
-      get_recipe('drawing') for the section conventions) — the reverse-reading discipline (dimension
-      ownership, section→3D mapping, through-vs-blind, profile-from-first-vector, loft/taper signals,
-      PDF-crop as last resort) lives there and only helps if read.
+    ⚠ NOT the shipping drawing→part path. A .SLDDRW is SLDPRT-linked (its views go blank if the part
+      is gone) and nobody ships one — real inputs are DXF/DWG (and PDF). This tool survives for two
+      jobs ONLY: (a) checking a drawing YOU produced (do its dimensions match the model?), and
+      (b) generating COM ground truth to compare a DXF reader against. For a DXF/DWG job do NOT use
+      this tool and do NOT apply its discipline — the fields below (measures, section, normal_axis,
+      relations, extent, center_marks) are COM constructs that DO NOT EXIST in a DXF.
+
+    ⮕ Reconstructing a part from a NATIVE SLDDRW (test/comparison work only)? Call
+      get_recipe('slddrw_testing') FIRST — the FROZEN reverse-reading discipline lives there.
+
+    Read-only, does NOT change state. Returns {view_count, dimension_count, views:[{name, type, scale,
+    pos, dimensions:[...], section?}]}: each view's name, type (swDrawingViewTypes_e int), scale, sheet
+    position [x,y] in meters, and its display dimensions. The FIRST view is the drawing SHEET (interpret
+    accordingly).
 
     Each dimension is {name, value_si (meters/radians, 6 decimals), diametric?, attached?, anchors?}:
       diametric — true flags a Ø (diameter) dimension, so "is this 17 a diameter?" is DATA, not a guess.
@@ -994,21 +1230,18 @@ def analyze_drawing(include_geometry: bool = False, include_relations: bool = Fa
         deviation, meters 6dp) — "why is this concentric?" is answerable by reading the field. Adds:
       relations per view — concentric:{members,center,radii} (TRUST these shared centers — never
         re-derive), equal_diameter:{members,r,centers} (same Ø at distinct centers = twin bores),
-        tangent (circle/arc/line contacts), touches (shared-endpoint junctions + T-contacts; projected
-        X-crossings deliberately NOT listed — a 2D crossing has no same-depth guarantee).
+        tangent (circle/arc/line contacts). (`touches` and the root `stations` table were REMOVED
+        from the reader in 0.16.1 / ADR-059 — redundant and unconsumed.)
       measures per dimension — the primitive id(s) the dim measures, resolved from its anchors
         (measure_src anchor_at_center|anchor_on_primitive); a dim with unattached:true resolved to NO
         primitive — a loud gap to close from geometry, never dropped.
-      stations at root — cross-view JOIN KEYS: per model axis, coordinate values shared by ≥2 views
-        with the candidate entities per view {vid:[ids]}. Candidates only: resolve which candidate is
-        the same physical entity via dimensions; >1 candidate = state the ambiguity explicitly.
       center_marks / centerlines per view — which circles carry center marks (on:[ids]), centerline
         segments (through:[ids]); a view reporting centerlines it cannot expose emits
         {centerlines_reported, unreadable:true} instead of a guess.
 
-    Requires an active drawing document (call create_drawing first)."""
-    return _call("analyze_drawing", {"include_geometry": include_geometry,
-                                     "include_relations": include_relations})
+    Requires an active NATIVE drawing document."""
+    return _call("analyze_slddrw_test", {"include_geometry": include_geometry,
+                                         "include_relations": include_relations})
 
 
 # ---------------------------------------------------------------------------
@@ -1349,8 +1582,8 @@ def _recipe_sections():
 def get_recipe(
     section: Literal["index", "contract", "canonicalization", "forward", "mapping",
                      "mapping_part", "mapping_sheet_metal", "mapping_assembly", "verification",
-                     "reverse", "coverage", "drawing", "feature_graph_schema",
-                     "analysis_artifact_schema"] = "index",
+                     "reverse", "coverage", "feature_graph_schema",
+                     "analysis_artifact_schema", "slddrw_testing"] = "index",
 ) -> str:
     """The IR-generation recipe — REQUIRED READING before writing any Feature Graph IR
     (an artifact's `ir.graph`), reconstructing a part from a drawing, or producing a drawing
@@ -1362,12 +1595,18 @@ def get_recipe(
     'mapping_assembly'), then 'verification' before labeling anything. 'forward' holds the
     INTENT→IR authoring discipline (grammar cheat-sheet, anchor design without an original,
     computed-expectation self-verification) — read it FIRST when writing a graph for
-    submit_feature_graph from design intent. 'drawing' holds the model→drawing rules (section
-    coverage, HLV convention, model_path sourcing). 'reverse' holds the drawing→part
-    reconstruction discipline (dimension-skeleton reading order, section→3D mapping, loft
-    signals, readback discipline) — read it FIRST when rebuilding a part from its drawing.
+    submit_feature_graph from design intent. 'reverse' holds the DXF/DWG drawing→part
+    reconstruction discipline (scale/DIMLFAC, edge classes, view clustering, projection
+    standard, sheet-metal bend arithmetic) — read it FIRST when rebuilding a part from a 2D
+    drawing.
 
     section='index' (default): the version header + a one-line table of contents.
+    section='slddrw_testing': the FROZEN SLDDRW-era rules, served whole — PART 1 the drawing→part
+        reading discipline, PART 2 the model→drawing generation rules. TEST/REFERENCE ONLY: it
+        pairs with analyze_slddrw_test, and both parts are built on COM constructs / reader
+        assumptions that a DXF breaks. Do NOT apply it to a DXF/DWG job — the DXF reverse path is
+        the main line and is being rebuilt from scratch; copy from the frozen edition only
+        deliberately.
     section='feature_graph_schema': the Feature Graph IR schema / capability registry JSON —
         the node types and params the compiler accepts (what is NOT in it cannot be built).
     section='analysis_artifact_schema': the persistent analysis-artifact contract JSON
@@ -1381,12 +1620,19 @@ def get_recipe(
         with open(os.path.join(_CAD_PLANNER_DIR, "contracts", "analysis-artifact.schema.json"),
                   "r", encoding="utf-8-sig") as fh:
             return fh.read()
+    if section == "slddrw_testing":
+        # A separate FROZEN file, not a section of recipe-usage.md — served whole (2026-07-27).
+        with open(os.path.join(_CAD_PLANNER_DIR, "slddrw-testing-recipe-usage.md"),
+                  "r", encoding="utf-8-sig") as fh:
+            return fh.read()
     header, sections = _recipe_sections()
     if section == "index":
         toc = "\n".join(f"- {slug} — {title}" for slug, (title, _b) in sections.items())
         return (f"{header.strip()}\n\nSections (pass as `section`):\n{toc}\n"
                 "- feature_graph_schema — the IR schema / capability registry (JSON)\n"
-                "- analysis_artifact_schema — the analysis-artifact contract (JSON)")
+                "- analysis_artifact_schema — the analysis-artifact contract (JSON)\n"
+                "- slddrw_testing — FROZEN SLDDRW-era reverse discipline (TEST/REFERENCE ONLY;\n"
+                "  pairs with analyze_slddrw_test — do NOT apply it to a DXF/DWG job)")
     title, body = sections[section]
     return f"## {section} — {title}\n\n{body}"
 
@@ -1703,36 +1949,8 @@ def rebuild_from_ir(artifact_path: str, fresh_document: bool = True) -> str:
         if current != recorded:
             source_stale = " | source_stale=true (file changed since analysis — regenerate the artifact)"
 
-    if fresh_document:
-        # An assembly graph (component/mate nodes) rebuilds into a fresh ASSEMBLY document;
-        # part graphs into a fresh part (two doors, ONE compiler — the graph type decides).
-        is_assembly_graph = any(isinstance(n, dict) and n.get("type") in ("component", "mate")
-                                for n in graph.get("nodes", []))
-        new_tool = "open_new_assembly" if is_assembly_graph else "open_new_part"
-        opened = _call_raw(new_tool, {})
-        if opened.get("status") != "COMPLETED":
-            err = opened.get("error") or {}
-            return f"FAILED | {new_tool.upper()}_FAILED | {err.get('code')}: {err.get('message')}"
-
-    # Lazy import: pycompiler lives in the hyphenated solidworks-compiler/ dir; ir_execution_port
-    # wires sys.path + the ExecutionPort. Imported here so a missing compiler tree degrades to a
-    # clean tool error instead of killing the whole MCP server at startup.
-    try:
-        from ir_execution_port import run_feature_graph
-    except Exception as ex:  # noqa: BLE001
-        return f"FAILED | COMPILER_UNAVAILABLE | {ex}"
-
-    try:
-        result = run_feature_graph(graph)
-    finally:
-        # One rebuild performs MANY state-bumping sub-ops outside _call() — resync so the next
-        # normal tool call can't hit INVALID_STATE_VERSION (KNOWN-LIMITATIONS #5).
-        try:
-            _state_version = get_state()
-        except Exception:  # noqa: BLE001
-            pass
-
-    return f"{result.summary()} | artifact={os.path.basename(path)}{source_stale}"
+    text, ok, _sv = _run_graph(graph, fresh_document)
+    return text + (f" | artifact={os.path.basename(path)}{source_stale}" if ok else "")
 
 
 # ---------------------------------------------------------------------------
@@ -2022,6 +2240,46 @@ def _resync_state_version() -> int:
     return _state_version
 
 
+def _run_graph(graph_obj, fresh_document):
+    """The ONE path from a Feature Graph to live geometry — shared by every IR door.
+
+    IR-ADR-005 forbids FORKING the compiler, not having several doors into it. There are three
+    (submit_feature_graph takes a graph, rebuild_from_ir replays an artifact's stored one,
+    analyze_drawing(mode='build') lowers a drawing), and they all land here, so the document
+    choice, the compiler entry point and the post-run resync cannot diverge between them.
+
+    Returns (text, ok, state_version). On failure `text` is already a complete FAILED line."""
+    if fresh_document:
+        # The graph type picks the document: an assembly graph (component/mate nodes) needs an
+        # assembly, a part graph a part.
+        nodes = graph_obj.get("nodes") or [] if isinstance(graph_obj, dict) else []
+        is_assembly_graph = any(isinstance(n, dict) and n.get("type") in ("component", "mate")
+                                for n in nodes)
+        new_tool = "open_new_assembly" if is_assembly_graph else "open_new_part"
+        opened = _call_raw(new_tool, {})
+        if opened.get("status") != "COMPLETED":
+            err = opened.get("error") or {}
+            return (f"FAILED | {new_tool.upper()}_FAILED | {err.get('code')}: {err.get('message')}",
+                    False, _state_version)
+
+    # Lazy import: a missing compiler tree degrades to a clean tool error instead of killing the
+    # whole MCP server at startup.
+    try:
+        from ir_execution_port import run_feature_graph
+    except Exception as ex:  # noqa: BLE001
+        return f"FAILED | COMPILER_UNAVAILABLE | {ex}", False, _state_version
+
+    # NEVER let an exception crash the MCP server; resync state_version regardless (IR-ADR-001) —
+    # one run performs MANY state-bumping sub-ops outside _call() (KNOWN-LIMITATIONS #5).
+    try:
+        result = run_feature_graph(graph_obj)
+    except Exception as ex:  # noqa: BLE001
+        sv = _resync_state_version()
+        return (f"FAILED | UNEXPECTED | {type(ex).__name__}: {ex} | state_version resynced to {sv}",
+                False, sv)
+    return result.summary(), True, _resync_state_version()
+
+
 @mcp.tool()
 def submit_feature_graph(graph: str, fresh_document: bool = True) -> str:
     """Build a part (or assembly) from a Feature Graph IR in ONE call — the deterministic
@@ -2063,32 +2321,8 @@ def submit_feature_graph(graph: str, fresh_document: bool = True) -> str:
     except Exception as ex:  # noqa: BLE001
         return f"FAILED | INVALID_JSON | the graph is not valid JSON: {ex}"
 
-    if fresh_document:
-        # The graph type picks the document (mirrors rebuild_from_ir; two doors, one compiler).
-        nodes = graph_obj.get("nodes") or [] if isinstance(graph_obj, dict) else []
-        is_assembly_graph = any(isinstance(n, dict) and n.get("type") in ("component", "mate")
-                                for n in nodes)
-        new_tool = "open_new_assembly" if is_assembly_graph else "open_new_part"
-        opened = _call_raw(new_tool, {})
-        if opened.get("status") != "COMPLETED":
-            err = opened.get("error") or {}
-            return f"FAILED | {new_tool.upper()}_FAILED | {err.get('code')}: {err.get('message')}"
-
-    # Lazy import (mirrors rebuild_from_ir): a missing compiler tree degrades to a clean tool
-    # error instead of killing the whole MCP server at startup.
-    try:
-        from ir_execution_port import run_feature_graph
-    except Exception as ex:  # noqa: BLE001
-        return f"FAILED | COMPILER_UNAVAILABLE | {ex}"
-
-    # NEVER let an exception crash the MCP server; resync state_version regardless (IR-ADR-001).
-    try:
-        result = run_feature_graph(graph_obj)
-    except Exception as ex:  # noqa: BLE001
-        sv = _resync_state_version()
-        return f"FAILED | UNEXPECTED | {type(ex).__name__}: {ex} | state_version resynced to {sv}"
-    sv = _resync_state_version()  # first-class resync, success OR failure
-    return result.summary() + f" | state_version={sv}"
+    text, ok, sv = _run_graph(graph_obj, fresh_document)
+    return text + (f" | state_version={sv}" if ok else "")
 
 
 # ---------------------------------------------------------------------------

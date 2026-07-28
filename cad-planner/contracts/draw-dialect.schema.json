@@ -1,0 +1,104 @@
+{
+ "_meta": {
+  "name": "draw-dialect",
+  "version": "0.2.0-draft",
+  "status": "DRAFT — the compact 2D description a technical drawing (DXF/DWG) is read into. Shipped with the DXF-first reverse path (ADR-062) and grown with contour chaining + the direct-buildable gate (ADR-064).",
+  "produced_by": "cad-planner/drawing/dxf_read.py (its ANALYSIS_VERSION is this artifact's `analysis_version`)",
+  "consumed_by": "cad-planner/drawing/{contour,pairing,lowering}.py, the `analyze_drawing` MCP tool, and the model itself (get_recipe('reverse') tells it how to read this)",
+  "role": "The reverse path's evidence layer. It reports deterministic FACTS ONLY — no feature classification, no 3D inference, no confidence scores. Interpretation belongs to the recipe, and everything that CANNOT be interpreted deterministically is reported as a gap rather than guessed.",
+  "size_is_a_contract": "Payload cost is first-class. Loops reference the view's own primitive arrays by INDEX rather than repeating geometry, exact duplicates are dropped at emit time, and the direct-buildable path hands the model a ~10-line summary instead of a contour it would have to echo back."
+ },
+
+ "artifact": {
+  "analysis_version": "string — dxf_read.ANALYSIS_VERSION. A new version writes a new artifact file; the same version overwrites in place.",
+  "source": "{ file, sha256, bytes, converted_from? } — `converted_from` names the .DWG when SolidWorks produced the DXF. The hash is what lets a later build re-derive from the SAME input without a cache.",
+  "config": "{ projection, k_factor } — the conventions from config.json that were IN FORCE for this read, recorded so a re-read with different settings is detectable.",
+  "sheet": {
+   "dxf_version": "string",
+   "units": "$INSUNITS or null",
+   "scale_factor": "number — DIMLFAC. TRUE value = paper value x this. ALREADY APPLIED to every dimension, view size and geometry coordinate in this artifact; it is reported so the model can see the sheet was 1:2, never so it can multiply again.",
+   "paper_box": "[x0, y0, x1, y1] — the sheet frame, in PAPER mm",
+   "audit_errors": "integer — ezdxf recover-mode findings"
+  },
+  "views": "array of view objects (see `view`)",
+  "alignment": "array of { a, b, shares: 'x'|'y' } — two views sharing a paper-axis span are a projection pair. Convention-independent; only the SIGN needs config.projection.",
+  "dimensions": "array of { value, kind, defpts, view?, measures?, text? } — `value` is TRUE (scaled). `measures` links a radius/diameter dim to the primitive it measures ('v0:c1').",
+  "bend_notes": "array of bend objects (see `bend_note`)",
+  "notes": "array of { text, at, view? } — free text outside the title block (e.g. a bare '2 mm' thickness note, section labels)",
+  "user_description": "string or null — filled in BY HAND when the author described the part. Research pool only; the build flow never reads it."
+ },
+
+ "view": {
+  "vid": "string — 'v0', 'v1', … stable within one artifact",
+  "role": "one of covered.view_roles — 'annotation' marks a cluster that is drafting furniture (a section arrow head), not a view. Marked, never deleted: deleting by size would take a 2 mm thickness view with it.",
+  "paper_box": "[x0, y0, x1, y1] in PAPER mm — the coordinate space the bend notes' `at` lives in",
+  "size": "[w, h] in TRUE mm",
+  "dropped_duplicates": "integer (omitted when 0) — exact-duplicate primitives removed at emit time. The SolidWorks DWG→DXF route is lossless but ADDITIVE: it re-emits a section view's boundary geometry. Duplicates make every shared endpoint look like a degree-4 junction, which stops the chainer dead.",
+  "geometry": {
+   "lines": "array of { x1, y1, x2, y2, c } — view-local TRUE mm, origin at the view box's lower-left",
+   "arcs": "array of { cx, cy, r, a1, a2, x1, y1, x2, y2, dir, c } — a1/a2 are DEGREES (a DXF ARC always runs CCW from a1 to a2, hence dir=1); x1..y2 are the resolved endpoints, so an arc maps 1:1 onto the IR's `arc` profile primitive with no trigonometry",
+   "circles": "array of { cx, cy, d, c } — d is the DIAMETER"
+  },
+  "loops": "array of loop objects (see `loop`) — the CLOSED contours found by chaining",
+  "open_chains": "array of { id, class, seq } — maximal chains that did NOT close. An open chain is a segment belonging to no contour: a bend line, a centre line, or (in an ortho view) a silhouette fragment stopped by a T-junction."
+ },
+
+ "loop": {
+  "id": "string — 'L0', 'L1', … ordered by descending area",
+  "class": "one of covered.edge_classes — chaining is per class; a loop never mixes classes",
+  "role": "one of covered.loop_roles — `outer` = contained by no other loop; `inner` = contained. By point-in-polygon containment, which is measurement, not interpretation.",
+  "parent": "loop id or null — the SMALLEST loop containing this one, so an island inside a hole is representable",
+  "area": "number — mm^2, ABSOLUTE, with each arc's circular-segment bulge included exactly (verified: f-1's 100x60 outline with an R10 corner and a 4 mm chamfer = 5970.5398 = 6000 − 21.4602 − 8.0)",
+  "bbox": "[x0, y0, x1, y1] in view-local TRUE mm",
+  "seq": "array of [code, index, dir] — code is one of covered.seq_codes, index points into the matching `geometry` array, dir is +1 when the primitive is traversed from its stored start to its stored end and -1 when reversed. Consecutive entries share an endpoint exactly; that is what closes the contour on rebuild."
+ },
+
+ "bend_note": {
+  "dir": "one of covered.bend_directions",
+  "angle_deg": "number — DEGREES, as annotated",
+  "radius": "number — mm, as annotated",
+  "rot": "number — the annotation's own DXF rotation in degrees; defines its local up axis",
+  "at": "[x, y] in PAPER mm",
+  "view": "vid or null",
+  "bend_line": "{ seg: [code, index], class, note_offset, in_loop } — present when the note matched exactly one line. `in_loop` true means the match landed on a line that IS part of a closed contour, which a bend line never should be: suspicious, kept for observation.",
+  "unpaired": "{ reason: one of covered.unpaired_reasons, candidates: [[code, index], …] } — present INSTEAD of bend_line. Never a guess: repairing a wrong bend costs a delete plus a full re-create (no sketch-entity move/delete tool exists), and a wrong fold is invisible to volume, area and topology alike."
+ },
+
+ "direct_build": {
+  "_role": "Not part of the artifact — the verdict `lowering.assess` returns for it, and the reason the tool has two result shapes at all. The reader decides; the model is never asked to choose before it has seen any geometry.",
+  "direct": "boolean",
+  "reason": "one of covered.gate_reasons when direct is false — a reason the DRAWING does not force a decision, never an error",
+  "summary": "{ flat_view, blank{size,outer_segments,area_mm2,cutouts}, thickness{value_mm,source}, bends[], skipped_bends[], k_factor, expected{volume_m3}, fixed_point_mm } — what the model judges the build on. The contour itself stays out of it.",
+  "scope_v1": "Sheet-metal FLAT PATTERNS. A plain plate is excluded on purpose (thickness source and which view carries the profile are interpretive). Failing the gate costs nothing: the caller falls back to the full analysis, which is the pre-existing behaviour."
+ },
+
+ "covered": {
+  "_note": "CONTRACT: every ARRAY here is machine-diffed against the matching frozenset in cad-planner/drawing/*.py by tests/test_draw_contract.py — both directions, exact set equality. Adding a token on one side alone FAILS the gate. Everything else in this file is prose and is deliberately NOT checked (mirrors feature-graph.schema.json's own contract/prose split).",
+  "edge_classes": ["visible", "hidden", "cut_line", "center"],
+  "view_roles": ["view", "annotation"],
+  "loop_roles": ["outer", "inner"],
+  "seq_codes": ["l", "a", "c"],
+  "primitive_kinds": ["lines", "arcs", "circles"],
+  "bend_directions": ["UP", "DOWN"],
+  "unpaired_reasons": ["no_candidate", "ambiguous"],
+  "gate_reasons": [
+   "no_bend_notes",
+   "bend_notes_split",
+   "no_outer_loop",
+   "multiple_outer_loops",
+   "stray_loop",
+   "cut_line_in_flat_view",
+   "unclaimed_open_chain",
+   "no_bend_paired",
+   "thickness_unresolved",
+   "thickness_ambiguous",
+   "fixed_point_ambiguous"
+  ]
+ },
+
+ "known_limits": {
+  "chaining": "Tier A only — strict degree-2 endpoint chaining. Solves flat patterns completely; leaves ORTHO views partly chained, because a feature silhouette ending mid-edge on the outline is a T-junction (degree 3) and the chainer refuses to guess there. Tier B (planar arrangement: split at interior touch points, then walk faces by leftmost turn) is a separate job — ADR-064.",
+  "bend_note_rotation": "The note-above-the-line rule is generalised through the note's own rotation, but only rotation 0 has been observed. See logs.md KNOWN RISKS.",
+  "hatch": "HATCH entities are dropped (they are not part geometry). Verified they are real HATCH entities in the samples, not exploded line fans."
+ }
+}

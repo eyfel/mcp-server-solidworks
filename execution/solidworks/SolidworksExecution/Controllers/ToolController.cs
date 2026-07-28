@@ -169,7 +169,7 @@ namespace SolidworksExecution.Controllers
                 case "verify_state":           return _service.VerifyState(request);
                 case "close_document":         return _service.CloseDocument(request);
                 case "analyze_model":          return _service.AnalyzeModel(request);
-                case "analyze_drawing":        return _service.AnalyzeDrawing(request);
+                case "analyze_slddrw_test":    return _service.AnalyzeDrawing(request);
                 case "get_selection":          return _service.GetSelection(request);
                 case "edit_sketch":            return _service.EditSketch(request);
                 case "add_reference_geometry": return _service.AddReferenceGeometry(request);

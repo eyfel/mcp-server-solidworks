@@ -1,4 +1,4 @@
-# solidworks-execution — Architecture
+# execution/solidworks — Architecture
 
 Role: **Execution Layer / Truth Engine (SolidWorks-specific)**
 
@@ -8,7 +8,7 @@ The deterministic execution core. **The only layer allowed to touch the SolidWor
 
 Position in the system:
 ```
-… ─▶ solidworks-compiler ──REST──▶ solidworks-execution ──COM──▶ SolidWorks
+… ─▶ compiler/solidworks ──REST──▶ execution/solidworks ──COM──▶ SolidWorks
 ```
 The compiler (deterministic) drives this layer over plain REST. In Phase 1 the MCP adapter also drives it directly with the low-level tools while the IR vocabulary grows. All COM work runs serialized on a single dedicated STA thread (`StaExecutor`).
 
@@ -31,7 +31,7 @@ The compiler (deterministic) drives this layer over plain REST. In Phase 1 the M
 
 The SolidWorks-specific low-level contracts now live **here** (moved from the old `solidworks-planner/`):
 ```
-solidworks-execution/contracts/
+execution/solidworks/contracts/
   tool-schemas.json        ← input/output schema for every low-level CAD tool
   state-format.json        ← CadState structure
   execution-response.json  ← COMPLETED / FAILED / DUPLICATE shapes

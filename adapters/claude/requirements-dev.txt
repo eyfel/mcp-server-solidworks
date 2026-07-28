@@ -8,4 +8,4 @@ pytest>=8.0.0
 # Editable install of the deterministic IR compiler, so `import pycompiler` resolves
 # in IDEs/type checkers too (the adapter itself falls back to a sys.path insert when
 # the package isn't installed — see ir_execution_port.py).
--e ../../solidworks-compiler
+-e ../../compiler/solidworks

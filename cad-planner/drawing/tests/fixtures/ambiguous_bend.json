@@ -1,0 +1,226 @@
+{
+ "analysis_version": "0.2.0",
+ "source": {
+  "file": "ambiguous_bend",
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "bytes": 0
+ },
+ "config": {
+  "projection": "first_angle",
+  "k_factor": 0.5
+ },
+ "sheet": {
+  "dxf_version": "AC1027",
+  "units": 4,
+  "scale_factor": 1.0,
+  "paper_box": [
+   0.0,
+   0.0,
+   297.0,
+   210.0
+  ],
+  "audit_errors": 0
+ },
+ "views": [
+  {
+   "vid": "v0",
+   "paper_box": [
+    100.0,
+    100.0,
+    140.0,
+    160.0
+   ],
+   "size": [
+    40,
+    60
+   ],
+   "geometry": {
+    "lines": [
+     {
+      "x1": 0,
+      "y1": 0,
+      "x2": 40,
+      "y2": 0,
+      "c": "visible"
+     },
+     {
+      "x1": 40,
+      "y1": 0,
+      "x2": 40,
+      "y2": 60,
+      "c": "visible"
+     },
+     {
+      "x1": 40,
+      "y1": 60,
+      "x2": 0,
+      "y2": 60,
+      "c": "visible"
+     },
+     {
+      "x1": 0,
+      "y1": 60,
+      "x2": 0,
+      "y2": 0,
+      "c": "visible"
+     },
+     {
+      "x1": 0,
+      "y1": 40,
+      "x2": 40,
+      "y2": 40,
+      "c": "visible"
+     },
+     {
+      "x1": 0,
+      "y1": 20,
+      "x2": 15,
+      "y2": 20,
+      "c": "hidden"
+     },
+     {
+      "x1": 25,
+      "y1": 20,
+      "x2": 40,
+      "y2": 20,
+      "c": "hidden"
+     }
+    ],
+    "arcs": [],
+    "circles": []
+   },
+   "loops": [
+    {
+     "id": "L0",
+     "class": "visible",
+     "role": "outer",
+     "parent": null,
+     "area": 2400.0,
+     "bbox": [
+      0,
+      0,
+      40,
+      60
+     ],
+     "seq": [
+      [
+       "l",
+       0,
+       1
+      ],
+      [
+       "l",
+       1,
+       1
+      ],
+      [
+       "l",
+       2,
+       1
+      ],
+      [
+       "l",
+       3,
+       1
+      ]
+     ]
+    }
+   ],
+   "open_chains": [
+    {
+     "id": "O0",
+     "class": "hidden",
+     "seq": [
+      [
+       "l",
+       5,
+       1
+      ]
+     ]
+    },
+    {
+     "id": "O1",
+     "class": "hidden",
+     "seq": [
+      [
+       "l",
+       6,
+       1
+      ]
+     ]
+    },
+    {
+     "id": "O2",
+     "class": "visible",
+     "seq": [
+      [
+       "l",
+       4,
+       1
+      ]
+     ]
+    }
+   ],
+   "role": "view"
+  }
+ ],
+ "alignment": [],
+ "dimensions": [],
+ "bend_notes": [
+  {
+   "dir": "UP",
+   "angle_deg": 90.0,
+   "radius": 1.0,
+   "rot": 0.0,
+   "at": [
+    120.0,
+    144.5
+   ],
+   "view": "v0",
+   "bend_line": {
+    "seg": [
+     "l",
+     4
+    ],
+    "class": "visible",
+    "note_offset": 4.5,
+    "in_loop": false
+   }
+  },
+  {
+   "dir": "DOWN",
+   "angle_deg": 90.0,
+   "radius": 1.0,
+   "rot": 0.0,
+   "at": [
+    120.0,
+    124.5
+   ],
+   "view": "v0",
+   "unpaired": {
+    "reason": "ambiguous",
+    "candidates": [
+     [
+      "l",
+      5
+     ],
+     [
+      "l",
+      6
+     ]
+    ]
+   }
+  }
+ ],
+ "notes": [
+  {
+   "text": "3 mm",
+   "at": [
+    10.0,
+    10.0
+   ],
+   "view": null
+  }
+ ],
+ "user_description": null
+}

@@ -1,5 +1,5 @@
 """
-Maps solidworks-execution ExecutionResponse payloads to MCP tool result strings.
+Maps execution/solidworks ExecutionResponse payloads to MCP tool result strings.
 
 COMPLETED → success text with state summary
 FAILED    → raises RuntimeError (fastmcp surfaces this as isError=True)

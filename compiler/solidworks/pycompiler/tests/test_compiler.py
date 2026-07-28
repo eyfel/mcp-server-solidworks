@@ -4,15 +4,15 @@ Proves the lowering order, the reference resolver (picks the +Y top face), struc
 rejection (no execution calls), and partial-progress reporting on an injected sub-op failure.
 
 Run two ways:
-  - standalone:  python solidworks-compiler/pycompiler/tests/test_compiler.py
-  - pytest:      pytest solidworks-compiler/pycompiler/tests/test_compiler.py
+  - standalone:  python compiler/solidworks/pycompiler/tests/test_compiler.py
+  - pytest:      pytest compiler/solidworks/pycompiler/tests/test_compiler.py
 """
 import json
 import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_COMPILER_ROOT = os.path.dirname(os.path.dirname(_HERE))  # solidworks-compiler/
+_COMPILER_ROOT = os.path.dirname(os.path.dirname(_HERE))  # compiler/solidworks/
 if _COMPILER_ROOT not in sys.path:
     sys.path.insert(0, _COMPILER_ROOT)
 
