@@ -1,6 +1,6 @@
 # recipe-usage.md — The IR Generation Recipe (usage edition)
 
-**Version: 0.20.0** · Owner: cad-planner · Served to the model section-by-section via the
+**Version: 0.21.0** · Owner: cad-planner · Served to the model section-by-section via the
 `get_recipe` MCP tool. This is the operational rule set for turning an analysis artifact's
 recipe into a Feature Graph IR (and for producing reconstructable drawings). Sections are
 addressed by the slug in each `##` header.
@@ -304,10 +304,17 @@ f-2, s-2, 2026-07-27).
 
 **Read R16 FIRST.** The tool answers in one of two shapes, and the shape tells you which job you have.
 
-**R1 — Apply the scale before anything else.** A DXF dimension's stored value is PAPER space. The
-TRUE value is `value × sheet.scale_factor` (DXF `DIMLFAC`; the tool already applies it, and view sizes
-and geometry are emitted in TRUE mm). A 1:2 sheet reads 50 for a 100 mm part — an unscaled read
-silently builds a half-size part and every downstream check still "passes".
+**R1 — Apply the scale before anything else — and it is PER VIEW, not per sheet.** A DXF dimension's
+stored value is PAPER space. The TRUE value is `value × scale` (DXF `DIMLFAC`; the tool already applies
+it, and view sizes and geometry are emitted in TRUE mm). A 1:2 sheet reads 50 for a 100 mm part — an
+unscaled read silently builds a half-size part and every downstream check still "passes". Two riders:
+
+- A VIEW MAY CARRY ITS OWN SCALE. A detail or section labelled `A-A 1 : 1` on a 1:10 sheet is drawn at
+  1:1, and the sheet factor is wrong for it by ten. The reader reads the ratio from the view's own
+  LABEL and reports `view.scale_factor` when it differs from the sheet's; its geometry and its
+  dimensions are then scaled with THAT factor. Where a view carries a `scale_factor`, say so before
+  using any number from it.
+- AN ANGLE IS NEVER SCALED. `DIMLFAC` is a length factor; an angular dimension is dimensionless.
 
 **R2 — The edge CLASS is data, never appearance.** Every primitive carries `c`: `visible` (a real edge
 on the near side) · `hidden` (obscured — a real feature seen through material) · `cut_line` (a
@@ -322,11 +329,21 @@ nothing). An open chain is a real segment belonging to no contour: a bend line, 
 ortho silhouette fragment the chainer stopped at a T-junction. It is never an invitation to close the
 loop yourself — see R17.
 
-**R3 — Views come from clustering; the sheet-spanning cluster is the FRAME.** The title block/border is
-one cluster the size of the sheet — never a view, and its texts are metadata (part name, `ÖLÇEK`, sheet
-size). Do not trust title-block labels over geometry: the f-1/f-2 template prints "A3" on a 210×297
-(A4) sheet. A cluster fully INSIDE another view's box is a FEATURE of that view (a hole, a slot), not a
-separate view.
+**R3 — The frame is not a view; the TITLE BLOCK is a parameter TABLE, not junk.** The border/title
+block is one cluster the size of the sheet — never a view. A cluster fully INSIDE another view's box is
+a FEATURE of that view (a hole, a slot), not a separate view; a cluster sitting in the title-block
+corner that no dimension points at is furniture and arrives as `role: "frame_item"` (a projection
+symbol, a weld symbol, the oval around a check dimension). But the TEXT down there is often the most
+important evidence on the sheet, and it arrives separately as **`frame_notes`**, in reading order:
+
+- Read it as a TABLE: a label and its value share an x, one row apart. On a real industrial block that
+  is where LENGTH, WIDTH, THICKNESS, MATERIAL, the standard, the DESCRIPTION, the SCALE, the
+  PROJECTION METHOD and the WEIGHT live. On a break view the title-block length is the ONLY length
+  there is (R19).
+- A field whose value is IDENTICAL across DIFFERENT parts is template boilerplate, not part data —
+  a check dimension repeating `257 ±0.1` on five unrelated drawings is not a feature.
+- Still do not trust a title-block LABEL over geometry where the two overlap: the f-1/f-2 template
+  prints "A3" on a 210×297 (A4) sheet.
 
 **R4 — Alignment gives the axis; the PROJECTION STANDARD gives the sign.** Two views sharing their
 paper-X span are a vertical projection pair; sharing paper-Y, a horizontal pair. That much is
@@ -458,6 +475,61 @@ patterns completely; in ORTHO views it leaves fragments, because a feature silho
 middle of an outline edge is exactly such a junction. When the outline you need is in pieces, say which
 pieces you have and what you could not close. Do NOT invent the missing segment: a wrong contour builds
 VALID geometry with no error — the same silent-failure class as R14's mirror.
+
+### Reading a real production drawing
+
+**R18 — What the drawing PRINTS arbitrates.** Every dimension carries `printed` — the string the CAD
+system actually drew, taken from the dimension's own block. It is more reliable than the stored
+measurement, which the DWG→DXF route corrupts in two whole classes: an ANGULAR value comes back as
+180+θ (a 7.9° bend reads 187.8765, a 45° weld bevel reads 225), and a RADIUS loses its arc side. So for
+angular, radius and diameter the printed value WINS and the reader has already substituted it. For a
+linear dimension the computed value stays (it carries more decimals than the printed rounding), but a
+disagreement beyond rounding is reported as `printed_mismatch` — read that flag, it means the scale,
+the arc match or the per-view factor is wrong, and it is free.
+
+**R19 — A BREAK (interrupted) view gives you the PROFILE, never the LENGTH.** A very long part is drawn
+shortened, with the middle cut out. The signature is mechanical, all of it computable from what the
+reader emits: the outline does not close although every primitive is `visible`; the silhouette edges
+appear as COLLINEAR PAIRS with a gap; the gap is spanned by primitives that OVERHANG the silhouette on
+BOTH sides (nothing real overhangs its own outline); and they come as a MATCHED PAIR, one set per
+broken end. When you see it:
+
+- Take the cross-section/profile from the drawn body. Its extent along the break axis is VOID.
+- The length comes from an ANNOTATION — a dimension or the title block. If nothing states it, that is
+  a gap (R17 applied to the length axis), never a derivation.
+- A dimension placed ON the broken geometry may itself be the DRAWN extent, not the part: cross-check
+  it against the title-block length before trusting it, and let R20 arbitrate.
+- Classify the break lines explicitly in the R15 ledger. They are furniture, not contour.
+
+**R20 — If the title block states a WEIGHT, it must come out.** Compute it from your reading before
+building: volume × density. It is an independent check on the WHOLE interpretation at once — it caught
+a break view's true length (338 gives 0.464 kg, the drawn 125 gives 0.172) and it confirms
+material-REMOVING detail too, because the stated weight includes it (a 6.7 m plate read 183.47 kg as a
+plain blank and 178.73 kg once the 45° weld preparation along both long edges was subtracted, against
+a stated 178.694). Do NOT go looking for a weight that is not there — many drawings have none. Use it
+when it exists.
+
+**R21 — Sheet metal is decided by DECLARATION first, thickness second.** If the title block says so
+(`Blech`, `plate`, and their equivalents), build it as sheet metal. If it does not, a part of
+**thickness ≤ 20 mm** that is otherwise a single extrude is sheet metal too — building it as a base
+flange is more useful downstream (flat pattern, bends, manufacturing intent) than a plain boss. Above
+20 mm there is no rule: decide, and say which way you decided and why.
+
+**R22 — With no UP/DOWN note, bend DIRECTION comes from the projection, not from the line's class.**
+`bend_class_map` (visible=UP, hidden=DOWN) is a SolidWorks flat-pattern convention and only applies to
+a flat pattern SolidWorks generated — a real drawing draws bend lines as plain continuous lines and may
+mark them with a hand leader instead. Read the direction from the FORMED view via R4 instead: find the
+edge view of the formed part, apply the projection standard to learn which side of it is the near face,
+and see which way the bend centre lies. Then, because the compiler's own fold convention is a BUILD
+choice and not something the drawing says: build once, READ THE FOLD BACK (R14), and set `flip` if it
+came out mirrored. The magnitude being right and only the sign wrong is the expected first result.
+
+**R23 — On sheet metal, BENDS come before chamfers and fillets.** SolidWorks cannot fold through a
+chamfer: a sketched bend crossing a chamfered edge returns null with no useful message. Order the graph
+blank → base flange → every bend → only then the edge treatments. Selecting the edges afterwards costs
+more (each long edge is split by every bend it crosses, so one weld preparation became 16 edges instead
+of 4) — pay it. If the edge treatment is easier to express on the flat, that is not a reason: it will
+not build.
 
 ## coverage — Coverage reporting
 

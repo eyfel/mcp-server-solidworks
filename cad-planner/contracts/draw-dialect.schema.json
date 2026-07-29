@@ -1,7 +1,7 @@
 {
  "_meta": {
   "name": "draw-dialect",
-  "version": "0.2.0-draft",
+  "version": "0.3.0-draft",
   "status": "DRAFT — the compact 2D description a technical drawing (DXF/DWG) is read into. Shipped with the DXF-first reverse path (ADR-062) and grown with contour chaining + the direct-buildable gate (ADR-064).",
   "produced_by": "cad-planner/drawing/dxf_read.py (its ANALYSIS_VERSION is this artifact's `analysis_version`)",
   "consumed_by": "cad-planner/drawing/{contour,pairing,lowering}.py, the `analyze_drawing` MCP tool, and the model itself (get_recipe('reverse') tells it how to read this)",
@@ -20,19 +20,22 @@
    "paper_box": "[x0, y0, x1, y1] — the sheet frame, in PAPER mm",
    "audit_errors": "integer — ezdxf recover-mode findings"
   },
+  "frame": "{ paper_box, title_block_top, primitives{lines,arcs,circles}, circles[], note_count } — the border/title-block cluster, which is NOT emitted as a view. Reported so it cannot vanish silently: it had been swallowing the projection-method symbol's concentric circles. `title_block_top` is the topmost full-width horizontal rule in the sheet's lower half (null when none) — the line that separates drawing area from administrative band.",
   "views": "array of view objects (see `view`)",
-  "alignment": "array of { a, b, shares: 'x'|'y' } — two views sharing a paper-axis span are a projection pair. Convention-independent; only the SIGN needs config.projection.",
+  "alignment": "array of { a, b, shares: 'x'|'y' } — two views sharing a paper-axis span are a projection pair. Compared on `geom_box`, and only between views of role 'view'. Convention-independent; only the SIGN needs config.projection.",
   "dimensions": "array of { value, kind, defpts, view?, measures?, text? } — `value` is TRUE (scaled). `measures` links a radius/diameter dim to the primitive it measures ('v0:c1').",
   "bend_notes": "array of bend objects (see `bend_note`)",
-  "notes": "array of { text, at, view? } — free text outside the title block (e.g. a bare '2 mm' thickness note, section labels)",
+  "notes": "array of { text, at, view? } — free text OUTSIDE the title block (e.g. a bare '2 mm' thickness note, section labels)",
+  "frame_notes": "array of { text, at } — every text INSIDE the title block / sheet margin, in reading order (top row first, then left to right). Emitted, never dropped: on a bare CAD template this is furniture, but on a real industrial title block it is the parameter table — length, width, thickness, material, scale, projection standard, description and weight all live here, and on a break view the title-block length is the ONLY source there is. A title block is a TABLE: pair a label with the value in the row below it at the same x. A field whose value is IDENTICAL across different parts is template boilerplate, not part data.",
   "user_description": "string or null — filled in BY HAND when the author described the part. Research pool only; the build flow never reads it."
  },
 
  "view": {
   "vid": "string — 'v0', 'v1', … stable within one artifact",
-  "role": "one of covered.view_roles — 'annotation' marks a cluster that is drafting furniture (a section arrow head), not a view. Marked, never deleted: deleting by size would take a 2 mm thickness view with it.",
-  "paper_box": "[x0, y0, x1, y1] in PAPER mm — the coordinate space the bend notes' `at` lives in",
-  "size": "[w, h] in TRUE mm",
+  "role": "one of covered.view_roles — 'annotation' = drafting furniture (a section arrow head); 'frame_item' = a cluster lying wholly inside the title-block band that no dimension points at (a projection-method symbol, a weld symbol, the oval around a check dimension). Marked, never deleted: deleting by size would take a 2 mm thickness view with it, and a dimension pointing at a cluster always makes it a view.",
+  "paper_box": "[x0, y0, x1, y1] in PAPER mm — the CLUSTER box, and the origin of this view's local coordinates (the space bend notes' `at` is converted against). It over-reports the view on purpose-free grounds: centre lines overhang, and an arc joins its cluster by its whole CIRCLE box. Use geom_box to measure.",
+  "geom_box": "[x0, y0, x1, y1] in PAPER mm — the box of the VISIBLE geometry alone, each arc contributing its true extent. The visible silhouette bounds an orthographic view by definition (hidden geometry is obscured, therefore inside it), so this is what `size` and the projection-pair test are built on.",
+  "size": "[w, h] in TRUE mm — from geom_box, i.e. the size of the part AS DRAWN in this view. On a break view that is the shortened body, not the part (see the reverse recipe).",
   "dropped_duplicates": "integer (omitted when 0) — exact-duplicate primitives removed at emit time. The SolidWorks DWG→DXF route is lossless but ADDITIVE: it re-emits a section view's boundary geometry. Duplicates make every shared endpoint look like a degree-4 junction, which stops the chainer dead.",
   "geometry": {
    "lines": "array of { x1, y1, x2, y2, c } — view-local TRUE mm, origin at the view box's lower-left",
@@ -75,7 +78,7 @@
  "covered": {
   "_note": "CONTRACT: every ARRAY here is machine-diffed against the matching frozenset in cad-planner/drawing/*.py by tests/test_draw_contract.py — both directions, exact set equality. Adding a token on one side alone FAILS the gate. Everything else in this file is prose and is deliberately NOT checked (mirrors feature-graph.schema.json's own contract/prose split).",
   "edge_classes": ["visible", "hidden", "cut_line", "center"],
-  "view_roles": ["view", "annotation"],
+  "view_roles": ["view", "annotation", "frame_item"],
   "loop_roles": ["outer", "inner"],
   "seq_codes": ["l", "a", "c"],
   "primitive_kinds": ["lines", "arcs", "circles"],

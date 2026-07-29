@@ -12,7 +12,7 @@ from __future__ import annotations
 
 # --- geometry / structure --------------------------------------------------------------------
 EDGE_CLASSES = frozenset({"visible", "hidden", "cut_line", "center"})
-VIEW_ROLES = frozenset({"view", "annotation"})
+VIEW_ROLES = frozenset({"view", "annotation", "frame_item"})
 LOOP_ROLES = frozenset({"outer", "inner"})
 SEQ_CODES = frozenset({"l", "a", "c"})                      # as used in a loop's `seq`
 PRIMITIVE_KINDS = frozenset({"lines", "arcs", "circles"})   # the view.geometry array names

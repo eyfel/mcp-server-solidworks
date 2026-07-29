@@ -15,9 +15,17 @@ Key facts it recovers (each one cost a real bug when missing):
   * Edge class per entity  -- linetype with BYLAYER resolved through the layer: Continuous =
     visible, HIDDEN = obscured, PHANTOM = section cut line, CENTER* = axis.
   * Views by clustering    -- bbox union-find; the cluster spanning the whole sheet is the FRAME
-    (title block), never a view.
+    (title block), never a view. The frame is REPORTED (counts + its round primitives) rather than
+    dropped, and a cluster lying wholly inside the title-block band that no dimension points at is
+    tagged role="frame_item" -- the projection-method symbol and the weld symbol are not views.
+  * A view's true extent   -- `geom_box` / `size` come from the VISIBLE silhouette with true arc
+    extents, not from the cluster box (centre lines overhang; an arc clusters by its whole circle).
+    This is also what the projection-pair test compares.
   * Bend notes             -- "UP 90 R 1" / "DOWN 90 R 1" with the bend line they annotate.
   * Free notes             -- e.g. a bare "2 mm" thickness note, and section labels.
+  * Title-block text       -- `frame_notes`, in reading order. NOT part information on a bare CAD
+    template, but on a real industrial title block it IS the parameter table (length, width,
+    thickness, material, scale, projection standard, weight). Separated, never dropped.
 
 Usage:
   python dxf_read.py <file.dxf>                 # print the draw-dialect JSON
@@ -52,7 +60,11 @@ except ImportError:              # fallback: run directly as a script from this 
     import contour
     import pairing
 
-ANALYSIS_VERSION = "0.2.0"   # 0.2.0: contour chaining (loops + open_chains), emit-time duplicate
+ANALYSIS_VERSION = "0.3.0"   # 0.3.0: title-block text EMITTED (frame_notes) instead of dropped;
+                             #        geom_box + true arc extents (size / alignment no longer
+                             #        inflated); title-block furniture tagged role="frame_item";
+                             #        the frame cluster itself reported instead of vanishing
+                             # 0.2.0: contour chaining (loops + open_chains), emit-time duplicate
                              #        dedup, explicit arc endpoints, bend pairing by class + side
                              # 0.1.1: radius/diameter read off the GEOMETRY (+measures);
                              #        section-arrow clusters tagged role="annotation"
@@ -98,6 +110,89 @@ def bbox(e):
     if t in ("CIRCLE", "ARC"):
         c, r = e.dxf.center, e.dxf.radius
         return (c.x - r, c.y - r, c.x + r, c.y + r)
+    return None
+
+
+# A drawing-scale ratio inside a view label ("A-A 1 : 1", "DETAIL B 2:1", "M 1:2"). Bare integers
+# on either side only -- a bare "3:4" in prose would also match, which is why the caller additionally
+# requires the text to sit beside a view and outside the title block.
+_SCALE_RE = re.compile(r"(?<![\d.,])(\d+(?:[.,]\d+)?)\s*:\s*(\d+(?:[.,]\d+)?)(?![\d.,])")
+
+_NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
+
+
+def printed_text(doc, e):
+    """What the DRAWING PRINTS for this dimension.
+
+    A DXF DIMENSION carries a reference to an anonymous BLOCK holding its drawn representation --
+    extension lines, arrowheads, and the MTEXT with the value as the CAD system formatted it. That
+    text is ground truth, and it is the only reliable source for two whole classes of value that
+    the DWG->DXF route corrupts: every ANGULAR measurement comes back as 180+theta (s-7's 7.9 deg
+    bend reads 187.8765), and a RADIUS loses its arc side. It also cross-checks every linear value
+    against DIMLFAC and the per-view scale for free."""
+    blk = e.dxf.geometry if e.dxf.hasattr("geometry") else None
+    if not blk or blk not in doc.blocks:
+        return None
+    out = [(b.text if b.dxftype() == "MTEXT" else b.dxf.text)
+           for b in doc.blocks[blk] if b.dxftype() in ("MTEXT", "TEXT")]
+    return " ".join(t for t in out if t).strip() or None
+
+
+def printed_value(txt):
+    """The number inside a printed dimension string, or None. Strips MTEXT formatting runs and the
+    CAD escapes (%%c diameter, %%d degree) and accepts a comma decimal separator."""
+    if not txt:
+        return None
+    t = re.sub(r"\\[A-Za-z][^;]*;", " ", txt)
+    for junk in ("%%c", "%%C", "%%d", "%%D", "°", "{", "}"):
+        t = t.replace(junk, " ")
+    m = _NUM_RE.search(t)
+    return float(m.group(0).replace(",", ".")) if m else None
+
+
+_CARDINALS = (0.0, 90.0, 180.0, 270.0)
+
+
+def arc_bbox(cx, cy, r, a1, a2):
+    """The TRUE bbox of an arc, not of its full circle.
+
+    bbox() above deliberately returns the CIRCLE box: for CLUSTERING an over-estimate is safe. For
+    MEASURING a view it is not — s-3's break-line arcs (r = 26.88 mm drawn across a 35 mm wide part)
+    pushed its front view's reported size from 35 x 125 to 74 x 129 and, worse, moved its box far
+    enough that the true projection pair with the side view failed the shared-span test."""
+    a1, a2 = a1 % 360.0, a2 % 360.0
+    sweep = (a2 - a1) % 360.0 or 360.0
+    xs = [cx + r * math.cos(math.radians(a)) for a in (a1, a2)]
+    ys = [cy + r * math.sin(math.radians(a)) for a in (a1, a2)]
+    for ang in _CARDINALS:                       # a quadrant point is an extremum only if swept
+        if ((ang - a1) % 360.0) <= sweep:
+            xs.append(cx + r * math.cos(math.radians(ang)))
+            ys.append(cy + r * math.sin(math.radians(ang)))
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def geom_bbox(doc, items):
+    """Bbox over REAL part geometry only — the box a view's SIZE and its projection-pair test must
+    use, as opposed to the cluster box, which is an over-estimate by construction.
+
+    Taken from the VISIBLE class alone, because the visible silhouette bounds an orthographic view
+    by definition: hidden geometry is obscured and therefore inside it, centre lines overhang by
+    drafting convention, cut lines overhang too — and BREAK-VIEW furniture, drawn hidden on s-3,
+    overhangs the silhouette on both sides. Arcs contribute their true extent (arc_bbox). Falls
+    back through hidden and then the raw cluster for a cluster with no visible primitive."""
+    for keep in (("visible",), ("visible", "hidden"), None):
+        boxes = []
+        for e, b in items:
+            if keep is not None and edge_class(doc, e) not in keep:
+                continue
+            if e.dxftype() == "ARC":
+                c = e.dxf.center
+                boxes.append(arc_bbox(c.x, c.y, e.dxf.radius, e.dxf.start_angle, e.dxf.end_angle))
+            else:
+                boxes.append(b)
+        if boxes:
+            return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                    max(b[2] for b in boxes), max(b[3] for b in boxes))
     return None
 
 
@@ -162,6 +257,38 @@ def read(path, cfg):
     fb = cbox(frame) if frame else (0, 0, 0, 0)
     sheet_w, sheet_h = fb[2] - fb[0], fb[3] - fb[1]
 
+    # ---- the TITLE BLOCK band. Its rows are ruled by horizontal lines spanning (nearly) the whole
+    #      border width; the topmost such rule in the sheet's LOWER half is the block's top edge.
+    #      This is what tells a small cluster down there apart from a real view: a projection-method
+    #      symbol, a weld symbol and a boxed check dimension all clustered on their own on s-3/s-4
+    #      and were emitted as views v2/v3/v4, because R3's "the sheet-spanning cluster is the
+    #      frame" only catches furniture that TOUCHES the border.
+    #      The block is anchored to the frame's inner RIGHT edge and does NOT span the sheet: on A4
+    #      portrait its rules run the full inner width (18..205), on A3 landscape the same 187 mm
+    #      block sits at 228..415 — so a "spans the sheet" test finds nothing there, and a
+    #      y-only test would swallow s-6's thickness view, which sits BELOW the block's top edge but
+    #      far to its left. Hence: right-anchored, long, and the band is a CORNER, not a strip.
+    title_block_top = title_block_left = None
+    rules = [(e.dxf.start.y, min(e.dxf.start.x, e.dxf.end.x), max(e.dxf.start.x, e.dxf.end.x))
+             for e, _b in (frame or [])
+             if e.dxftype() == "LINE" and abs(e.dxf.start.y - e.dxf.end.y) <= 0.5
+             and e.dxf.start.y < (fb[1] + fb[3]) / 2.0]
+    if rules:
+        # The INNER border first: the longest horizontal rule that is not the sheet edge itself.
+        inner = max((r for r in rules if (r[2] - r[1]) < 0.99 * sheet_w),
+                    key=lambda r: r[2] - r[1], default=None)
+        if inner:
+            # The block's ROW GRID: rules that end at the inner right edge AND share one left x.
+            # Grouping by left x is what makes this sheet-size independent — the block is a fixed
+            # 187 mm on A4, A3 and A1 alike, so any "fraction of the sheet" threshold is wrong
+            # (it found the block on A4, missed it on A1). The biggest such column IS the block.
+            anchored = [r for r in rules if abs(r[2] - inner[2]) <= 0.5]
+            cols = Counter(round(r[1], 1) for r in anchored)
+            left, n = max(cols.items(), key=lambda kv: (kv[1], kv[0])) if cols else (None, 0)
+            if n >= 2:
+                grp = [r for r in anchored if abs(r[1] - left) <= 0.5]
+                title_block_left, title_block_top = min(r[1] for r in grp), max(r[0] for r in grp)
+
     # ---- views: every cluster that is NOT the frame. Nested clusters (a hole inside an
     #      outline) are merged into the containing view by bbox containment. -------------
     cands = []
@@ -197,10 +324,44 @@ def read(path, cfg):
                 v["ents"].append((e, b))
                 break
 
+    # ---- PER-VIEW SCALE. A view may be drawn at its OWN scale — s-7 is a 1:10 sheet carrying a
+    #      section labelled "A-A 1 : 1", so the sheet DIMLFAC is wrong for that view's geometry AND
+    #      its dimensions by a factor of ten (a 9.5 mm weld-prep leg read as 95). The DIMSTYLEs
+    #      cannot tell them apart (all four of s-7's carry dimlfac 10), so the only deterministic
+    #      source is the view's own LABEL. A label sits outside the view, overlapping its x span;
+    #      it belongs to the nearest such view. Title-block text is excluded by construction —
+    #      otherwise the block's own "Maßstab 1:10" would be read as a view label.
+    for v in views:
+        v["scale"] = sheet_scale
+    for e in ents:
+        if e.dxftype() not in ("MTEXT", "TEXT"):
+            continue
+        m = _SCALE_RE.search(((e.text if e.dxftype() == "MTEXT" else e.dxf.text) or "").replace("\n", " "))
+        if not m:
+            continue
+        p = e.dxf.insert
+        if (title_block_top is not None
+                and p.y <= title_block_top and p.x >= title_block_left):
+            continue
+        a, b = (float(m.group(i).replace(",", ".")) for i in (1, 2))
+        if not (a > 0 and b > 0):
+            continue
+        best, bd = None, 0.1 * sheet_h
+        for v in views:
+            bx = v["box"]
+            if not bx[0] <= p.x <= bx[2]:
+                continue
+            dist = bx[1] - p.y if p.y < bx[1] else p.y - bx[3] if p.y > bx[3] else 0.0
+            if dist < bd:
+                best, bd = v, dist
+        if best is not None:
+            best["scale"] = b / a
+
     chain_eps = cfg["tolerance"].get("chain_eps_mm", 0.01)
     out_views = []
     for vi, v in enumerate(views):
         x0, y0, x1, y1 = v["box"]
+        vscale = v["scale"]                      # this VIEW's scale, not the sheet's (see above)
         prims = {"lines": [], "arcs": [], "circles": []}
         # DEDUP at emit time. The SolidWorks DWG->DXF route is lossless but ADDITIVE: it re-emits a
         # section view's boundary geometry (f-2: 20->36 lines, 2->4 arcs; the direct DXF has none).
@@ -212,14 +373,14 @@ def read(path, cfg):
             t, k = e.dxftype(), edge_class(doc, e)
             if t == "LINE":
                 s, en = e.dxf.start, e.dxf.end
-                p = {"x1": _r((s.x - x0) * sheet_scale), "y1": _r((s.y - y0) * sheet_scale),
-                     "x2": _r((en.x - x0) * sheet_scale), "y2": _r((en.y - y0) * sheet_scale),
+                p = {"x1": _r((s.x - x0) * vscale), "y1": _r((s.y - y0) * vscale),
+                     "x2": _r((en.x - x0) * vscale), "y2": _r((en.y - y0) * vscale),
                      "c": k}
                 sig = ("l", k) + tuple(sorted([(p["x1"], p["y1"]), (p["x2"], p["y2"])]))
                 bucket = "lines"
             elif t == "ARC":
-                c, rad = e.dxf.center, _r(e.dxf.radius * sheet_scale)
-                cx, cy = _r((c.x - x0) * sheet_scale), _r((c.y - y0) * sheet_scale)
+                c, rad = e.dxf.center, _r(e.dxf.radius * vscale)
+                cx, cy = _r((c.x - x0) * vscale), _r((c.y - y0) * vscale)
                 a1, a2 = _r(e.dxf.start_angle, 2), _r(e.dxf.end_angle, 2)
                 # Explicit endpoints + sweep sense: a DXF ARC always runs CCW from a1 to a2, so a
                 # `draw` arc is 1:1 with the IR's `arc` profile primitive and the model never has
@@ -233,8 +394,8 @@ def read(path, cfg):
                 bucket = "arcs"
             elif t == "CIRCLE":
                 c = e.dxf.center
-                p = {"cx": _r((c.x - x0) * sheet_scale), "cy": _r((c.y - y0) * sheet_scale),
-                     "d": _r(2 * e.dxf.radius * sheet_scale), "c": k}
+                p = {"cx": _r((c.x - x0) * vscale), "cy": _r((c.y - y0) * vscale),
+                     "d": _r(2 * e.dxf.radius * vscale), "c": k}
                 sig = ("c", k, p["cx"], p["cy"], p["d"])
                 bucket = "circles"
             else:
@@ -245,12 +406,21 @@ def read(path, cfg):
             seen.add(sig)
             prims[bucket].append(p)
 
+        # paper_box is the CLUSTER box and stays the local-coordinate origin. It over-reports the
+        # view (overhanging centre lines, an arc's circle box), so the view's SIZE and its
+        # projection-pair test use the geometry box instead.
+        gb = geom_bbox(doc, v["ents"]) or (x0, y0, x1, y1)
         ov = {
             "vid": "v%d" % vi,
             "paper_box": [_r(x0, 2), _r(y0, 2), _r(x1, 2), _r(y1, 2)],
-            "size": [_r((x1 - x0) * sheet_scale), _r((y1 - y0) * sheet_scale)],
+            "geom_box": [_r(gb[0], 2), _r(gb[1], 2), _r(gb[2], 2), _r(gb[3], 2)],
+            "size": [_r((gb[2] - gb[0]) * vscale), _r((gb[3] - gb[1]) * vscale)],
             "geometry": prims,
         }
+        if vscale != sheet_scale:
+            # Say so loudly: this view is NOT at the sheet scale, and the label it was read from
+            # is the only evidence for that.
+            ov["scale_factor"] = vscale
         if dropped:
             ov["dropped_duplicates"] = dropped
         # CONTOUR CHAINING: closed loops (outer + inner) and open chains, as index references into
@@ -259,17 +429,8 @@ def read(path, cfg):
         ov.update(contour.chain_view(ov, chain_eps))
         out_views.append(ov)
 
-    # ---- view ALIGNMENT: shared paper-X = a vertical projection pair (same width axis),
-    #      shared paper-Y = a horizontal pair. Convention-independent; only the SIGN needs
-    #      config['projection']. -------------------------------------------------------
-    align = []
-    for i in range(len(out_views)):
-        for j in range(i + 1, len(out_views)):
-            a, b = out_views[i]["paper_box"], out_views[j]["paper_box"]
-            if abs(a[0] - b[0]) < 0.5 and abs(a[2] - b[2]) < 0.5:
-                align.append({"a": out_views[i]["vid"], "b": out_views[j]["vid"], "shares": "x"})
-            elif abs(a[1] - b[1]) < 0.5 and abs(a[3] - b[3]) < 0.5:
-                align.append({"a": out_views[i]["vid"], "b": out_views[j]["vid"], "shares": "y"})
+    # view ALIGNMENT is computed AFTER the roles are known (it must not pair title-block furniture)
+    # -- see the align block near the end of this function.
 
     def which_view(px, py):
         for v in out_views:
@@ -284,14 +445,17 @@ def read(path, cfg):
     # every arc/circle in PAPER coords, tagged with its view-local id -- the lookup table a
     # radius/diameter dimension is resolved against (see the RADIUS note below)
     round_prims = []
+    view_scale = {}
     for v in out_views:
         x0, y0 = v["paper_box"][0], v["paper_box"][1]
+        vs = v.get("scale_factor", sheet_scale)     # un-scale with the SAME factor that scaled it
+        view_scale[v["vid"]] = vs
         for i, a in enumerate(v["geometry"]["arcs"]):
-            round_prims.append((x0 + a["cx"] / sheet_scale, y0 + a["cy"] / sheet_scale,
-                                a["r"] / sheet_scale, "%s:a%d" % (v["vid"], i)))
+            round_prims.append((x0 + a["cx"] / vs, y0 + a["cy"] / vs,
+                                a["r"] / vs, "%s:a%d" % (v["vid"], i)))
         for i, c in enumerate(v["geometry"]["circles"]):
-            round_prims.append((x0 + c["cx"] / sheet_scale, y0 + c["cy"] / sheet_scale,
-                                c["d"] / sheet_scale / 2.0, "%s:c%d" % (v["vid"], i)))
+            round_prims.append((x0 + c["cx"] / vs, y0 + c["cy"] / vs,
+                                c["d"] / vs / 2.0, "%s:c%d" % (v["vid"], i)))
     dims = []
     for e in ents:
         if e.dxftype() != "DIMENSION":
@@ -300,7 +464,6 @@ def read(path, cfg):
             raw = float(e.get_measurement())
         except Exception:
             continue
-        f = dimlfac.get(getattr(e.dxf, "dimstyle", ""), 1.0)
         pts = []
         for a in ("defpoint", "defpoint2", "defpoint3", "defpoint4", "defpoint5"):
             if e.dxf.hasattr(a):
@@ -310,7 +473,13 @@ def read(path, cfg):
             kind = DIMKIND.get(int(e.dxf.dimtype) & 7, "?")
         except Exception:
             kind = "?"
-        value = _r(raw * f)
+        # The OWNING VIEW's scale wins over the dimstyle's DIMLFAC: s-7 puts every dimension,
+        # including the 1:1 section's, on a dimstyle carrying the sheet's factor of 10.
+        owner = which_view(pts[-1][0], pts[-1][1]) if pts else None
+        f = view_scale.get(owner) or dimlfac.get(getattr(e.dxf, "dimstyle", ""), 1.0)
+        # DIMLFAC is a LENGTH factor. An ANGULAR dimension is dimensionless and must never be
+        # scaled by it — s-7 is a 1:10 sheet and reported 2250 for a 225 deg angle.
+        value = _r(raw if kind in ("angular", "angular3p") else raw * f)
         # RADIUS/DIAMETER: do not trust the stored measurement. A DWG->DXF round trip loses the
         # arc-side defpoint, and the value then degrades to |centre - origin| (f-2: R4.5 read as
         # 232.36 = hypot(67.99, 222.19)). The dim's first defpoint IS the arc centre and the ARC
@@ -328,13 +497,31 @@ def read(path, cfg):
                 if score < bd:
                     bd, best = score, (ar, aid)
             if best is not None and bd <= 0.5:
-                value = _r(best[0] * sheet_scale * (2.0 if kind == "diameter" else 1.0))
+                vs = view_scale.get(best[1].split(":")[0], sheet_scale)
+                value = _r(best[0] * vs * (2.0 if kind == "diameter" else 1.0))
                 measures = best[1]
+        # The PRINTED text ARBITRATES. For an angular or a radius/diameter dim it simply wins —
+        # both are unreliable through the DWG route, and the printed string is what the drafter
+        # signed off on. For a linear dim the computed value stays (it carries more decimals than
+        # the printed rounding), but a disagreement beyond rounding is REPORTED, never swallowed.
+        printed = printed_text(doc, e)
+        pv = printed_value(printed)
+        mismatch = False
+        if pv is not None:
+            if kind in ("angular", "angular3p", "radius", "diameter"):
+                mismatch = value is not None and abs(value - pv) > max(0.01, 0.01 * abs(pv))
+                value = _r(pv)
+            elif value is not None:
+                mismatch = abs(value - pv) > max(0.05, 0.01 * abs(pv))
         d = {"value": value, "kind": kind, "defpts": pts}
+        if printed:
+            d["printed"] = printed
+        if mismatch:
+            d["printed_mismatch"] = True
         if measures:
             d["measures"] = measures
-        if pts:
-            d["view"] = which_view(pts[-1][0], pts[-1][1])
+        if owner:
+            d["view"] = owner
         txt = getattr(e.dxf, "text", "") or ""
         if txt not in ("<>", ""):
             d["text"] = txt          # e.g. '8x <>' (count prefix) or '%%c<>' (diameter)
@@ -342,7 +529,7 @@ def read(path, cfg):
 
     # ---- notes: bend annotations, free notes, section labels ---------------------------
     bend_re = re.compile(cfg["sheet_metal"]["bend_note_pattern"], re.I)
-    notes, bends = [], []
+    notes, frame_notes, bends = [], [], []
     for e in ents:
         if e.dxftype() not in ("MTEXT", "TEXT"):
             continue
@@ -351,8 +538,12 @@ def read(path, cfg):
         p = e.dxf.insert
         if not t:
             continue
-        # inside the title block / sheet margin -> metadata, not part information (the margins
-        # carry the A-F row and 1-4 column labels of the sheet format on ALL four edges)
+        # Inside the title block / sheet margin. This used to be a DELETE, and it was wrong: on a
+        # bare SolidWorks template the title block really is furniture, but on a real industrial one
+        # it IS the parameter table. s-3 lost 104 of its 134 texts that way -- among them the part's
+        # LENGTH (`l=338`, the only source, since the drawing is a break view), the projection
+        # standard (`ISO-E`), the sheet scale (`1:2`), the description (`Blech`) and the weight
+        # (`0,464 kg`, a free independent check on the whole reading). So: separated, never dropped.
         in_frame = (p.y < fb[1] + 0.25 * sheet_h or p.y > fb[3] - 0.03 * sheet_h
                     or p.x < fb[0] + 0.03 * sheet_w or p.x > fb[2] - 0.03 * sheet_w)
         m = bend_re.match(t.replace("°", " ").replace("  ", " ").strip()) or bend_re.match(t)
@@ -362,6 +553,11 @@ def read(path, cfg):
                           "at": [_r(p.x, 2), _r(p.y, 2)], "view": which_view(p.x, p.y)})
         elif not in_frame:
             notes.append({"text": t, "at": [_r(p.x, 2), _r(p.y, 2)], "view": which_view(p.x, p.y)})
+        else:
+            frame_notes.append({"text": t, "at": [_r(p.x, 2), _r(p.y, 2)]})
+    # Reading order (top row first, left to right): a title block is a TABLE, and its rows are what
+    # pair a label with its value -- 'Länge' at x=78.73 with '338' at x=78.57 one row below.
+    frame_notes.sort(key=lambda n: (-n["at"][1], n["at"][0]))
 
     pairing.pair_bend_notes(bends, out_views, sheet_scale, cfg)
 
@@ -378,7 +574,43 @@ def read(path, cfg):
         b = v["paper_box"]
         touches_end = any(b[0] - 1 <= px <= b[2] + 1 and b[1] - 1 <= py <= b[3] + 1
                           for px, py in cut_ends)
-        v["role"] = "annotation" if (touches_end and v["vid"] not in dimmed) else "view"
+        # A cluster lying WHOLLY inside the title-block band that no dimension points at is
+        # administrative furniture: the projection-method symbol, a weld symbol, the oval around a
+        # check dimension. The no-dimension guard is what keeps a real (if small) view safe.
+        in_title_block = (title_block_top is not None
+                          and b[3] <= title_block_top + gap and b[0] >= title_block_left - gap)
+        if v["vid"] in dimmed:
+            v["role"] = "view"
+        elif in_title_block:
+            v["role"] = "frame_item"
+        elif touches_end:
+            v["role"] = "annotation"
+        else:
+            v["role"] = "view"
+
+    # ---- view ALIGNMENT: shared paper-X = a vertical projection pair (same width axis),
+    #      shared paper-Y = a horizontal pair. Convention-independent; only the SIGN needs
+    #      config['projection']. Compared on GEOM_BOX, not paper_box: the cluster box carries
+    #      overhanging centre lines and whole-circle arc boxes, which moved s-3's front view 20 mm
+    #      off its own side view and lost a pair that is exact to 0.01 mm. Furniture never pairs.
+    align = []
+    real = [v for v in out_views if v["role"] == "view"]
+    for i in range(len(real)):
+        for j in range(i + 1, len(real)):
+            a, b = real[i]["geom_box"], real[j]["geom_box"]
+            if abs(a[0] - b[0]) < 0.5 and abs(a[2] - b[2]) < 0.5:
+                align.append({"a": real[i]["vid"], "b": real[j]["vid"], "shares": "x"})
+            elif abs(a[1] - b[1]) < 0.5 and abs(a[3] - b[3]) < 0.5:
+                align.append({"a": real[i]["vid"], "b": real[j]["vid"], "shares": "y"})
+
+    # ---- the FRAME cluster is not emitted as a view (it is the border + title block), but it must
+    #      not VANISH either: on s-3 it silently swallowed the projection symbol's two concentric
+    #      circles, so the model could see the symbol's cone and never its circles. Counted, and its
+    #      round primitives -- always few, always meaningful -- reported in PAPER mm.
+    fcount = Counter(e.dxftype() for e, _b in (frame or []))
+    fcircles = [{"cx": _r(e.dxf.center.x, 2), "cy": _r(e.dxf.center.y, 2),
+                 "d": _r(2 * e.dxf.radius, 2), "c": edge_class(doc, e)}
+                for e, _b in (frame or []) if e.dxftype() == "CIRCLE"]
 
     with open(path, "rb") as fh:
         digest = hashlib.sha256(fh.read()).hexdigest()
@@ -395,11 +627,21 @@ def read(path, cfg):
             "paper_box": [_r(fb[0], 2), _r(fb[1], 2), _r(fb[2], 2), _r(fb[3], 2)],
             "audit_errors": len(auditor.errors),
         },
+        "frame": {
+            "paper_box": [_r(fb[0], 2), _r(fb[1], 2), _r(fb[2], 2), _r(fb[3], 2)],
+            "title_block_top": _r(title_block_top, 2) if title_block_top is not None else None,
+            "title_block_left": _r(title_block_left, 2) if title_block_left is not None else None,
+            "primitives": {"lines": fcount.get("LINE", 0), "arcs": fcount.get("ARC", 0),
+                           "circles": fcount.get("CIRCLE", 0)},
+            "circles": fcircles,
+            "note_count": len(frame_notes),
+        },
         "views": out_views,
         "alignment": align,
         "dimensions": dims,
         "bend_notes": bends,
         "notes": notes,
+        "frame_notes": frame_notes,
         "user_description": None,   # filled in by hand when the author described the part
     }
 
