@@ -19,7 +19,7 @@ Phase 1:  Claude ──MCP: 38 low-level tools──────────▶ 
 
 ## Responsibilities
 
-- Implement the MCP protocol server (FastMCP, stdio).
+- Implement the MCP protocol server (official MCP Python SDK v2 — `MCPServer`, stdio).
 - Translate host tool calls into Execution Layer REST requests.
 - Generate `operation_id` (UUID4) per call; track `state_version`.
 - Map `ExecutionResponse` → MCP result.

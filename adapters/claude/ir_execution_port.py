@@ -10,7 +10,7 @@ This is the only place that wires the two together. It:
     /api/tool/execute + /state endpoints and the SAME idempotency / state_version machinery the
     low-level tools use (nothing forked, per the additive constraint).
 
-pycompiler itself imports nothing from the adapter (no FastMCP / httpx / server.py) — that one-way
+pycompiler itself imports nothing from the adapter (no MCP SDK / httpx / server.py) — that one-way
 dependency is what keeps the compiler relocatable to a standalone service later (IR-ADR-003).
 """
 import os

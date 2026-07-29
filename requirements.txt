@@ -1,3 +1,3 @@
-fastmcp>=3.4.5
+mcp>=2.0.0,<3        # official MCP Python SDK v2 (protocol 2026-07-28)
 httpx>=0.27.0
 python-dotenv>=1.0.0

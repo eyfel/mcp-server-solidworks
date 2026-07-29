@@ -15,7 +15,7 @@ The system has four layers, and preserving these boundaries is the foundation of
 | `cad-planner` | `cad-planner/` | Intent -> CAD-neutral Feature Graph IR. Does not touch COM, does not emit raw tool calls. |
 | `compiler/solidworks` | `compiler/solidworks/` | IR -> tool calls + reference resolution. Deterministic; contains no LLM and no MCP. |
 | `execution/solidworks` | `execution/solidworks/` | The only layer that touches SolidWorks COM (C#, .NET 4.8). |
-| `adapters/claude` | `adapters/claude/` | MCP protocol bridge (Python, FastMCP). |
+| `adapters/claude` | `adapters/claude/` | MCP protocol bridge (Python, MCP SDK v2). |
 
 Rules that must never be violated:
 
@@ -33,7 +33,7 @@ Rules that must never be violated:
 ### Requirements
 - Windows and **SolidWorks 2026** (development happens against a local SolidWorks install).
 - **.NET Framework 4.8** and MSBuild (ships with Visual Studio 2022).
-- **Python 3.x** and **FastMCP** (for the MCP adapter).
+- **Python 3.x** and the official **MCP Python SDK v2** (`mcp>=2.0.0`) for the MCP adapter.
 
 ### Building and running the execution layer
 

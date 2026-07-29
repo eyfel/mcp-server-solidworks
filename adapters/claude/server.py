@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -6,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 from pydantic import Field
-from fastmcp import FastMCP
+from mcp.server import MCPServer
 from execution_client import call_tool, get_state, ensure_ready as _ensure_ready, ExecutionLayerError
 from response_mapper import map_response
 # NOTE: pycompiler is reached via `from ir_execution_port import run_feature_graph` imported
@@ -20,7 +21,14 @@ from response_mapper import map_response
 # so valid selectors are never rejected. Editing this file requires reconnecting the
 # `solidworks` MCP server (no hot-reload — KNOWN-LIMITATIONS #4).
 
-mcp = FastMCP("solidworks-execution-adapter")
+# Every tool is registered with `structured_output=False`. All 47 return a `str`, so the
+# SDK's structured mirror is `{"result": "<the same string>"}` — the whole payload a second
+# time, for zero added information (measured: exactly 2.00x on both SDKs). Switching it off
+# halves the wire cost of every reader (`get_recipe('feature_graph_schema')` alone: 66 KB
+# -> 33 KB) and drops the per-tool `outputSchema` from the tools/list prompt. Restore it
+# only for a tool that returns real structure, never for a `-> str` one.
+
+mcp = MCPServer("solidworks-execution-adapter")
 
 # Tracks state_version in memory. Starts at 0, updated after every response.
 # Auto-resyncs from the execution layer on an INVALID_STATE_VERSION mismatch
@@ -67,7 +75,7 @@ def _call(tool_name: str, params: dict) -> str:
 # ---------------------------------------------------------------------------
 # Tool: ensure_ready  (lifecycle / bootstrap — not a state-versioned CAD op)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def ensure_ready() -> str:
     """Bring the SolidWorks environment up and confirm it is ready to use.
 
@@ -99,7 +107,7 @@ def ensure_ready() -> str:
 # ---------------------------------------------------------------------------
 # Tool: open_new_part
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def open_new_part(template_path: str = "") -> str:
     """Open a new SolidWorks part document."""
     params = {}
@@ -111,7 +119,7 @@ def open_new_part(template_path: str = "") -> str:
 # ---------------------------------------------------------------------------
 # Tool: open_document
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def open_document(file_path: str, as_assembly: bool = False) -> str:
     """Open an EXISTING document from disk (counterpart to open_new_part, which makes a BLANK doc).
     file_path: full path to the file.
@@ -132,7 +140,7 @@ def open_document(file_path: str, as_assembly: bool = False) -> str:
 # ---------------------------------------------------------------------------
 # Tool: open_new_assembly  (Phase B, ADR-047)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def open_new_assembly(template_path: str = "") -> str:
     """Open a new blank SolidWorks ASSEMBLY document (the twin of open_new_part).
     Use before insert_component / add_mate. template_path: optional .asmdot template
@@ -146,7 +154,7 @@ def open_new_assembly(template_path: str = "") -> str:
 # ---------------------------------------------------------------------------
 # Tool: analyze_assembly  (Phase B read tool, ADR-047 B1)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def analyze_assembly(
     analysis_type: Literal["components", "components_flat", "mates", "faces", "edges"],
     component: str = "",
@@ -176,7 +184,7 @@ def analyze_assembly(
 # ---------------------------------------------------------------------------
 # Tool: insert_component  (Phase B build tool, ADR-047 B3)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def insert_component(
     file_path: str,
     x: float = 0.0,
@@ -206,7 +214,7 @@ def insert_component(
 # ---------------------------------------------------------------------------
 # Tool: add_mate  (Phase B build tool, ADR-047 B3)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_mate(
     mate_type: Literal["coincident", "concentric", "perpendicular", "parallel",
                        "tangent", "distance", "angle", "lock"],
@@ -242,7 +250,7 @@ def add_mate(
 # ---------------------------------------------------------------------------
 # Tool: save_body_as_part  (Phase B — flattened-assembly reconstruction, ADR-048)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def save_body_as_part(body_index: int, file_path: str) -> str:
     """Extract ONE solid body of the ACTIVE multibody part into its own .SLDPRT file.
     body_index: from analyze_model(analysis_type='bodies'). The body's geometry stays in the
@@ -256,7 +264,7 @@ def save_body_as_part(body_index: int, file_path: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool: create_sketch
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_sketch(
     plane: str = "",
     on_face: bool = False,
@@ -284,7 +292,7 @@ def create_sketch(
 # ---------------------------------------------------------------------------
 # Tool: add_sketch_entity
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_sketch_entity(
     entity_type: Literal["rectangle", "circle", "line", "arc", "arc_center", "ellipse", "spline", "fillet", "chamfer"],
     x1: float = 0.0,
@@ -360,7 +368,7 @@ def add_sketch_entity(
 # ---------------------------------------------------------------------------
 # Tool: add_sketch_entities (batch)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_sketch_entities(segments: str) -> str:
     """Add MANY sketch entities to the active sketch in ONE call (the batch form of
     add_sketch_entity — prefer this whenever a profile has more than ~3 segments).
@@ -389,7 +397,7 @@ def add_sketch_entities(segments: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool: add_sketch_constraint
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_sketch_constraint(
     constraint_type: Literal[
         "horizontal", "vertical", "coincident", "parallel",
@@ -423,7 +431,7 @@ def add_sketch_constraint(
 # ---------------------------------------------------------------------------
 # Tool: add_dimension
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_dimension(px: float, py: float, value: Annotated[float, Field(gt=0, description="Dimension value in METERS (e.g. 0.05 = 50mm)")], label_offset_x: float = 0.0, label_offset_y: float = -0.015) -> str:
     """Apply a smart dimension to the sketch segment nearest to point (px, py).
     px/py should be on or very near the target segment — e.g. the midpoint of a line.
@@ -439,7 +447,7 @@ def add_dimension(px: float, py: float, value: Annotated[float, Field(gt=0, desc
 # ---------------------------------------------------------------------------
 # Tool: extrude_feature
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def extrude_feature(
     depth: Annotated[float, Field(
         ge=0, description="Extrusion depth in METERS (required > 0 for boss/cut)")] = 0.0,
@@ -501,7 +509,7 @@ def extrude_feature(
 # ---------------------------------------------------------------------------
 # Tool: create_rib
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_rib(
     thickness: Annotated[float, Field(gt=0, description="Rib thickness in METERS (e.g. 0.005 = 5mm)")],
     two_sided: bool = True,
@@ -538,7 +546,7 @@ def create_rib(
 # ---------------------------------------------------------------------------
 # Tool: add_edge_feature
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_edge_feature(
     feature_type: Literal["fillet", "chamfer"],
     radius_or_distance: Annotated[float, Field(gt=0, description="Fillet radius / chamfer FIRST-face setback (D1) in METERS (e.g. 0.01 = 10mm)")],
@@ -585,7 +593,7 @@ def add_edge_feature(
 # ---------------------------------------------------------------------------
 # Tool: create_drawing
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_drawing(model_path: str = "") -> str:
     """Open a new SolidWorks drawing document (A3 sheet, 1:1 scale).
     model_path: optional path to the part/assembly to reference. If omitted, an empty drawing is created.
@@ -596,7 +604,7 @@ def create_drawing(model_path: str = "") -> str:
 # ---------------------------------------------------------------------------
 # Tool: add_drawing_view
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_drawing_view(
     view_type: Literal["front", "top", "right", "isometric", "back", "bottom", "left"],
     pos_x: float = 0.1,
@@ -627,7 +635,7 @@ def add_drawing_view(
 # ---------------------------------------------------------------------------
 # Tool: add_flat_pattern_view
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_flat_pattern_view(
     pos_x: float = 0.1,
     pos_y: float = 0.1,
@@ -665,7 +673,7 @@ def add_flat_pattern_view(
 # ---------------------------------------------------------------------------
 # Tool: add_drawing_dimension
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_drawing_dimension(
     px: float,
     py: float,
@@ -687,7 +695,7 @@ def add_drawing_dimension(
 # ---------------------------------------------------------------------------
 # Tool: auto_dimension_drawing
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def auto_dimension_drawing(
     all_views: bool = True,
     include_unmarked: bool = False,
@@ -718,7 +726,7 @@ def auto_dimension_drawing(
 # ---------------------------------------------------------------------------
 # Tool: auto_center_marks
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def auto_center_marks(
     include_slots: bool = True,
     extended_lines: bool = True,
@@ -743,7 +751,7 @@ def auto_center_marks(
 # ---------------------------------------------------------------------------
 # Tool: add_hole_callout
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_hole_callout(px: float, py: float) -> str:
     """Insert a hole callout (e.g. '4× Ø8 THRU') on the hole edge nearest the sheet point (px, py)
     in the active drawing. Coordinate-based selection — same fragile point pick as add_drawing_dimension
@@ -757,7 +765,7 @@ def add_hole_callout(px: float, py: float) -> str:
 # ---------------------------------------------------------------------------
 # Tool: add_section_view
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_section_view(
     px: float,
     py: float,
@@ -804,7 +812,7 @@ def add_section_view(
 # ---------------------------------------------------------------------------
 # Tool: export_document
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def export_document(format: Literal["STEP", "IGES", "STL", "PDF", "DWG", "DXF"], file_path: str) -> str:
     """Export the active SolidWorks document to a file. The document remains open after export.
     format: 'STEP', 'IGES', 'STL', 'PDF', 'DWG', 'DXF'.
@@ -819,7 +827,7 @@ def export_document(format: Literal["STEP", "IGES", "STL", "PDF", "DWG", "DXF"],
 # ---------------------------------------------------------------------------
 # Tool: batch_export
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def batch_export(file_path_base: str, formats_json: str) -> str:
     """Export the active document to multiple formats in one call.
     file_path_base: output path without extension (e.g. 'C:/output/mypart').
@@ -832,7 +840,7 @@ def batch_export(file_path_base: str, formats_json: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool: verify_state
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def verify_state() -> str:
     """Read and return the current CAD state without modifying it."""
     return _call("verify_state", {})
@@ -841,7 +849,7 @@ def verify_state() -> str:
 # ---------------------------------------------------------------------------
 # Tool: close_document
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def close_document(save: bool = False, close_all: bool = False) -> str:
     """Close the active SolidWorks document. Set save=True to save before closing.
     close_all=True closes ALL open documents (incl. invisibly-loaded component docs that a
@@ -856,7 +864,7 @@ def close_document(save: bool = False, close_all: bool = False) -> str:
 # ---------------------------------------------------------------------------
 # Tool: save_document
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def save_document(file_path: str = "") -> str:
     """Save the active SolidWorks document to disk.
     file_path: full output path including the document extension
@@ -869,7 +877,7 @@ def save_document(file_path: str = "") -> str:
 # ---------------------------------------------------------------------------
 # Tool: analyze_model
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def analyze_model(
     analysis_type: Literal["mass_properties", "geometry", "bodies", "edges", "faces", "features", "sketch", "feature_map"],
     name: str = "",
@@ -949,7 +957,7 @@ _CAD_PLANNER_PKG_DIR = os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "cad-planner"))
 
 # Imported EAGERLY, at startup, in the MAIN thread -- deliberately, and NOT lazily inside the tool
-# like pycompiler is. ezdxf pulls in numpy, and loading numpy's C extensions from a FastMCP worker
+# like pycompiler is. ezdxf pulls in numpy, and loading numpy's C extensions from an MCP worker
 # thread DEADLOCKS on Windows: the tool hung forever with no error and no traceback (diagnosed by
 # faulthandler thread dump, 2026-07-27 -- stuck in importlib create_module for numpy._core.
 # multiarray). A failure here must still never kill the server, so it degrades to a clean per-call
@@ -1010,7 +1018,7 @@ def _summarise_direct(art, summary, graph):
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def analyze_drawing(file_path: str, save_analysis: bool = True,
                     mode: Literal["auto", "full", "ir", "build"] = "auto") -> str:
     """Read a 2D technical drawing — **.DXF or .DWG** — and either BUILD the part from it or hand
@@ -1173,7 +1181,7 @@ def analyze_drawing(file_path: str, save_analysis: bool = True,
 # ---------------------------------------------------------------------------
 # Tool: analyze_slddrw_test  (TEST/REFERENCE ONLY — was analyze_drawing until 2026-07-27)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def analyze_slddrw_test(include_geometry: bool = False, include_relations: bool = False) -> str:
     """TEST/REFERENCE TOOL — reads a NATIVE SolidWorks drawing (.SLDDRW) through COM.
 
@@ -1247,7 +1255,7 @@ def analyze_slddrw_test(include_geometry: bool = False, include_relations: bool 
 # ---------------------------------------------------------------------------
 # Tool: get_selection
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def get_selection() -> str:
     """Report what the USER currently has selected in the SolidWorks GUI — the inverse of index-based selection.
     When the user clicks geometry in the SolidWorks window (e.g. while telling you what to do — "put a hole on
@@ -1266,7 +1274,7 @@ def get_selection() -> str:
 # ---------------------------------------------------------------------------
 # Tool: edit_sketch
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def edit_sketch(sketch_name: str) -> str:
     """Reopen an existing sketch for editing. Counterpart to create_sketch.
     sketch_name: exact name of the sketch feature in the feature tree (e.g. 'Sketch1').
@@ -1278,7 +1286,7 @@ def edit_sketch(sketch_name: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool: add_reference_geometry
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def add_reference_geometry(
     type: Literal["plane", "axis", "point"],
     ref_plane_name: str = "",
@@ -1314,7 +1322,7 @@ def add_reference_geometry(
 # ---------------------------------------------------------------------------
 # Tool: create_pattern
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def create_pattern(
     pattern_type: Literal["linear", "circular", "mirror"],
     feature_name: str = "",
@@ -1388,7 +1396,7 @@ def create_pattern(
 # ---------------------------------------------------------------------------
 # Tool: set_part_material
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def set_part_material(
     material_name: str,
     library: str = "SolidWorks Materials",
@@ -1404,7 +1412,7 @@ def set_part_material(
 # ---------------------------------------------------------------------------
 # Tool: sheet_metal_feature
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def sheet_metal_feature(
     feature_type: Literal["base_flange", "edge_flange", "edge_flange_sketch", "edge_flange_finish",
                           "flat_pattern", "sketched_bend"],
@@ -1494,7 +1502,7 @@ def sheet_metal_feature(
 # ---------------------------------------------------------------------------
 # Tool: modify_dimension
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def modify_dimension(
     name: str,
     value: float,
@@ -1516,7 +1524,7 @@ def modify_dimension(
 # ---------------------------------------------------------------------------
 # Tool: edit_feature
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def edit_feature(
     feature_name: str,
     action: Literal["suppress", "unsuppress", "delete", "rename"],
@@ -1542,7 +1550,7 @@ def edit_feature(
 # ---------------------------------------------------------------------------
 # Tool: activate_document
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def activate_document(title: str) -> str:
     """Switch the ACTIVE SolidWorks document to an already-open one by its title (e.g. 'gear' or
     'gear.SLDPRT'). Use this to read/compare another open part — e.g. activate the original, analyze_model
@@ -1578,7 +1586,7 @@ def _recipe_sections():
     return header, {k: (t, "\n".join(body).strip()) for k, (t, body) in sections.items()}
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def get_recipe(
     section: Literal["index", "contract", "canonicalization", "forward", "mapping",
                      "mapping_part", "mapping_sheet_metal", "mapping_assembly", "verification",
@@ -1710,7 +1718,7 @@ def _collect_parameters(node, out: list, feature_name: str = "") -> None:
             _collect_parameters(child, out, feature_name)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def save_analysis(file_path: str) -> str:
     """Analyze a part FILE and persist its analysis ARTIFACT — the entry tool of the analysis
     pipeline. Opens the part (activates it if already open), runs the standard reads (features
@@ -1897,7 +1905,7 @@ def _save_assembly_analysis(src: str, sha: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool: rebuild_from_ir  (adapter-only — the analysis pipeline's IR door, IR-ADR-005)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def rebuild_from_ir(artifact_path: str, fresh_document: bool = True) -> str:
     """Rebuild a part from its analysis artifact's Feature Graph IR — the verification half of
     the round-trip ("the LLM proposes, the round-trip decides", IR-ADR-006). Reads
@@ -1956,7 +1964,7 @@ def rebuild_from_ir(artifact_path: str, fresh_document: bool = True) -> str:
 # ---------------------------------------------------------------------------
 # Tool: compare_parts  (adapter-only — the objective round-trip verifier, ADR-040/A0)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def compare_parts(doc_a: str, doc_b: str, detail: str = "") -> str:
     """Objectively diff two part documents — the round-trip verifier behind the artifact's
     `verified` label (and a general-purpose "are these the same part?" check).
@@ -2134,7 +2142,7 @@ def _face_desc(f: dict) -> str:
 # ---------------------------------------------------------------------------
 # Tool: compare_assemblies  (adapter-only — the assembly round-trip verifier, ADR-047 B4)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def compare_assemblies(doc_a: str, doc_b: str) -> str:
     """Objectively diff two ASSEMBLY documents against the RATIFIED verified criteria
     (ADR-047): component set EXACT (source file + config + instance counts) AND every
@@ -2280,7 +2288,7 @@ def _run_graph(graph_obj, fresh_document):
     return result.summary(), True, _resync_state_version()
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def submit_feature_graph(graph: str, fresh_document: bool = True) -> str:
     """Build a part (or assembly) from a Feature Graph IR in ONE call — the deterministic
     compiler lowers each IR node to the right low-level tool sequence and resolves references
@@ -2323,6 +2331,41 @@ def submit_feature_graph(graph: str, fresh_document: bool = True) -> str:
 
     text, ok, sv = _run_graph(graph_obj, fresh_document)
     return text + (f" | state_version={sv}" if ok else "")
+
+
+# ---------------------------------------------------------------------------
+# Tool-surface normalisation (prompt cost)
+# ---------------------------------------------------------------------------
+def _normalize_tool_surface() -> None:
+    """Undo three SDK artefacts that ride in the tools/list prompt on every turn.
+
+    1. Docstrings keep their source indentation (the SDK does not dedent them).
+    2. Every parameter gets an auto-generated `title` that just re-spells its own name.
+    3. `additionalProperties` is absent, so a typo'd param name is not rejected by the
+       schema — the P0.4 stance is to reject at the MCP layer, before any REST/COM
+       round-trip, so put it back.
+
+    `Tool.description` / `Tool.parameters` are plain mutable fields that `list_tools()`
+    reads at call time, so one pass after registration is enough. Without this the payload
+    is ~9% larger than the FastMCP surface it replaced; with it, ~2% smaller.
+
+    Touches `mcp._tool_manager` (private). The public alternative is the `middleware`
+    hook, which the SDK marks provisional — revisit if this breaks on an SDK bump; the
+    schema-contract test is what catches it.
+    """
+    for tool in mcp._tool_manager.list_tools():
+        if tool.description:
+            tool.description = inspect.cleandoc(tool.description)
+        schema = tool.parameters
+        if isinstance(schema, dict):
+            schema.pop("title", None)
+            for prop in (schema.get("properties") or {}).values():
+                if isinstance(prop, dict):
+                    prop.pop("title", None)
+            schema.setdefault("additionalProperties", False)
+
+
+_normalize_tool_surface()
 
 
 # ---------------------------------------------------------------------------

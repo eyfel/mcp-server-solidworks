@@ -2,7 +2,7 @@
 Maps execution/solidworks ExecutionResponse payloads to MCP tool result strings.
 
 COMPLETED → success text with state summary
-FAILED    → raises RuntimeError (fastmcp surfaces this as isError=True)
+FAILED    → raises RuntimeError (the SDK surfaces this as isError=True)
 DUPLICATE → success text noting idempotent result
 """
 import json
@@ -12,7 +12,7 @@ def map_response(response: dict) -> str:
     """
     Convert an ExecutionResponse dict into a MCP-compatible result string.
 
-    Raises RuntimeError for FAILED responses so fastmcp marks the call as an error.
+    Raises RuntimeError for FAILED responses so the SDK marks the call as an error.
     """
     status = response.get("status")
 

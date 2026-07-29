@@ -25,6 +25,21 @@ SolidPilot solves this by **raising the level of abstraction**:
 - A deterministic **compiler** lowers the IR into ordered, concrete SolidWorks operations.
 - A single feature therefore maps to many low-level operations, and one model call per request is enough.
 
+Because the IR is the spine, the same machinery runs **backwards**: a 2D technical drawing is design intent expressed in two dimensions, so it can be read into the same IR and built.
+
+### From a 2D drawing file to a solid part
+
+Hand SolidPilot a **.DXF or .DWG** — the file a supplier or a customer actually sends, with no model behind it — and it reconstructs the part:
+
+```
+drawing.dwg → analyze_drawing → (draw dialect: views, edge classes, chained contours,
+              true-valued dimensions, bend notes) → Feature Graph IR → compiler → SolidWorks
+```
+
+The reader decides which of two answers the drawing warrants. When every decision the part needs is **forced by the drawing itself** — today, sheet-metal flat patterns — it lowers the whole part to IR on its own and `analyze_drawing(mode='build')` builds it in one call. When the drawing needs real engineering reading (the normal case for a machined part), it says so and hands over the structured analysis, which the model interprets under a versioned rule set (`get_recipe('reverse')`) and builds through `submit_feature_graph`.
+
+Either way the result is checked, not assumed: expected volume is computed from the drawing's own dimensions *before* building and read back after. Nine real drawings have been reconstructed this way so far — four in-house samples (two of them sheet metal) and five production manufacturing sheets (A4/A3/A1, 1:1 to 1:10, three different title-block templates), each verified against its own title-block weight to within 0.02% or against the original part to exact topology.
+
 ---
 
 ## Architecture
@@ -77,7 +92,7 @@ The system has four layers:
 | Planner / Intent | `cad-planner/` | AI model + IR schema | Turns user intent into a CAD-neutral Feature Graph IR. Never touches COM, never emits raw tool calls. |
 | Compiler | `compiler/solidworks/` | Deterministic (no LLM) | Lowers the IR into ordered tool calls; resolves semantic references (e.g. `top_face`, `center`) against live geometry state. |
 | Execution | `execution/solidworks/` | C# (.NET Framework 4.8) | The **only** layer that touches the SolidWorks COM API. The single source of truth for CAD state. |
-| Adapter | `adapters/claude/` | Python (FastMCP) | MCP protocol bridge. The MCP boundary sits at the **top** of the system. |
+| Adapter | `adapters/claude/` | Python (MCP SDK v2) | MCP protocol bridge. The MCP boundary sits at the **top** of the system. |
 
 **MCP sits at the top:** it is the boundary where the AI client meets the system, not an internal transport. Everything below the IR is deterministic and communicates over plain REST.
 
@@ -154,7 +169,7 @@ The drawing tools were added after the initial part-modeling set and are now a s
 - `add_hole_callout` — adds a hole callout on a hole edge.
 - `add_drawing_dimension` — adds a single dimension by sheet coordinate.
 - `add_section_view` — section view along an existing edge or a drawn cut line — the standard way to expose and dimension internal/blind features (one section per distinct internal-depth axis).
-- `analyze_drawing` — reads a **2D technical drawing file (.DXF or .DWG)** and returns it as structured JSON: sheet scale (already applied, so every number is true model mm), detected views with per-primitive edge class (visible / hidden / section cut line / centre), view alignment pairs, true-valued dimensions, and sheet-metal bend notes. A .DWG is converted to DXF automatically. This is the drawing→part front end. _(The older reader for native SolidWorks drawings survives as `analyze_slddrw_test` — test/reference only: a .SLDDRW is model-linked, so if you have one the part already exists.)_
+- `analyze_drawing` — the **drawing → part front end**: reads a **2D technical drawing file (.DXF or .DWG)** and either builds the part from it or hands over the evidence to build it. A .DWG is converted to DXF automatically. What it extracts: per-view scale (already applied, so every number is true model mm), detected views with a per-primitive **edge class** (visible / hidden / section cut line / centre), contours already **chained into closed loops**, view alignment pairs, dimensions carrying the string the CAD system actually **printed** (which arbitrates over the stored value — a DWG round-trip corrupts angles and radii), the **title block as a parameter table** (`frame_notes` — length, material, weight, projection standard), and sheet-metal bend notes paired to their bend lines on three independent channels. It answers in one of two shapes, and the reader chooses: `DIRECT_BUILDABLE` + a compact summary (then `mode='build'` builds it in one call), or `NOT_DIRECT | <reason>` + the full analysis for the model to read under `get_recipe('reverse')`. Anything it cannot attribute is reported as skipped — never guessed. _(The older reader for native SolidWorks drawings survives as `analyze_slddrw_test` — test/reference only: a .SLDDRW is model-linked, so if you have one the part already exists.)_
 
 ### Export
 - `export_document` — STEP, IGES, STL, **PDF, DWG, DXF** (PDF/DWG/DXF require a drawing document).
@@ -167,7 +182,8 @@ The drawing tools were added after the initial part-modeling set and are now a s
 ### Requirements
 - Windows and **SolidWorks 2026**.
 - **.NET Framework 4.8** and MSBuild for the execution layer (ships with Visual Studio 2022).
-- **Python 3.x** and **FastMCP** for the adapter (Python dependencies are installed via `requirements.txt`).
+- **Python 3.x** and the official **MCP Python SDK v2** (`mcp>=2.0.0`, protocol `2026-07-28`) for the
+  adapter (Python dependencies are installed via `requirements.txt`).
 - An MCP-capable AI client (e.g. Claude Desktop; OpenClaw, OpenAI-based agents, and local LLMs are also targeted).
 
 ### Execution layer (C#)
@@ -225,7 +241,9 @@ SolidPilot is a **working prototype / early alpha**. The low-level tools have be
 
 **Parts:** the part-modeling surface is the most mature — sketches, extrude/revolve/sweep/loft, fillets/chamfers, patterns, sheet metal, reference geometry, plus editing (`modify_dimension`, `edit_feature`) and rich analysis. Initially only the tools needed for part creation existed.
 
-**Technical drawing:** added later and now a real (if still maturing) capability — multi-view drawings, section views, model-item auto-dimensioning, center marks, hole callouts, sheet-metal flat-pattern views, and a structural drawing reader. Both directions have been demonstrated on real production parts: **model → drawing** (a five-view dimensioned drawing incl. two orthogonal section views placed from analysis alone) and **drawing → model** (a part reconstructed from its drawing alone, read via `analyze_drawing(include_geometry)`, matching the original exactly in volume, surface area, and topology). Known limitation: the auto-dimension pass is drafting-blind (it can omit or mis-place dimensions and dimension hidden edges) — a smarter dimensioning layer is on the roadmap.
+**Technical drawing:** added later and now a real (if still maturing) capability — multi-view drawings, section views, model-item auto-dimensioning, center marks, hole callouts, sheet-metal flat-pattern views, and a drawing reader. **Model → drawing** has been demonstrated on real production parts (a five-view dimensioned drawing incl. two orthogonal section views placed from analysis alone). Known limitation there: the auto-dimension pass is drafting-blind (it can omit or mis-place dimensions and dimension hidden edges) — a smarter dimensioning layer is on the roadmap.
+
+**Drawing → model** is the direction that changed most recently, and it now works from a **drawing FILE alone** — no model, no SolidWorks drawing document, just the .DXF/.DWG a supplier would send. The reader (`cad-planner/drawing/`, the only module that touches DXF) chains contours into closed loops by strict degree-2 endpoint matching, pairs bend notes to bend lines, reads the title block as a parameter table, and takes each dimension's *printed* string as ground truth. Reconstructed so far: four in-house samples (two sheet metal, two machined) to **exact topology** against their originals, and five real production manufacturing sheets — A4/A3/A1, scales 1:1 to 1:10, three different title-block templates — each verified against its own stated weight to **≤ 0.02%**, including a 6.69 m three-bend plate and a break (interrupted) view whose drawn length is not the part's length. Honest limits: ortho views do not fully chain yet (a feature silhouette ending mid-edge is a T-junction, where the chainer stops rather than guess — an unresolved contour is reported as a gap), the projection standard is read from config rather than detected, and machined parts still need the model to do the engineering reading.
 
 **Assembly:** the assembly surface now works end-to-end — creating assemblies, inserting components with full transforms, index-based mating, deep structural readback (`analyze_assembly`), and objective verification (`compare_assemblies`). An assembly IR sub-vocabulary (components + mates) has been added to the Feature Graph schema, and real sample assemblies (up to ~17 components) have been reproduced from their IR to a `verified` match: exact component sets, transforms to sub-micron, matching mate counts and types.
 
@@ -235,7 +253,7 @@ The open problem — and the project's real research risk — is a **durable ref
 
 > **Two IR doors, one compiler.** The *reverse* door is `rebuild_from_ir` (reproduce an existing part from its artifact). The *forward* door is `submit_feature_graph` (build from design intent, with no original to copy) — now **live and gate-free**, and proven on real geometry: swept solids matching πr²·L to six digits, composed pattern grids, elliptic prisms, and sheet-metal flanges. Both doors execute through the same `pycompiler`, so every lesson from one improves the other. Note that having the forward door is *not* the same as collapsing the low-level surface beneath it — the 40-odd low-level tools still stand, and retiring them waits on the reference resolver below.
 
-**Testing:** three automated suites run fully offline (no SolidWorks needed) — a **tool contract test** (`adapters/claude/tests/test_schema_contract.py`) that fails on any tool/parameter drift between the adapter (`server.py`) and the execution contract (`tool-schemas.json`); an **IR contract test** (`compiler/solidworks/pycompiler/tests/test_ir_schema_contract.py`) that fails on any vocabulary drift between the IR schema — which doubles as the capability registry — and the validator that enforces it, in both directions; and the **compiler suite** (`compiler/solidworks/pycompiler/tests/`) covering IR validation, lowering, and reference resolution against a fake execution port. Behavioral verification of the CAD operations themselves is manual against live SolidWorks, by design.
+**Testing:** four automated suites run fully offline (no SolidWorks needed) and in CI on every push — a **tool contract test** (`adapters/claude/tests/test_schema_contract.py`) that fails on any tool/parameter drift between the adapter (`server.py`) and the execution contract (`tool-schemas.json`); an **IR contract test** (`compiler/solidworks/pycompiler/tests/test_ir_schema_contract.py`) that fails on any vocabulary drift between the IR schema — which doubles as the capability registry — and the validator that enforces it, in both directions; the **compiler suite** (`compiler/solidworks/pycompiler/tests/`) covering IR validation, lowering, and reference resolution against a fake execution port; and a **drawing-reader gate** (`cad-planner/drawing/tests/`) that diffs the draw-dialect vocabulary both ways and re-chains frozen DXF fixtures from raw primitives, validating the IR it emits against the compiler's own validator so the reader cannot invent vocabulary the compiler could not build. Behavioral verification of the CAD operations themselves is manual against live SolidWorks, by design.
 
 Notes:
 - The Python MCP adapter does not hot-reload while running; after editing `server.py`, the MCP server must be reconnected.

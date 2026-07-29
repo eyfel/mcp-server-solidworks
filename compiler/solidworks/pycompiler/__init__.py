@@ -7,7 +7,7 @@ resolves semantic references (top_face / center) against live geometry.
 Architectural rules (see compiler/solidworks/architecture.md + master-architecture.md):
   - Deterministic. NO LLM, NO MCP, NO COM.
   - Reaches the execution layer ONLY through an injected ExecutionPort (plain REST behind it),
-    never by importing the adapter, FastMCP, or httpx. This is what keeps the module separable:
+    never by importing the adapter, the MCP SDK, or httpx. This is what keeps the module separable:
     moving it into a standalone REST service later is a transport swap behind ExecutionPort,
     with the lowering / resolver / validation logic untouched (IR-ADR-003).
 
