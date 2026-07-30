@@ -530,19 +530,8 @@
   },
   "output": "→ see execution-response.json — CadState.ActiveDocument holds the now-active document title"
  },
- "get_recipe": {
-  "description": "[ADAPTER-ONLY — no COM, no REST, no state_version] Serves the IR-generation recipe (cad-planner/recipe-usage.md) to the model section-by-section, plus the two cad-planner contract JSONs (feature-graph.schema.json = the capability registry; analysis-artifact.schema.json). The model calls this BEFORE writing an ir.graph or producing a reconstruction-grade drawing — token cost stays proportional to the task (index → only the needed sections). Read-only file serving from the repo; no SolidWorks interaction.",
-  "input": {
-   "operation_id": "n/a — pure file read, no execution call",
-   "state_version": "n/a — pure file read, no execution call",
-   "params": {
-    "section": "string enum (default 'index' — TOC + version header): 'contract' | 'canonicalization' | 'forward' (intent→IR authoring for submit_feature_graph) | 'mapping' | 'mapping_part' | 'mapping_sheet_metal' | 'mapping_assembly' | 'verification' | 'reverse' (drawing→part reading discipline) | 'coverage' | 'drawing' | 'feature_graph_schema' (IR schema JSON) | 'analysis_artifact_schema' (artifact contract JSON)"
-   }
-  },
-  "output": "The requested recipe section as markdown (or the raw contract JSON for the two schema sections)."
- },
  "save_analysis": {
-  "description": "[ADAPTER-ONLY — Phase A analysis pipeline, ADR-040] NOT a COM/execution tool: it has NO ToolController/SolidWorksService case. The adapter orchestrates EXISTING reads (open_document/activate_document + analyze_model features/mass_properties/geometry), computes the file's sha256, and writes the persistent analysis artifact <folder>/.solidpilot/<filename>.analysis.json per cad-planner/contracts/analysis-artifact.schema.json. Artifacts are a CACHE, never truth: identity.source_hash mismatch against the current file = stale, re-analyze. The ir block is left null (the AI/IR pass fills it later — the model gets the mapping rules from the get_recipe tool). Leaves the part open and active.",
+  "description": "[ADAPTER-ONLY — Phase A analysis pipeline, ADR-040] NOT a COM/execution tool: it has NO ToolController/SolidWorksService case. The adapter orchestrates EXISTING reads (open_document/activate_document + analyze_model features/mass_properties/geometry), computes the file's sha256, and writes the persistent analysis artifact <folder>/.solidpilot/<filename>.analysis.json per cad-planner/contracts/analysis-artifact.schema.json. Artifacts are a CACHE, never truth: identity.source_hash mismatch against the current file = stale, re-analyze. The ir block is left null (the AI/IR pass fills it later — the model gets the mapping rules from the `recipe://usage/*` MCP resources). Leaves the part open and active.",
   "input": {
    "operation_id": "n/a at this level — each underlying read carries its own operation_id (uuid4) on /api/tool/execute",
    "state_version": "n/a at this level — the underlying calls thread the adapter's tracked state_version (one-shot resync-retry on INVALID_STATE_VERSION)",
@@ -565,7 +554,7 @@
   "output": "The compiler's per-node summary string: COMPLETED n/n nodes (+ artifact name, + source_stale flag when the source file changed since analysis) or FAILED with the feature-level error and how far it got (partial geometry may remain — CAD ops are not transactional)."
  },
  "submit_feature_graph": {
-  "description": "ADAPTER-ONLY orchestration (no ToolController/SolidWorksService case) — the FORWARD Feature Graph IR door (re-enabled gate-free 2026-07-16, IR-ADR-017): builds a part or assembly from a CAD-neutral Feature Graph IR in ONE call. The adapter's deterministic pycompiler (compiler/solidworks/pycompiler — the SAME compiler rebuild_from_ir uses; two doors, one compiler, IR-ADR-005) lowers each IR node to ordered calls on the EXISTING low-level tools over /api/tool/execute + /state, and resolves references (geometric anchors, runtime feature names) against live geometry. Vocabulary = cad-planner/contracts/feature-graph.schema.json 0.7.0-draft (the capability registry; served to the model via get_recipe). fresh_document=true opens a new blank document first — the graph's node types decide part vs assembly. Resyncs the adapter's state_version after every run (many state-bumping sub-ops happen outside the normal _call path).",
+  "description": "ADAPTER-ONLY orchestration (no ToolController/SolidWorksService case) — the FORWARD Feature Graph IR door (re-enabled gate-free 2026-07-16, IR-ADR-017): builds a part or assembly from a CAD-neutral Feature Graph IR in ONE call. The adapter's deterministic pycompiler (compiler/solidworks/pycompiler — the SAME compiler rebuild_from_ir uses; two doors, one compiler, IR-ADR-005) lowers each IR node to ordered calls on the EXISTING low-level tools over /api/tool/execute + /state, and resolves references (geometric anchors, runtime feature names) against live geometry. Vocabulary = cad-planner/contracts/feature-graph.schema.json 0.7.0-draft (the capability registry; served to the model as the `schema://feature-graph` MCP resource). fresh_document=true opens a new blank document first — the graph's node types decide part vs assembly. Resyncs the adapter's state_version after every run (many state-bumping sub-ops happen outside the normal _call path).",
   "input": {
    "operation_id": "n/a at this level — each lowered sub-op carries its own operation_id (uuid4) and state_version on /api/tool/execute",
    "state_version": "n/a at this level — the adapter resyncs its local state_version from GET /state after the run",

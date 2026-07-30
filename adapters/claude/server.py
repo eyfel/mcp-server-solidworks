@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 from pydantic import Field
 from mcp.server import MCPServer
+from mcp.server.caching import CacheHint
+from mcp.server.mcpserver.exceptions import ResourceError
 from execution_client import call_tool, get_state, ensure_ready as _ensure_ready, ExecutionLayerError
 from response_mapper import map_response
 # NOTE: pycompiler is reached via `from ir_execution_port import run_feature_graph` imported
@@ -21,14 +23,37 @@ from response_mapper import map_response
 # so valid selectors are never rejected. Editing this file requires reconnecting the
 # `solidworks` MCP server (no hot-reload — KNOWN-LIMITATIONS #4).
 
-# Every tool is registered with `structured_output=False`. All 47 return a `str`, so the
+# Every tool is registered with `structured_output=False`. All 46 return a `str`, so the
 # SDK's structured mirror is `{"result": "<the same string>"}` — the whole payload a second
 # time, for zero added information (measured: exactly 2.00x on both SDKs). Switching it off
-# halves the wire cost of every reader (`get_recipe('feature_graph_schema')` alone: 66 KB
-# -> 33 KB) and drops the per-tool `outputSchema` from the tools/list prompt. Restore it
-# only for a tool that returns real structure, never for a `-> str` one.
+# halves the wire cost of every reader (the 33 KB `schema://feature-graph` read went over at
+# 66 KB before this) and drops the per-tool `outputSchema` from the tools/list prompt. Restore
+# it only for a tool that returns real structure, never for a `-> str` one.
 
-mcp = MCPServer("solidworks-execution-adapter")
+# Cache hints for the resource surface (SEP-2549, protocol 2026-07-28). NOTE: `ttl_ms`/
+# `cache_scope` are set PER METHOD at construction, NOT per resource — the high-level
+# `@mcp.resource` decorator returns str/bytes, so an individual handler cannot carry its own TTL.
+# One value therefore covers every resource. `scope="public"`: the recipe rules and contract
+# schemas are byte-identical for every caller, with nothing authorization-dependent in them.
+# ttl_ms=1h is deliberately shorter than it could be — recipe-usage.md is read FRESH from disk on
+# every read so an edit goes live without a reconnect, and a long TTL would defeat that.
+# MEASURED 2026-07-30, and it settles the matter: the host does NOT honor these hints. A marker
+# appended to recipe-usage.md showed up in `recipe://usage/coverage` immediately, with no
+# reconnect, on a URI already read minutes earlier in the same session — a TTL-honoring client
+# would have served the stale copy. Good news (reads are genuinely fresh), but the caching win is
+# ZERO. And no host setting can change the deeper limit: a cached body STILL enters the model's
+# context on every read, so TTL caching can only save a round-trip, never tokens. The whole
+# measured saving of this migration is the per-turn `tools/list` shrinkage. Hints stay declared —
+# spec-correct, free, and a future host may use them.
+_RECIPE_CACHE = CacheHint(ttl_ms=3_600_000, scope="public")  # 1 h
+mcp = MCPServer(
+    "solidworks-execution-adapter",
+    cache_hints={
+        "resources/read": _RECIPE_CACHE,
+        "resources/list": _RECIPE_CACHE,
+        "resources/templates/list": _RECIPE_CACHE,
+    },
+)
 
 # Tracks state_version in memory. Starts at 0, updated after every response.
 # Auto-resyncs from the execution layer on an INVALID_STATE_VERSION mismatch
@@ -1039,8 +1064,8 @@ def analyze_drawing(file_path: str, save_analysis: bool = True,
 
     (B) `NOT_DIRECT | <reason>` followed by the full analysis JSON — the drawing needs real
         reading. This is the normal path for machined parts. The reason names exactly which
-        decision the drawing left open. Nothing is lost: read the JSON per get_recipe('reverse')
-        and build with submit_feature_graph as before.
+        decision the drawing left open. Nothing is lost: read the JSON per the
+        recipe://usage/reverse resource and build with submit_feature_graph as before.
 
     mode='full'  — always the full analysis JSON, even when it is directly buildable.
     mode='ir'    — the lowered Feature Graph IR, without building. For inspection or saving.
@@ -1049,9 +1074,9 @@ def analyze_drawing(file_path: str, save_analysis: bool = True,
                    part. Re-derives from the same file, so it needs no cached graph — but verify
                    the sha256 in the summary is the file you looked at.
 
-    ⮕ Before reading a `full` payload, call get_recipe('reverse') — it holds the reading discipline
-      (scale, edge classes, projection standard, sheet-metal bend arithmetic) and the
-      self-verification rules that make this small payload sufficient.
+    ⮕ Before reading a `full` payload, read the MCP resource `recipe://usage/reverse` — it holds
+      the reading discipline (scale, edge classes, projection standard, sheet-metal bend
+      arithmetic) and the self-verification rules that make this small payload sufficient.
 
     The full JSON:
       sheet — dxf_version, units, **scale_factor** and the sheet box. `scale_factor` is ALREADY
@@ -1146,8 +1171,8 @@ def analyze_drawing(file_path: str, save_analysis: bool = True,
             return (f"FAILED | NOT_DIRECTLY_BUILDABLE | {verdict['reason']} | {verdict['detail']} — "
                     f"call analyze_drawing(mode='full') and build with submit_feature_graph.")
         return (f"NOT_DIRECT | {verdict['reason']} | {verdict['detail']}\n"
-                f"Read the analysis below per get_recipe('reverse') and build it with "
-                f"submit_feature_graph.\n{full}")
+                f"Read the analysis below per the recipe://usage/reverse resource and build it "
+                f"with submit_feature_graph.\n{full}")
 
     try:
         graph = _draw.lower_flat_pattern(art, cfg, verdict)
@@ -1192,8 +1217,10 @@ def analyze_slddrw_test(include_geometry: bool = False, include_relations: bool 
       this tool and do NOT apply its discipline — the fields below (measures, section, normal_axis,
       relations, extent, center_marks) are COM constructs that DO NOT EXIST in a DXF.
 
-    ⮕ Reconstructing a part from a NATIVE SLDDRW (test/comparison work only)? Call
-      get_recipe('slddrw_testing') FIRST — the FROZEN reverse-reading discipline lives there.
+    ⮕ Reconstructing a part from a NATIVE SLDDRW (test/comparison work only)? The FROZEN
+      reverse-reading discipline is deliberately NOT on the MCP surface (ADR-069) — it is the repo
+      file `cad-planner/slddrw-testing-recipe-usage.md`. Read it from disk when this tool is the
+      job; port a rule out of it into the active recipe only as a conscious decision (ADR-063).
 
     Read-only, does NOT change state. Returns {view_count, dimension_count, views:[{name, type, scale,
     pos, dimensions:[...], section?}]}: each view's name, type (swDrawingViewTypes_e int), scale, sheet
@@ -1560,10 +1587,41 @@ def activate_document(title: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool: get_recipe  (adapter-only — serves the IR-generation rules to the model)
+# RESOURCE surface: the IR-generation recipe + the two cad-planner contract JSONs
+#
+# These were the `get_recipe(section=...)` tool until 2026-07-30 (ADR-069). They are now MCP
+# *resources*: the content is large, near-static, identical for every caller and re-read
+# constantly — exactly what `resources/read` + the 2026-07-28 `ttlMs`/`cacheScope` hints are for.
+# MEASURED reason to move (not estimated): `get_recipe` cost 2,369 chars of `tools/list` on EVERY
+# turn (2.97% of the 47-tool surface; 1,928 of it the docstring), paid whether or not any recipe
+# was read. A resource read costs ~50 chars MORE than the equivalent tool result (the
+# `uri`+`mimeType` wrapper), so the win is entirely the per-turn surface — which is why the tool
+# had to GO, not sit beside the resources.
+#
+# Shape decided with the user (2026-07-30):
+#   - EVERY section is its own STATIC resource. Probe finding: templated URIs are readable but
+#     appear in NO listing (`resources/list` shows static entries only), so a template-only
+#     surface would be undiscoverable. Static-per-section makes ONE `resources/list` the manifest.
+#   - `recipe://usage/{section}` stays as a TEMPLATE ALIAS so a slug guessed from the index
+#     still resolves. Concrete resources win over templates in the SDK's resolution order, so
+#     the static entries above are never shadowed by it.
+#   - Version lives in the BODY only (`Version: 0.21.0`), never in the URI: bumps must not
+#     break the URI pointers embedded in the tool docstrings below.
+#   - The FROZEN `slddrw-testing-recipe-usage.md` pair (ADR-063) is deliberately NOT served —
+#     it stays a repo file; port from it consciously if a rule there is wanted again.
+# The recipe's PRIVATE full edition (`recipe.md`) is NEVER served — it carries lesson history and
+# provenance, is gitignored, and only the PUBLIC `-usage` twin appears on this surface.
 # ---------------------------------------------------------------------------
 _CAD_PLANNER_DIR = os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "cad-planner"))
+
+# The served section slugs, EXPLICIT (this replaces get_recipe's `Literal[...]`). The surface is
+# under the user's control by decision: a new `## slug — title` in recipe-usage.md does NOT
+# publish itself as a resource until it is added here, deliberately.
+_RECIPE_SECTIONS = (
+    "contract", "canonicalization", "forward", "mapping", "mapping_part",
+    "mapping_sheet_metal", "mapping_assembly", "verification", "reverse", "coverage",
+)
 
 
 def _recipe_sections():
@@ -1586,63 +1644,112 @@ def _recipe_sections():
     return header, {k: (t, "\n".join(body).strip()) for k, (t, body) in sections.items()}
 
 
-@mcp.tool(structured_output=False)
-def get_recipe(
-    section: Literal["index", "contract", "canonicalization", "forward", "mapping",
-                     "mapping_part", "mapping_sheet_metal", "mapping_assembly", "verification",
-                     "reverse", "coverage", "feature_graph_schema",
-                     "analysis_artifact_schema", "slddrw_testing"] = "index",
-) -> str:
-    """The IR-generation recipe — REQUIRED READING before writing any Feature Graph IR
-    (an artifact's `ir.graph`), reconstructing a part from a drawing, or producing a drawing
-    meant for reconstruction. Serves the rules section-by-section so token cost stays
-    proportional to the task.
+def _recipe_section_text(section: str) -> str:
+    """One section, rendered with its own `## slug — title` header restored.
 
-    Call order for the ARTIFACT→IR flow: 'contract' + 'canonicalization' + 'mapping' first,
-    then the vocabulary section matching the document ('mapping_part' / 'mapping_sheet_metal' /
-    'mapping_assembly'), then 'verification' before labeling anything. 'forward' holds the
-    INTENT→IR authoring discipline (grammar cheat-sheet, anchor design without an original,
-    computed-expectation self-verification) — read it FIRST when writing a graph for
-    submit_feature_graph from design intent. 'reverse' holds the DXF/DWG drawing→part
-    reconstruction discipline (scale/DIMLFAC, edge classes, view clustering, projection
-    standard, sheet-metal bend arithmetic) — read it FIRST when rebuilding a part from a 2D
-    drawing.
-
-    section='index' (default): the version header + a one-line table of contents.
-    section='slddrw_testing': the FROZEN SLDDRW-era rules, served whole — PART 1 the drawing→part
-        reading discipline, PART 2 the model→drawing generation rules. TEST/REFERENCE ONLY: it
-        pairs with analyze_slddrw_test, and both parts are built on COM constructs / reader
-        assumptions that a DXF breaks. Do NOT apply it to a DXF/DWG job — the DXF reverse path is
-        the main line and is being rebuilt from scratch; copy from the frozen edition only
-        deliberately.
-    section='feature_graph_schema': the Feature Graph IR schema / capability registry JSON —
-        the node types and params the compiler accepts (what is NOT in it cannot be built).
-    section='analysis_artifact_schema': the persistent analysis-artifact contract JSON
-        (identity/hash, recipe, parameters, ir block + the formal 'verified' definition).
-    Read-only; does NOT touch SolidWorks or state_version."""
-    if section == "feature_graph_schema":
-        with open(os.path.join(_CAD_PLANNER_DIR, "contracts", "feature-graph.schema.json"),
-                  "r", encoding="utf-8-sig") as fh:
-            return fh.read()
-    if section == "analysis_artifact_schema":
-        with open(os.path.join(_CAD_PLANNER_DIR, "contracts", "analysis-artifact.schema.json"),
-                  "r", encoding="utf-8-sig") as fh:
-            return fh.read()
-    if section == "slddrw_testing":
-        # A separate FROZEN file, not a section of recipe-usage.md — served whole (2026-07-27).
-        with open(os.path.join(_CAD_PLANNER_DIR, "slddrw-testing-recipe-usage.md"),
-                  "r", encoding="utf-8-sig") as fh:
-            return fh.read()
-    header, sections = _recipe_sections()
-    if section == "index":
-        toc = "\n".join(f"- {slug} — {title}" for slug, (title, _b) in sections.items())
-        return (f"{header.strip()}\n\nSections (pass as `section`):\n{toc}\n"
-                "- feature_graph_schema — the IR schema / capability registry (JSON)\n"
-                "- analysis_artifact_schema — the analysis-artifact contract (JSON)\n"
-                "- slddrw_testing — FROZEN SLDDRW-era reverse discipline (TEST/REFERENCE ONLY;\n"
-                "  pairs with analyze_slddrw_test — do NOT apply it to a DXF/DWG job)")
+    Read FRESH from disk on every call (via _recipe_sections), so editing recipe-usage.md goes
+    live with no reconnect — only the registration metadata below is snapshotted at import."""
+    _header, sections = _recipe_sections()
+    if section not in sections:
+        # MUST be ResourceError: the SDK re-raises ResourceError/MCPError verbatim but replaces any
+        # other exception's message with a generic "Error creating resource from template <uri>"
+        # (templates.py). Verified live — a plain ValueError left the caller with no idea what the
+        # valid slugs were, and a model that guesses (e.g. 'drawing', which was in the retired
+        # get_recipe enum but is not a section) needs the list to self-correct in one step.
+        raise ResourceError(
+            f"'{section}' is not a served recipe section. Served: "
+            f"{', '.join(_RECIPE_SECTIONS)}. Read recipe://usage/index for the full surface.")
     title, body = sections[section]
     return f"## {section} — {title}\n\n{body}"
+
+
+def _contract_json(filename: str) -> str:
+    with open(os.path.join(_CAD_PLANNER_DIR, "contracts", filename),
+              "r", encoding="utf-8-sig") as fh:
+        return fh.read()
+
+
+@mcp.resource("recipe://usage/index", name="recipe_index", mime_type="text/markdown",
+              description="START HERE for IR work: the recipe version header + every section URI. "
+                          "Rules for turning an analysis artifact or a 2D drawing into a Feature "
+                          "Graph IR.")
+def _recipe_index() -> str:
+    """The table of contents, generated from the file so it can never drift from what is served."""
+    header, sections = _recipe_sections()
+    lines = []
+    for slug in _RECIPE_SECTIONS:
+        title = (sections.get(slug) or ("(missing from recipe-usage.md)",))[0]
+        lines.append(f"- recipe://usage/{slug} — {title}")
+    return (
+        f"{header.strip()}\n\n"
+        f"Sections (read by URI):\n" + "\n".join(lines) + "\n\n"
+        "Contracts:\n"
+        "- schema://feature-graph — the IR schema / capability registry (JSON). What is NOT in\n"
+        "  it cannot be built; it doubles as the capability list.\n"
+        "- schema://analysis-artifact — the persistent analysis-artifact contract (JSON):\n"
+        "  identity/hash, recipe, parameter table, ir block + the formal 'verified' definition.\n\n"
+        "Reading order — ARTIFACT→IR: contract + canonicalization + mapping, then the vocabulary\n"
+        "section matching the document (mapping_part / mapping_sheet_metal / mapping_assembly),\n"
+        "then verification BEFORE labeling anything. INTENT→IR (no original part): forward.\n"
+        "DXF/DWG DRAWING→PART: reverse."
+    )
+
+
+def _register_recipe_sections() -> None:
+    """Register one STATIC resource per served section.
+
+    Static (not template-only) because a templated URI appears in NO listing — `resources/list`
+    carries concrete resources only — so this is what makes the rule set DISCOVERABLE: one
+    `resources/list` call returns every section with its title as the description.
+
+    Titles are snapshotted at import for the descriptions (the listing metadata is fixed at
+    registration time); the BODIES stay fresh per read. A missing/unreadable recipe-usage.md
+    degrades to a generic description instead of killing the MCP server at startup — the same
+    stance as the lazily-imported compiler.
+    """
+    try:
+        _header, sections = _recipe_sections()
+    except OSError:
+        sections = {}
+    for slug in _RECIPE_SECTIONS:
+        title = (sections.get(slug) or ("",))[0]
+        reader = (lambda s: lambda: _recipe_section_text(s))(slug)
+        reader.__name__ = f"_recipe_{slug}"
+        mcp.resource(
+            f"recipe://usage/{slug}",
+            name=f"recipe_{slug}",
+            mime_type="text/markdown",
+            description=(f"IR recipe — {title}" if title
+                         else f"IR recipe section '{slug}' (see recipe://usage/index)"),
+        )(reader)
+
+
+_register_recipe_sections()
+
+
+@mcp.resource("recipe://usage/{section}", name="recipe_section", mime_type="text/markdown",
+              description="Alias: any recipe-usage.md section by slug. The per-section URIs above "
+                          "are the discoverable form; this only catches a slug read off the index.")
+def _recipe_section_alias(section: str) -> str:
+    return _recipe_section_text(section)
+
+
+@mcp.resource("schema://feature-graph", name="feature_graph_schema",
+              mime_type="application/json",
+              description="The CAD-neutral Feature Graph IR schema AND capability registry — the "
+                          "node types and params the deterministic compiler accepts. What is not "
+                          "in it cannot be built. Read before authoring any ir.graph.")
+def _feature_graph_schema() -> str:
+    return _contract_json("feature-graph.schema.json")
+
+
+@mcp.resource("schema://analysis-artifact", name="analysis_artifact_schema",
+              mime_type="application/json",
+              description="The persistent per-file analysis-artifact contract "
+                          "(.solidpilot/*.analysis.json): identity/hash, recipe, lifted parameter "
+                          "table, ir block + the formal 'verified' definition.")
+def _analysis_artifact_schema() -> str:
+    return _contract_json("analysis-artifact.schema.json")
 
 
 # ---------------------------------------------------------------------------
@@ -1728,8 +1835,8 @@ def save_analysis(file_path: str) -> str:
 
     The artifact is a CACHE of the file's state at analysis time: consumers must compare
     identity.source_hash against the current file and re-analyze on a mismatch. The `ir` block
-    is left null here — the AI/IR pass fills it later: BEFORE writing an ir.graph, call
-    get_recipe (start with section='index') for the mapping rules. The part is left OPEN and
+    is left null here — the AI/IR pass fills it later: BEFORE writing an ir.graph, read the MCP
+    resource `recipe://usage/index` for the mapping rules. The part is left OPEN and
     ACTIVE for follow-up work.
 
     file_path: absolute path of the .SLDPRT part OR .SLDASM assembly to analyze (drawing
@@ -1923,7 +2030,7 @@ def rebuild_from_ir(artifact_path: str, fresh_document: bool = True) -> str:
     Returns the compiler's per-node summary (COMPLETED n/n, or the feature-level error and how
     far it got — partial geometry may remain; CAD ops are not transactional). Afterwards, verify
     with compare_parts and only then label the artifact's ir.verification. If you are GENERATING
-    the ir.graph yourself, call get_recipe first (start with section='index') — it holds the
+    the ir.graph yourself, read the MCP resource `recipe://usage/index` first — it indexes the
     mapping/canonicalization rules the compiler expects."""
     global _state_version
     path = os.path.abspath(artifact_path)
@@ -2305,11 +2412,11 @@ def submit_feature_graph(graph: str, fresh_document: bool = True) -> str:
     LARGEST coherent batches (fresh_document=True for the first, append with fresh_document=False),
     never one node at a time.
 
-    graph: the Feature Graph as a JSON STRING. Authoring from DESIGN INTENT: read
-        get_recipe('forward') FIRST (grammar, anchor design, self-verification), plus
-        get_recipe(section='feature_graph_schema') — the schema IS the capability registry.
-        Replaying an ANALYZED part instead: get_recipe('canonicalization') + 'mapping_part'
-        ('mapping_sheet_metal' for sheet metal, 'mapping_assembly' for assemblies).
+    graph: the Feature Graph as a JSON STRING. Authoring from DESIGN INTENT: read the MCP resource
+        `recipe://usage/forward` FIRST (grammar, anchor design, self-verification), plus
+        `schema://feature-graph` — the schema IS the capability registry.
+        Replaying an ANALYZED part instead: `recipe://usage/canonicalization` +
+        `recipe://usage/mapping_part` (…/mapping_sheet_metal, …/mapping_assembly).
         Essentials: units METERS, angles RADIANS (the compiler converts at tool boundaries);
         nodes build in array order (tree order is law); extrude/revolve/rib/sweep/sheet_metal/
         sketched_bend consume the IMMEDIATELY preceding sketch node; loft profiles, a sweep's

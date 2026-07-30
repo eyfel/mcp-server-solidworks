@@ -4,7 +4,7 @@
   "version": "0.3.0-draft",
   "status": "DRAFT — the compact 2D description a technical drawing (DXF/DWG) is read into. Shipped with the DXF-first reverse path (ADR-062) and grown with contour chaining + the direct-buildable gate (ADR-064).",
   "produced_by": "cad-planner/drawing/dxf_read.py (its ANALYSIS_VERSION is this artifact's `analysis_version`)",
-  "consumed_by": "cad-planner/drawing/{contour,pairing,lowering}.py, the `analyze_drawing` MCP tool, and the model itself (get_recipe('reverse') tells it how to read this)",
+  "consumed_by": "cad-planner/drawing/{contour,pairing,lowering}.py, the `analyze_drawing` MCP tool, and the model itself (the `recipe://usage/reverse` MCP resource tells it how to read this)",
   "role": "The reverse path's evidence layer. It reports deterministic FACTS ONLY — no feature classification, no 3D inference, no confidence scores. Interpretation belongs to the recipe, and everything that CANNOT be interpreted deterministically is reported as a gap rather than guessed.",
   "size_is_a_contract": "Payload cost is first-class. Loops reference the view's own primitive arrays by INDEX rather than repeating geometry, exact duplicates are dropped at emit time, and the direct-buildable path hands the model a ~10-line summary instead of a contour it would have to echo back."
  },

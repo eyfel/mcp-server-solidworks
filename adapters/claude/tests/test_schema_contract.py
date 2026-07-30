@@ -10,6 +10,15 @@ per tool. (The contract stores prose-valued params, not machine types, so deeper
 type/enum checks would be brittle; those live in server.py's Literal/Field
 constraints, exercised by the live smoke test.)
 
+SECOND CHECK (2026-07-30, ADR-069): the RESOURCE surface. The recipe moved from the
+`get_recipe` tool to `recipe://usage/*` + `schema://*` resources, and the only thing telling
+the model those URIs exist is prose inside other tools' docstrings. So a renamed URI whose
+docstring pointer is not updated does not fail loudly — the model just silently stops finding
+the rules. `find_resource_drift` closes exactly that hole: every URI mentioned anywhere in
+server.py must resolve, every declared section must be registered AND present in
+recipe-usage.md. Resources have no `tool-schemas.json` counterpart (that file's every top-level
+key is a tool), so the declared surface is `server._RECIPE_SECTIONS` itself.
+
 Runnable two ways:
   - standalone:  python tests/test_schema_contract.py   (exits non-zero on drift)
   - pytest:      pytest tests/test_schema_contract.py
@@ -17,6 +26,7 @@ Runnable two ways:
 import asyncio
 import json
 import os
+import re
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -76,19 +86,70 @@ def find_drift():
     return errors
 
 
+def find_resource_drift():
+    """Return drift messages for the RESOURCE surface (empty == in sync)."""
+    errors = []
+    static = {str(r.uri) for r in asyncio.run(server.mcp.list_resources())}
+    templates = [t.uri_template for t in asyncio.run(server.mcp.list_resource_templates())]
+    _header, sections = server._recipe_sections()
+
+    # 1. Every declared section is registered AND actually exists in recipe-usage.md.
+    for slug in server._RECIPE_SECTIONS:
+        if f"recipe://usage/{slug}" not in static:
+            errors.append(f"section '{slug}' is in _RECIPE_SECTIONS but not registered as a resource")
+        if slug not in sections:
+            errors.append(f"section '{slug}' is served but has no '## {slug} — ...' header in "
+                          f"recipe-usage.md")
+
+    # 2. A section present in the file but not served — deliberate (the surface is
+    #    user-controlled), so report it as INFO-level drift only if it is never mentioned.
+    unserved = sorted(set(sections) - set(server._RECIPE_SECTIONS))
+    if unserved:
+        errors.append(f"recipe-usage.md has section(s) {unserved} that are NOT served — add them "
+                      f"to _RECIPE_SECTIONS deliberately, or drop the header")
+
+    # 3. THE IMPORTANT ONE: every recipe://|schema:// URI mentioned anywhere in server.py must
+    #    resolve, or the docstring pointers silently stop finding the rules.
+    with open(os.path.join(_ADAPTER_DIR, "server.py"), encoding="utf-8") as fh:
+        source = fh.read()
+    mentioned = set(re.findall(r"(?:recipe|schema)://[A-Za-z0-9_./{}-]+", source))
+    prefixes = [t.split("{")[0] for t in templates if "{" in t]
+    for uri in sorted(mentioned):
+        if uri in static:
+            continue
+        # A braced URI is either the template's own registration or an f-string placeholder
+        # (`f"recipe://usage/{slug}"`); both are satisfied by a template with the same literal
+        # prefix, while a typo'd scheme/path still fails.
+        base = uri.split("{")[0] if "{" in uri else uri.rstrip("/")
+        if not any(p and base.startswith(p.rstrip("/")) for p in prefixes):
+            errors.append(f"URI '{uri}' is mentioned in server.py but resolves to no resource "
+                          f"or template")
+    return errors
+
+
 def test_schema_contract_in_sync():
     """pytest entry point."""
     errors = find_drift()
     assert not errors, "MCP/contract drift detected:\n  - " + "\n  - ".join(errors)
 
 
+def test_resource_surface_in_sync():
+    """pytest entry point for the resource surface."""
+    errors = find_resource_drift()
+    assert not errors, "MCP resource drift detected:\n  - " + "\n  - ".join(errors)
+
+
 if __name__ == "__main__":
-    errs = find_drift()
+    errs = find_drift() + find_resource_drift()
     if errs:
         print("CONTRACT DRIFT DETECTED:")
         for e in errs:
             print("  -", e)
         sys.exit(1)
     counts = _adapter_tools()
-    print(f"OK - {len(counts)} tools in sync (server.py <-> tool-schemas.json)")
+    n_res = len(asyncio.run(server.mcp.list_resources()))
+    n_tmpl = len(asyncio.run(server.mcp.list_resource_templates()))
+    print(f"OK - {len(counts)} tools in sync (server.py <-> tool-schemas.json); "
+          f"{n_res} resources + {n_tmpl} template in sync (URIs resolve, sections match "
+          f"recipe-usage.md)")
     sys.exit(0)

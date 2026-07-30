@@ -79,7 +79,7 @@ python server.py
 2. Add its lowering rule and any required reference resolution in `compiler/solidworks`.
 3. It reuses existing low-level tools; usually no new execution tool is needed.
 
-> **The two IR doors:** `rebuild_from_ir` is the **reverse** door (rebuilds a part/assembly from its analysis artifact's IR block — the round-trip that verifies an LLM-proposed IR). `submit_feature_graph` is the **forward** door (builds from a Feature Graph the model supplies directly, from design intent, with no original to copy); it is **live and gate-free**. Both doors run through the same `pycompiler` — **never fork the compiler**. Note the different failure surface: the reverse door can warn `source_stale` because it has an artifact hash to check, whereas the forward door takes a raw graph and has nothing to compare against — so a forward run must self-verify by computing its expected outcome (see `get_recipe('forward')`).
+> **The two IR doors:** `rebuild_from_ir` is the **reverse** door (rebuilds a part/assembly from its analysis artifact's IR block — the round-trip that verifies an LLM-proposed IR). `submit_feature_graph` is the **forward** door (builds from a Feature Graph the model supplies directly, from design intent, with no original to copy); it is **live and gate-free**. Both doors run through the same `pycompiler` — **never fork the compiler**. Note the different failure surface: the reverse door can warn `source_stale` because it has an artifact hash to check, whereas the forward door takes a raw graph and has nothing to compare against — so a forward run must self-verify by computing its expected outcome (see the `recipe://usage/forward` resource).
 
 ---
 
@@ -96,7 +96,7 @@ python server.py
 
 ## Testing
 
-- **Contract test:** catches any tool or parameter drift between `server.py` and `tool-schemas.json`.
+- **Contract test:** catches any tool or parameter drift between `server.py` and `tool-schemas.json`, **and guards the MCP resource surface**: every `recipe://` / `schema://` URI mentioned anywhere in `server.py` must resolve to a registered resource or template, every served recipe section must exist in `recipe-usage.md`, and a section present in the file but NOT served fails too (so the surface cannot grow by accident either). That second half matters because the recipe is reached by URI now — a renamed URI whose docstring pointer was not updated would otherwise fail *silently*, with the model simply never finding the rules.
 
   ```
   cd adapters/claude

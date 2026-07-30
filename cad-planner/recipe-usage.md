@@ -1,9 +1,10 @@
 # recipe-usage.md — The IR Generation Recipe (usage edition)
 
-**Version: 0.21.0** · Owner: cad-planner · Served to the model section-by-section via the
-`get_recipe` MCP tool. This is the operational rule set for turning an analysis artifact's
-recipe into a Feature Graph IR (and for producing reconstructable drawings). Sections are
-addressed by the slug in each `##` header.
+**Version: 0.22.0** · Owner: cad-planner · Served to the model section-by-section as MCP
+**resources** — one static `recipe://usage/<slug>` per section, indexed by
+`recipe://usage/index` (ADR-069, 2026-07-30; previously the `get_recipe` tool). This is the
+operational rule set for turning an analysis artifact's recipe into a Feature Graph IR (and for
+producing reconstructable drawings). Sections are addressed by the slug in each `##` header.
 
 Any IR block written into an artifact MUST record which `recipe_version` produced it
 (`ir.generator.recipe_version` in `analysis-artifact.schema.json`).
@@ -14,7 +15,7 @@ Any IR block written into an artifact MUST record which `recipe_version` produce
   geometry counts, parameters table). Optionally live `analyze_model` reads when a detail
   (e.g. an exact sketch profile via `analysis_type='sketch'`) is missing from the artifact.
 - **Output:** a Feature Graph IR conforming to `feature-graph.schema.json`
-  (see `get_recipe('feature_graph_schema')`), written into the artifact's `ir.graph` — plus an
+  (see the `schema://feature-graph` resource), written into the artifact's `ir.graph` — plus an
   honest `ir.verification` block (see the `verification` section). Never write a graph without
   a verification status.
 - **Never** emit raw tool sequences; the IR is the only output. Lowering belongs to the
@@ -52,7 +53,7 @@ Read this FIRST when writing a Feature Graph from DESIGN INTENT (the forward doo
 an ORIGINAL part whose reader output you copy verbatim (C7 readback); forward authoring has no
 original — these rules replace the readback discipline there. C1–C5 still apply.
 
-- **Vocabulary + grammar come from the schema** (`get_recipe('feature_graph_schema')` — the
+- **Vocabulary + grammar come from the schema** (the `schema://feature-graph` resource — the
   capability registry; what is not in it cannot be built). Grammar essentials: `extrude` /
   `revolve` / `rib` / `sweep` / `sheet_metal` / `sketched_bend` consume the ACTIVE sketch —
   each must IMMEDIATELY follow its (profile) sketch node. `loft` profiles, a sweep's `path`,
@@ -100,7 +101,7 @@ original — these rules replace the readback discipline there. C1–C5 still ap
 
 1. Walk `recipe.features` in order; classify each against the CURRENT covered vocabulary —
    **the schema IS the registry**: read the node types from `feature-graph.schema.json`
-   (`get_recipe('feature_graph_schema')`). Part vocabulary (0.7.1-draft): `box`,
+   (the `schema://feature-graph` resource). Part vocabulary (0.7.2-draft): `box`,
    `sketch`+`extrude` boss/cut (ends blind / through_all / up_to_surface / mid_plane),
    `hole`-on-face, `fillet`, `chamfer`, `revolve`, `sweep`, `rib`, `loft`, `linear_pattern`,
    `circular_pattern`, `mirror`, `sheet_metal`, `sketched_bend`, `edge_flange` (custom-profile
@@ -290,8 +291,10 @@ Per PART (never per batch):
    rebuilds, variants, or pattern matching.**
 
 Reverse (drawing → part) reconstruction has been SPLIT OUT (2026-07-27): the SLDDRW-based
-discipline is FROZEN as the SLDDRW TEST edition — `get_recipe('slddrw_testing')`. The DXF/DWG
-reverse path is the main line and is being rebuilt; do not apply the frozen rules to a DXF job.
+discipline is FROZEN as the SLDDRW TEST edition, the repo file
+`cad-planner/slddrw-testing-recipe-usage.md` — deliberately NOT served on the MCP surface
+(ADR-069). The DXF/DWG reverse path is the main line and is being rebuilt; do not apply the
+frozen rules to a DXF job.
 
 ## reverse — Drawing (DXF/DWG) → part reconstruction
 
@@ -372,6 +375,32 @@ for R13 instead of recomputing.
 drawn with VISIBLE lines in the front view ⇒ it is cut into the face the front view shows. Placing it on
 the opposite face produced identical topology, volume AND area — the error surfaced only as a CG shift
 and a flipped face normal. Depth-axis placement is the highest-risk decision on this path.
+
+**R6b — Knowing which view shows which face is only HALF the decision: bind it to the IR's own BUILD
+DIRECTION, explicitly, before the first extrude node.** The IR extrudes toward the datum's POSITIVE
+normal by default (Front→+Z, Top→+Y, Right→+X). A boss on `front` therefore grows toward the direction
+the front view is looked at FROM — so with the default the sketch plane is the part's **BACK** face, not
+its front, and every depth you then take from the drawing's front datum lands mirrored. State the
+binding in one sentence and then hold to it:
+
+- *"the drawing's FRONT face is my sketch plane"* ⇒ set **`reversed: true`** on the base extrude, after
+  which every subsequent depth is measured from that plane with the drawing's own sign. This is usually
+  the cheaper choice, because it is the datum the drawing dimensions from.
+- *"my sketch plane is the BACK face"* ⇒ leave the default and SUBTRACT every drawing depth from the
+  part's thickness.
+
+Either is legal. Leaving it IMPLICIT is what produced f-2's mirrored first build — and it passed
+topology, volume AND area (R14 is why: none of the three can see a reflection). Two riders:
+
+- **A BASE FLANGE's default runs the OTHER WAY.** `sheet_metal` thickens to the sketch plane's
+  **−normal** side unless `reverse_thickness` (`symmetric_thickness` splits ±t/2). So the same binding
+  question has the opposite default from `extrude` — do not carry one habit into the other. A wrong side
+  also puts every downstream bend-sketch plane off the sheet, so it fails later and less clearly.
+- `mid_plane` is symmetric by construction and immune; `reversed` is ignored there.
+
+Verify it, do not trust it: after the base feature, read one face or edge back
+(`analyze_model(faces|edges, near=…)`) and check that the coordinate matches the dimension that fixed
+it. That single readback is the whole guard (R14).
 
 **R7 — A section view is read along its cut line's axis.** The `cut_line` primitives name where the
 section was taken; the section view's horizontal axis is then the depth axis. Decide which SIDE of the
