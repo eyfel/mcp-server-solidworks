@@ -293,11 +293,11 @@
   "output": "→ see execution-response.json"
  },
  "ensure_ready": {
-  "description": "Lifecycle/bootstrap — NOT a state-versioned CAD op. Served on its own POST /ensure_ready route (not /api/tool/execute), so it carries no operation_id/state_version. Ensures the execution server is running and SolidWorks is attached, launching SolidWorks via COM if it is closed. Does NOT open or create any document. Does NOT increment state_version.",
+  "description": "Lifecycle/bootstrap — NOT a state-versioned CAD op. Served on its own POST /ensure_ready route (not /api/tool/execute), so it carries no operation_id/state_version. Ensures the execution server is running and SolidWorks is attached, launching SolidWorks via COM ONLY when no SLDWORKS process exists at all. Does NOT open or create any document. Does NOT increment state_version. SINGLE-INSTANCE DISCIPLINE (2026-07-30, KNOWN-LIMITATIONS #14): a failed COM attach does not mean SolidWorks is absent — a running instance can be missing from the Running Object Table (still starting up, or at a different integrity level because one side is elevated). When a process exists but the attach fails, this retries the attach for 30s and then FAILS with a diagnostic naming the PIDs and the likely cause, rather than launching a duplicate.",
   "input": {
    "params": {}
   },
-  "output": "{ status, comAttached, swLaunched, activeDocument, swVersion, stateVersion } (or comAttached=false + launchError/ensureError on failure)"
+  "output": "{ status, comAttached, swLaunched, activeDocument, swVersion, stateVersion } (or comAttached=false + launchError/ensureError on failure; ensureError also carries solidworksProcessCount when the attach failed while a process was running)"
  },
  "export_document": {
   "description": "Exports the active SolidWorks document to a file without closing it. DWG/DXF require an active drawing document. PDF uses SolidWorks PDF export options. state_version is NOT incremented (no CAD state change).",

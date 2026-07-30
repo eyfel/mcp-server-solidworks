@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 using Newtonsoft.Json.Linq;
 using SolidWorks.Interop.sldworks;
@@ -62,6 +64,46 @@ namespace SolidworksExecution.Services
             return Connect();
         }
 
+        // The PIDs of every running SolidWorks, regardless of whether COM can see them. This is the
+        // check that makes single-instance discipline possible: the ROT and the process list disagree
+        // exactly in the cases that used to spawn a duplicate (KNOWN-LIMITATIONS #14).
+        private static List<int> SolidWorksProcesses()
+        {
+            try
+            {
+                return Process.GetProcessesByName("SLDWORKS").Select(p => p.Id).ToList();
+            }
+            catch
+            {
+                return new List<int>(); // never let a diagnostic break the lifecycle path
+            }
+        }
+
+        // Poll for a FRESH ROT attach until `timeout`. Used both after launching (the app needs time
+        // before it is usable) and instead of launching when a process already exists but has not
+        // registered yet. Gates on a real call, not mere registration, because that is what the next
+        // tool call will do. Sets `_solidWorks` on success so the caller can read doc/version off it.
+        private bool RetryAttach(TimeSpan timeout)
+        {
+            var deadline = DateTime.UtcNow + timeout;
+            while (true)
+            {
+                try
+                {
+                    var probe = (ISldWorks)Marshal.GetActiveObject("SldWorks.Application");
+                    probe.RevisionNumber(); // confirms responsive, not just registered
+                    _solidWorks = probe;
+                    EnsureVisible();
+                    return true;
+                }
+                catch
+                {
+                    if (DateTime.UtcNow >= deadline) return false;
+                    System.Threading.Thread.Sleep(1000); // still spinning up / COM server busy
+                }
+            }
+        }
+
         // Health probe (P0.6): attempts a fresh COM attach and reports whether SolidWorks is reachable
         // plus the active document title. Must run on the STA thread (it touches COM via Connect()).
         // Returns a dictionary so no new compiled type is needed (old-style csproj).
@@ -79,6 +121,18 @@ namespace SolidworksExecution.Services
                 }
                 catch { /* attached but couldn't read the active doc — leave it unset */ }
             }
+            // Duplicate/hidden-instance diagnostic (KNOWN-LIMITATIONS #14). A count > 1 is the
+            // condition under which automation can drive an instance the user is not watching, and a
+            // count > 0 while comAttached is false is the ROT-vs-process disagreement that used to
+            // spawn another. windowless>0 names the specific bad case: an instance with no window.
+            try
+            {
+                var procs = Process.GetProcessesByName("SLDWORKS");
+                result["solidworksProcessCount"] = procs.Length;
+                result["solidworksPids"] = procs.Select(p => p.Id).ToArray();
+                result["solidworksWindowless"] = procs.Count(p => p.MainWindowHandle == IntPtr.Zero);
+            }
+            catch { /* diagnostic only — never fail /health over it */ }
             return result;
         }
 
@@ -96,43 +150,62 @@ namespace SolidworksExecution.Services
 
             if (!attached)
             {
-                // SolidWorks is not running — start it out-of-process via COM and make it visible.
-                try
+                // SINGLE-INSTANCE DISCIPLINE (KNOWN-LIMITATIONS #14, 2026-07-30). A failed attach does
+                // NOT mean SolidWorks is absent: Marshal.GetActiveObject only sees the COM Running
+                // Object Table, and a RUNNING instance can be missing from our view of it — it is still
+                // starting up and has not registered yet, or it runs at a different integrity level
+                // (started elevated while this server is not, or vice versa), or it is wedged in a modal
+                // dialog. Launching in those cases produced a SECOND SLDWORKS.exe, which is what the
+                // user actually sees. So: only CreateInstance when NO SolidWorks process exists at all.
+                var running = SolidWorksProcesses();
+                if (running.Count > 0)
                 {
-                    var progType = Type.GetTypeFromProgID("SldWorks.Application");
-                    if (progType == null)
-                        throw new Exception("SldWorks.Application ProgID is not registered. Is SolidWorks installed?");
-
-                    _solidWorks = (ISldWorks)Activator.CreateInstance(progType);
-                    EnsureVisible(); // visible + user-controllable from the moment it launches
-                    launched = true;
-
-                    // CreateInstance returns before the app is usable. Gate on a FRESH ROT attach
-                    // (Marshal.GetActiveObject) succeeding + a responsive call — that's what the next
-                    // tool call will do. Wait up to 90s (adapter ENSURE_TIMEOUT is 120s).
-                    var deadline = DateTime.UtcNow.AddSeconds(90);
-                    while (DateTime.UtcNow < deadline)
-                    {
-                        try
-                        {
-                            var probe = (ISldWorks)Marshal.GetActiveObject("SldWorks.Application");
-                            var rev = probe.RevisionNumber(); // confirms responsive, not just registered
-                            attached = true;
-                            break;
-                        }
-                        catch
-                        {
-                            System.Threading.Thread.Sleep(1000); // app still spinning up / COM server busy
-                        }
-                    }
+                    // One (or more) IS running but the ROT attach failed. Retry the attach — the common
+                    // benign case is an instance mid-startup — and NEVER launch another.
+                    attached = RetryAttach(TimeSpan.FromSeconds(30));
                     IsConnected = attached;
+                    if (!attached)
+                    {
+                        result["comAttached"] = false;
+                        result["swLaunched"] = false;
+                        result["solidworksProcessCount"] = running.Count;
+                        result["ensureError"] =
+                            "SolidWorks IS running (PID " + string.Join(", ", running.Select(p => p.ToString()).ToArray()) +
+                            ") but COM attach via the Running Object Table failed after 30s. A second instance was " +
+                            "deliberately NOT launched (KNOWN-LIMITATIONS #14). Most likely causes, in order: " +
+                            "(1) SolidWorks is elevated/'Run as administrator' while this execution server is not " +
+                            "(or the reverse) — the ROT is not shared across integrity levels, so run both the same way; " +
+                            "(2) SolidWorks is still loading, or is blocked on a modal dialog / license prompt — clear it and retry; " +
+                            "(3) the instance never registered in the ROT. Check: Get-Process SLDWORKS | Select Id, MainWindowHandle, MainWindowTitle";
+                        return result;
+                    }
                 }
-                catch (Exception ex)
+                else
                 {
-                    result["comAttached"] = false;
-                    result["swLaunched"] = false;
-                    result["launchError"] = ex.Message;
-                    return result;
+                    // Genuinely nothing running — start it out-of-process via COM and make it visible.
+                    try
+                    {
+                        var progType = Type.GetTypeFromProgID("SldWorks.Application");
+                        if (progType == null)
+                            throw new Exception("SldWorks.Application ProgID is not registered. Is SolidWorks installed?");
+
+                        _solidWorks = (ISldWorks)Activator.CreateInstance(progType);
+                        EnsureVisible(); // visible + user-controllable from the moment it launches
+                        launched = true;
+
+                        // CreateInstance returns before the app is usable. Gate on a FRESH ROT attach
+                        // (Marshal.GetActiveObject) succeeding + a responsive call — that's what the next
+                        // tool call will do. Wait up to 90s (adapter ENSURE_TIMEOUT is 120s).
+                        attached = RetryAttach(TimeSpan.FromSeconds(90));
+                        IsConnected = attached;
+                    }
+                    catch (Exception ex)
+                    {
+                        result["comAttached"] = false;
+                        result["swLaunched"] = false;
+                        result["launchError"] = ex.Message;
+                        return result;
+                    }
                 }
             }
 
