@@ -32,6 +32,7 @@ env/
 *.log
 
 dxf-research/
+test/
 
 Thumbs.db
 .DS_Store
