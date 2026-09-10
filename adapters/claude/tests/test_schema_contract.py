@@ -127,10 +127,43 @@ def find_resource_drift():
     return errors
 
 
+def find_drawing_api_drift():
+    """Every `_draw.<name>` server.py calls must actually be exported by the drawing package.
+
+    The same silent-failure class as the resource URIs (ADR-069): the adapter reaches into
+    `cad-planner/drawing` through a package `__all__`, and a helper added to a MODULE but not
+    re-exported from `__init__.py` still imports fine, still passes every offline gate, and then
+    fails only on a live MCP call with `module 'drawing' has no attribute ...`. That is exactly
+    how `view_records` shipped broken (2026-09-03) -- caught by a live call, not by a gate, and it
+    cost the user a reconnect. Cheap to check, so check it.
+    """
+    errors = []
+    with open(server.__file__, encoding="utf-8") as fh:
+        src = fh.read()
+    used = set(re.findall(r"_draw\.([A-Za-z_][A-Za-z0-9_]*)", src))
+    if server._draw is None:
+        return ["the drawing package did not import — cannot verify the _draw API surface"]
+    exported = set(getattr(server._draw, "__all__", []))
+    for name in sorted(used):
+        if not hasattr(server._draw, name):
+            errors.append(f"server.py calls _draw.{name}, which the drawing package does not "
+                          f"provide at all")
+        elif exported and name not in exported:
+            errors.append(f"server.py calls _draw.{name}, which resolves but is NOT in the "
+                          f"drawing package's __all__ — add it to cad-planner/drawing/__init__.py")
+    return errors
+
+
 def test_schema_contract_in_sync():
     """pytest entry point."""
     errors = find_drift()
     assert not errors, "MCP/contract drift detected:\n  - " + "\n  - ".join(errors)
+
+
+def test_drawing_api_in_sync():
+    """pytest entry point for the adapter -> drawing-package call surface."""
+    errors = find_drawing_api_drift()
+    assert not errors, "drawing API drift detected:\n  - " + "\n  - ".join(errors)
 
 
 def test_resource_surface_in_sync():
@@ -140,7 +173,7 @@ def test_resource_surface_in_sync():
 
 
 if __name__ == "__main__":
-    errs = find_drift() + find_resource_drift()
+    errs = find_drift() + find_resource_drift() + find_drawing_api_drift()
     if errs:
         print("CONTRACT DRIFT DETECTED:")
         for e in errs:

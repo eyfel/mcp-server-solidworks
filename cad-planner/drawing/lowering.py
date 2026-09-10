@@ -21,10 +21,11 @@ from __future__ import annotations
 import math
 
 try:
-    from . import contour
+    from . import contour, curvefit
     from .vocab import GATE_REASONS
 except ImportError:
     import contour
+    import curvefit
     from vocab import GATE_REASONS
 
 _MM = 1000.0                    # the `draw` dialect is TRUE mm; the IR is meters
@@ -47,8 +48,10 @@ def _seg_points(view, item):
         p = g["lines"][idx]
     elif code == "a":
         p = g["arcs"][idx]
+    elif code == "e" and "t1" in g["ellipses"][idx]:
+        p = g["ellipses"][idx]                    # an ellipse ARC chains like an arc
     else:
-        return None
+        return None                               # a circle / full ellipse has no endpoints
     a, b = (p["x1"], p["y1"]), (p["x2"], p["y2"])
     return (b, a) if d < 0 else (a, b)
 
@@ -61,6 +64,9 @@ def _loop_polygon(view, loop):
         r = c["d"] / 2.0
         return [(c["cx"] + r, c["cy"]), (c["cx"], c["cy"] + r),
                 (c["cx"] - r, c["cy"]), (c["cx"], c["cy"] - r)]
+    if loop["seq"] and loop["seq"][0][0] == "e" and _seg_points(view, loop["seq"][0]) is None:
+        el = curvefit.record_ellipse(view["geometry"]["ellipses"][loop["seq"][0][1]])
+        return [curvefit.point_at(el, t) for t in (0.0, 90.0, 180.0, 270.0)]
     return [_seg_points(view, it)[0] for it in loop["seq"] if _seg_points(view, it)]
 
 
@@ -113,7 +119,14 @@ def assess(art, cfg):
     # --- G2: the blank contour. This one is HARD -- it is the foundation everything else sits on.
     if any(p["c"] == "cut_line" for p in fv["geometry"]["lines"]):
         return _fail("cut_line_in_flat_view", "view %s carries a section cut line" % vid)
-    outers = [lp for lp in fv["loops"] if lp["role"] == "outer" and lp["class"] == "visible"]
+    # TIER A ONLY on the direct-build path. A Tier B boundary is DETERMINED, not guessed, so this
+    # is not a doubt about its correctness -- it is about who checks it. Direct-build is the one
+    # route that turns a drawing into a solid with no human reading it, so it stays on the
+    # mechanism that has been exercised on every sample since ADR-064. Tier B reaches the model
+    # through the analysis, where the recipe makes it read the `tier` flag and corroborate.
+    # Revisit once Tier B has round-tripped a part (phase 2).
+    outers = [lp for lp in fv["loops"]
+              if lp["role"] == "outer" and lp["class"] == "visible" and lp.get("tier") != "B"]
     if not outers:
         return _fail("no_outer_loop", "view %s: the outline did not close into a single loop "
                                       "(%d loops, %d open chains)"
@@ -122,9 +135,12 @@ def assess(art, cfg):
         return _fail("multiple_outer_loops", "view %s: %d candidate blanks" % (vid, len(outers)))
     outer = outers[0]
     cutouts = [lp for lp in fv["loops"] if lp["parent"] == outer["id"]]
-    if len(fv["loops"]) != 1 + len(cutouts):
+    # Count Tier A only here too: a Tier B boundary this path deliberately ignored must not then
+    # be reported back as an unaccounted-for STRAY loop.
+    tier_a = [lp for lp in fv["loops"] if lp.get("tier") != "B"]
+    if len(tier_a) != 1 + len(cutouts):
         return _fail("stray_loop", "view %s: %d loops, but only the blank + %d cutouts are accounted for"
-                     % (vid, len(fv["loops"]), len(cutouts)))
+                     % (vid, len(tier_a), len(cutouts)))
 
     # --- G3: bends. An unmatched note is SKIPPED and reported; none matching is systematic.
     paired = [b for b in bends if b.get("bend_line")]
@@ -253,7 +269,8 @@ def lower_flat_pattern(art, cfg, assessment=None):
         raise ValueError("not directly buildable: %s (%s)" % (a["reason"], a["detail"]))
     s = a["summary"]
     fv = {v["vid"]: v for v in art["views"]}[s["flat_view"]]
-    outer = [lp for lp in fv["loops"] if lp["role"] == "outer" and lp["class"] == "visible"][0]
+    outer = [lp for lp in fv["loops"]                     # Tier A only -- same rule as the gate
+             if lp["role"] == "outer" and lp["class"] == "visible" and lp.get("tier") != "B"][0]
     cutouts = [lp for lp in fv["loops"] if lp["parent"] == outer["id"]]
 
     ox = (outer["bbox"][0] + outer["bbox"][2]) / 2.0
@@ -332,6 +349,28 @@ def _loop_profile(view, loop, to_m):
             x1, y1 = to_m(*a)
             x2, y2 = to_m(*b)
             out.append({"kind": "line", "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+        elif code == "e":
+            p = g["ellipses"][idx]
+            el = curvefit.record_ellipse(p)
+            if "t1" not in p:
+                # a FULL ellipse maps 1:1 onto the IR's `ellipse` (centre + a point on each axis)
+                cx, cy = to_m(p["cx"], p["cy"])
+                mx, my = to_m(*curvefit.point_at(el, 0.0))
+                nx, ny = to_m(*curvefit.point_at(el, 90.0))
+                out.append({"kind": "ellipse", "cx": cx, "cy": cy,
+                            "x1": mx, "y1": my, "x2": nx, "y2": ny})
+            else:
+                # The IR has NO partial-ellipse primitive (KNOWN-LIMITATIONS): transcribe the arc
+                # as a SPLINE through points sampled at the drawing's own resolution (its source
+                # segment count) -- visually equivalent, never bit-exact, exactly the IR's own
+                # spline caveat. Ends are the record's exact vertices, so the contour still closes.
+                pts = curvefit.sample_arc(p)
+                if d < 0:
+                    pts.reverse()
+                flat = []
+                for x, y in pts:
+                    flat += list(to_m(x, y))
+                out.append({"kind": "spline", "points": flat})
         else:
             p = g["arcs"][idx]
             a, b = ((p["x1"], p["y1"]), (p["x2"], p["y2"]))

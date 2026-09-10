@@ -1,14 +1,13 @@
 {
  "_meta": {
   "name": "draw-dialect",
-  "version": "0.3.0-draft",
-  "status": "DRAFT — the compact 2D description a technical drawing (DXF/DWG) is read into. Shipped with the DXF-first reverse path (ADR-062) and grown with contour chaining + the direct-buildable gate (ADR-064).",
-  "produced_by": "cad-planner/drawing/dxf_read.py (its ANALYSIS_VERSION is this artifact's `analysis_version`)",
-  "consumed_by": "cad-planner/drawing/{contour,pairing,lowering}.py, the `analyze_drawing` MCP tool, and the model itself (the `recipe://usage/reverse` MCP resource tells it how to read this)",
-  "role": "The reverse path's evidence layer. It reports deterministic FACTS ONLY — no feature classification, no 3D inference, no confidence scores. Interpretation belongs to the recipe, and everything that CANNOT be interpreted deterministically is reported as a gap rather than guessed.",
-  "size_is_a_contract": "Payload cost is first-class. Loops reference the view's own primitive arrays by INDEX rather than repeating geometry, exact duplicates are dropped at emit time, and the direct-buildable path hands the model a ~10-line summary instead of a contour it would have to echo back."
+  "version": "0.7.0-draft",
+  "status": "DRAFT — the compact 2D description a technical drawing (DXF/DWG) is read into. Shipped with the DXF-first reverse path (ADR-062), grown with contour chaining + the direct-buildable gate (ADR-064), the proven frame + graded alignment + the solved view graph (ADR-071/072), then PARAMETRIC ellipses + block text + `not_read` + the first-turn SUMMARY / per-view PULL (ADR-073), then TIER B phase 1 -- a closed visible subdivision's outer boundary walked by planar face traversal and tagged `tier` (ADR-076). Then the WIRE FORM (payload phase 1, 2026-09-07): `lines` grouped by edge class with each row carrying its own index, single-segment open chains collapsed into `open_singles`, and the summary/pull split RETIRED because one format measured smaller than summary-plus-pulls on all 10 samples.",
+  "produced_by": "cad-planner/drawing/dxf_read.py (its ANALYSIS_VERSION is this artifact's `analysis_version`); curvefit.py fits the ellipses; wire.py encodes the form on the way out and decodes it on the way back in",
+  "consumed_by": "cad-planner/drawing/{contour,pairing,lowering,viewgraph}.py (all of which see the DECODED record form), the `analyze_drawing` MCP tool, and the model itself (get_recipe('reverse') tells it how to read this)",
+  "role": "The reverse path's evidence layer. It reports deterministic FACTS ONLY — no feature classification, no 3D inference, no confidence scores. Interpretation belongs to the recipe, and everything that CANNOT be interpreted deterministically is reported as a gap rather than guessed. A FIT is a measurement under this rule: the fitter proposes, the residual decides, and the residual is published (`fit`).",
+  "size_is_a_contract": "Payload cost is first-class. Loops reference the view's own primitive arrays by INDEX rather than repeating geometry, exact duplicates are dropped at emit time, coordinates carry 3 decimals (1 µm), an exploded curve fan is collapsed to ONE parametric ellipse (f-3: 236 segments -> 9 records), the direct-buildable path hands the model a ~10-line summary instead of a contour it would have to echo back, and the whole artifact crosses in the WIRE FORM (class-grouped index-carrying lines + `open_singles`, serialized without JSON whitespace) -- measured -30% across the 10 samples, -38% on f-3. Every one of these is LOSSLESS: the reader never summarises in the lossy sense, and `wire.decode` reproduces its input exactly."
  },
-
  "artifact": {
   "analysis_version": "string — dxf_read.ANALYSIS_VERSION. A new version writes a new artifact file; the same version overwrites in place.",
   "source": "{ file, sha256, bytes, converted_from? } — `converted_from` names the .DWG when SolidWorks produced the DXF. The hash is what lets a later build re-derive from the SAME input without a cache.",
@@ -17,45 +16,51 @@
    "dxf_version": "string",
    "units": "$INSUNITS or null",
    "scale_factor": "number — DIMLFAC. TRUE value = paper value x this. ALREADY APPLIED to every dimension, view size and geometry coordinate in this artifact; it is reported so the model can see the sheet was 1:2, never so it can multiply again.",
-   "paper_box": "[x0, y0, x1, y1] — the sheet frame, in PAPER mm",
-   "audit_errors": "integer — ezdxf recover-mode findings"
+   "paper_box": "[x0, y0, x1, y1] — the sheet frame in PAPER mm; on a frameless sheet, the bbox of everything drawn",
+   "audit_errors": "integer — ezdxf recover-mode findings",
+   "not_read": "{ <ENTITY_TYPE>: count, INSERT?: { <block family>: count } } — every entity class the reader SAW and did NOT emit, so nothing vanishes silently: HATCH / SOLID (fills), OLE2FRAME (an embedded logo), and under INSERT the blocks carrying GEOMETRY (SW_CENTERMARKSYMBOL crosses, SW_HATCH lines, a WALZRICHTUNG rolling-direction symbol — furniture, never part edges). Block TEXT is read (see `notes`), so a text-only block (SW_NOTE) is not listed. The paper-space VIEWPORT is not counted. Empty {} = everything on the sheet was consumed."
   },
-  "frame": "{ paper_box, title_block_top, primitives{lines,arcs,circles}, circles[], note_count } — the border/title-block cluster, which is NOT emitted as a view. Reported so it cannot vanish silently: it had been swallowing the projection-method symbol's concentric circles. `title_block_top` is the topmost full-width horizontal rule in the sheet's lower half (null when none) — the line that separates drawing area from administrative band.",
+  "frame": "{ paper_box, title_block_top, primitives{lines,arcs,circles}, circles[], note_count } — the border/title-block cluster, which is NOT emitted as a view. A candidate is accepted ONLY when it contains every other cluster (a border encloses the drawing by construction); `paper_box: null` = NO frame on this sheet — the biggest cluster failed that proof and was emitted as a view instead (f-3's borderless sheet, whose FRONT VIEW the unproven heuristic had swallowed whole). Reported so it cannot vanish silently: it had been swallowing the projection-method symbol's concentric circles. `title_block_top` is the topmost full-width horizontal rule in the sheet's lower half (null when none) — the line that separates drawing area from administrative band.",
   "views": "array of view objects (see `view`)",
-  "alignment": "array of { a, b, shares: 'x'|'y' } — two views sharing a paper-axis span are a projection pair. Compared on `geom_box`, and only between views of role 'view'. Convention-independent; only the SIGN needs config.projection.",
-  "dimensions": "array of { value, kind, defpts, view?, measures?, text? } — `value` is TRUE (scaled). `measures` links a radius/diameter dim to the primitive it measures ('v0:c1').",
+  "alignment": "array of { a, b, shares: 'x'|'y'|null, grade } — projection-pair evidence, graded (see covered.alignment_grades). 'span': the two views share one paper-axis span edge-for-edge (compared on `geom_box`, role 'view' only) — the strongest evidence. 'mid': that axis's midpoints coincide and the views are disjoint along the other axis — weaker (silhouette ends may genuinely differ, s-7's bevelled beam; and on a bend-note sheet a mid pair may relate two STATES of the part — s-2's bent view beside its flat — drafting layout, not projection), still a measurement. 'label': a section caption ('SECTION A-A', 'A-A 1 : 1') ties view `b` (the section) to view `a` (the one carrying the cut line) — shares is null because a label asserts the RELATION, not an axis (it survives a cross-scale section); read the axis per R7. Facts stack: one pair may appear as both span and label. Convention-independent; only the SIGN needs config.projection.",
+  "view_graph": "OMITTED when no span/mid pair exists — and on a flat-pattern sheet (bend notes present): those belong to the direct-build gate, and a bent-state companion view is another STATE of the part, not another projection. { solved, views: {vid: [h_axis, v_axis]} } — each sheet-scale view's two paper axes assigned to the part's three axes by the pair constraints, with unpaired-extent merges applied only where no class is contested (independent forced merges all apply; a contested one is a cube and refuses). TOPOLOGY ONLY, on purpose: the axis extents live in each view's own `size` (as-drawn, R19/geom_box caveats included) and are not re-published here. Axes are ANONYMOUS (ax0/ax1/ax2, descending extent): which is width/depth and which view is 'front' stays with config.projection's sign and the model (R4). solved:false carries reason 'inconsistent' (a pair chain folds one view's h onto its v) | 'axes_ambiguous' (a merge is contested) | 'axes_unmerged' (more than three axes remain — e.g. an unfolded view stacked among ortho views, s-6/s-7).",
+  "dimensions": "array of { value, kind, defpts, view?, measures?, printed?, printed_mismatch?, kind_from?, text? } — `value` is TRUE (scaled). `measures` links a radius/diameter dim to the primitive it measures ('v0:c1'). `printed` is what the drawing PRINTS, read out of the dimension's own block, with AutoCAD's %% control codes DECODED (%%c→Ø, %%d→°, %%p→±) — the symbol is evidence, so it is decoded rather than stripped; `text` beside it is the RAW code-1 override, undecoded ('8x <>', '%%c<>'). For RADIUS/DIAMETER the printed value simply WINS (the DWG→DXF route destroys those defpoints). An ANGULAR dim is RECONCILED instead, because that route loses the dimension's SIDE and the damage lands on EITHER candidate — usually the stored measurement (180+θ), but on f-3 the rendered block text (it prints 250° for a real 110° = 360−110). Across all 7 angular dims in the sample set exactly one candidate is ≤180° and it is the true one every time — a mechanical drawing does not dimension a reflex angle — so the ≤180° candidate is taken, and where BOTH exceed 180° the reader refuses to choose, keeps printed and leaves `printed_mismatch` set as an explicit judgement flag. For linear the computed value stays and a disagreement beyond rounding is flagged `printed_mismatch`. `kind_from: 'printed'` marks a kind the PRINTED SYMBOL overruled the entity on: 4 of the 10 sample drawings dimension a hole with a plain LINEAR dimension across the circle and hand-type the diameter symbol in front (dimtype base 0 + an override opening '%%c'), so the entity says linear while the drawing says Ø60 — such a dim is emitted as `diameter`. The relabel is VALUE-NEUTRAL (a length measured across a circle already IS the diameter): only `kind` moves, and the value keeps the linear path. CAUTION on `measures` with concentric arcs: a radial dim's first defpoint is the arc CENTRE, and where two arcs share that centre the centre alone cannot say which is meant — s-6 has r=8 and r=12 concentric, and picking by iteration order gave R24 for a dim printing R16. The printed value decides; a surviving disagreement shows up as `printed_mismatch`.",
   "bend_notes": "array of bend objects (see `bend_note`)",
-  "notes": "array of { text, at, view? } — free text OUTSIDE the title block (e.g. a bare '2 mm' thickness note, section labels)",
-  "frame_notes": "array of { text, at } — every text INSIDE the title block / sheet margin, in reading order (top row first, then left to right). Emitted, never dropped: on a bare CAD template this is furniture, but on a real industrial title block it is the parameter table — length, width, thickness, material, scale, projection standard, description and weight all live here, and on a break view the title-block length is the ONLY source there is. A title block is a TABLE: pair a label with the value in the row below it at the same x. A field whose value is IDENTICAL across different parts is template boilerplate, not part data.",
+  "notes": "array of { text, at, view? } — free text OUTSIDE the title block (e.g. a bare '2 mm' thickness note, section labels). Since 0.5.0 this includes text INSIDE note blocks (INSERTs such as SW_NOTE / BIEGETEILE, nested to any depth), one entry per ROW: s-6's 'Abwicklung / developed view' labels its flat-pattern view and 'Biegelinie / bending line' its bend line, s-7's manufacturing notes ('Gebogene Blechabmaße sind einzuhalten') — all invisible to a top-level walk before. The DWG route splits a row into per-glyph fragments; they are re-joined left to right, so a fragment boundary may occasionally lose or gain a space.",
+  "frame_notes": "array of { text, at } — every text INSIDE the title block / sheet margin, in reading order (top row first, then left to right), block rows included. Emitted, never dropped: on a bare CAD template this is furniture, but on a real industrial title block it is the parameter table — length, width, thickness, material, scale, projection standard, description and weight all live here, and on a break view the title-block length is the ONLY source there is. A title block is a TABLE: pair a label with the value in the row below it at the same x. A field whose value is IDENTICAL across different parts is template boilerplate, not part data.",
   "user_description": "string or null — filled in BY HAND when the author described the part. Research pool only; the build flow never reads it."
  },
-
  "view": {
   "vid": "string — 'v0', 'v1', … stable within one artifact",
   "role": "one of covered.view_roles — 'annotation' = drafting furniture (a section arrow head); 'frame_item' = a cluster lying wholly inside the title-block band that no dimension points at (a projection-method symbol, a weld symbol, the oval around a check dimension). Marked, never deleted: deleting by size would take a 2 mm thickness view with it, and a dimension pointing at a cluster always makes it a view.",
   "paper_box": "[x0, y0, x1, y1] in PAPER mm — the CLUSTER box, and the origin of this view's local coordinates (the space bend notes' `at` is converted against). It over-reports the view on purpose-free grounds: centre lines overhang, and an arc joins its cluster by its whole CIRCLE box. Use geom_box to measure.",
-  "geom_box": "[x0, y0, x1, y1] in PAPER mm — the box of the VISIBLE geometry alone, each arc contributing its true extent. The visible silhouette bounds an orthographic view by definition (hidden geometry is obscured, therefore inside it), so this is what `size` and the projection-pair test are built on.",
+  "geom_box": "[x0, y0, x1, y1] in PAPER mm — the box of the VISIBLE geometry alone, each arc contributing its true extent. The visible silhouette bounds an orthographic view by definition (hidden geometry is obscured, therefore inside it), so this is what `size` and the projection-pair test are built on. KNOWN GAP: on a borderless sheet the section-arrow apparatus clusters INTO the view carrying the cut line and inflates its measured box (f-3's 100x40 front view reads 124x49.6 — the true silhouette is what the dimensions say, R18); the apparatus is symmetric about the cut line, so the 'mid' alignment grade survives the inflation.",
   "size": "[w, h] in TRUE mm — from geom_box, i.e. the size of the part AS DRAWN in this view. On a break view that is the shortened body, not the part (see the reverse recipe).",
   "dropped_duplicates": "integer (omitted when 0) — exact-duplicate primitives removed at emit time. The SolidWorks DWG→DXF route is lossless but ADDITIVE: it re-emits a section view's boundary geometry. Duplicates make every shared endpoint look like a degree-4 junction, which stops the chainer dead.",
   "geometry": {
-   "lines": "array of { x1, y1, x2, y2, c } — view-local TRUE mm, origin at the view box's lower-left",
+   "lines": "object { class: [[index, x1, y1, x2, y2], …] } — view-local TRUE mm, 3 decimals (1 µm), origin at the view box's lower-left, grouped by EDGE CLASS (the key is one of covered.edge_classes, so a line never repeats it). THE FIRST NUMBER IS THE INDEX a `seq` entry refers to, written in rather than implied by position: grouping moves what a position means, and recomputing a global index from group lengths is exactly the kind of off-by-one that builds VALID geometry with no error anywhere (R14/R17). To find ['l', 12, 1], look for the row starting with 12, in whichever class group. Indices are contiguous across all groups. (Wire form since reader 0.7.0; the record form { x1, y1, x2, y2, c } is what the reader works in internally and what `wire.decode` restores.)",
    "arcs": "array of { cx, cy, r, a1, a2, x1, y1, x2, y2, dir, c } — a1/a2 are DEGREES (a DXF ARC always runs CCW from a1 to a2, hence dir=1); x1..y2 are the resolved endpoints, so an arc maps 1:1 onto the IR's `arc` profile primitive with no trigonometry",
-   "circles": "array of { cx, cy, d, c } — d is the DIAMETER"
+   "circles": "array of { cx, cy, d, c } — d is the DIAMETER",
+   "ellipses": "array (OMITTED when empty) of { cx, cy, rx, ry, rot, c } for a FULL ellipse, plus { t1, t2, x1, y1, x2, y2, dir: 1 } for an ellipse ARC — rx ≥ ry, rx lies along `rot` (degrees, [0,180)), t1/t2 are PARAMETRIC degrees CCW from the rx axis (an arc always runs CCW from t1 to t2, like a DXF arc), x1..y2 its end vertices. Two provenances, told apart by the presence of `n` + `fit`: WITHOUT them the record is a real DXF ELLIPSE entity (the one curve the exporter keeps parametric); WITH them it was RECOVERED from an exploded fan of `n` LINE segments by curvefit.py — the fitter proposes a closed-form least-squares ellipse and the RESIDUAL decides: the run is replaced only when every vertex AND every chord midpoint lies within config.curve_fit.fit_eps_paper_mm × the view scale of the curve (`fit` = that max deviation, mm). The midpoint test keeps a polygon a polygon (a hexagon's vertices sit on a circle, its chords do not); `min_segments` (8) keeps a 4-chord run from fitting the wrong ellipse inside the sag. A refused run stays raw LINEs — the lossless fallback. On the end vertices: they are the run's OWN (so chaining still meets the neighbours exactly); point_at(t1) reproduces them within `fit`. READ IT AS EVIDENCE: a circle on a plane tilted by θ projects with ry/rx = cos θ and rx = its true radius (f-3: rx 5.000 / ry 4.699 → a Ø10 hole on a 20° face; the side view shows the same hole as rx 5 / ry 1.710 = sin 20°)."
   },
   "loops": "array of loop objects (see `loop`) — the CLOSED contours found by chaining",
-  "open_chains": "array of { id, class, seq } — maximal chains that did NOT close. An open chain is a segment belonging to no contour: a bend line, a centre line, or (in an ortho view) a silhouette fragment stopped by a T-junction."
+  "open_chains": "array of { id, class, seq } — maximal chains that did NOT close, MULTI-SEGMENT ones only since reader 0.7.0. An open chain is a segment belonging to no contour: a bend line, a centre line, or (in an ortho view) a silhouette fragment stopped by a T-junction.",
+  "open_singles": "array (OMITTED when empty) of [position, code, index] — the SINGLE-segment open chains, which were 302 of the sample set's 372 and spent ~55 bytes each to say 'this one primitive belongs to no contour'. Nothing is lost: `position` is the chain's place in the full list and therefore its id ('O<position>'), `class` is the primitive's own `c`, and the direction is 1. A chain collapses ONLY when all three are provably recoverable — any that is not stays a full record in `open_chains`. Read the two arrays together: a primitive named here is as unattributed as one in `open_chains`, and R15's ledger owes it the same account."
  },
-
  "loop": {
   "id": "string — 'L0', 'L1', … ordered by descending area",
   "class": "one of covered.edge_classes — chaining is per class; a loop never mixes classes",
   "role": "one of covered.loop_roles — `outer` = contained by no other loop; `inner` = contained. By point-in-polygon containment, which is measurement, not interpretation.",
   "parent": "loop id or null — the SMALLEST loop containing this one, so an island inside a hole is representable",
+  "tier": "one of covered.chain_tiers, and PRESENT ONLY WHEN 'B' — its absence means 'A', so the common case costs nothing. 'A' = strict chaining: the walk stops dead at any junction of three or more and therefore never guesses (R17). 'B' = planar face traversal, attempted ONLY on a view whose VISIBLE graph has no free end. That condition matters: with no dangling edge the figure is a closed planar subdivision, and its faces are then DEFINED by the angular order of the edges at each vertex — walking it is a reading, not a guess, which is why it does not violate R17. It runs only where Tier A returned no visible OUTER loop, so it can never duplicate or contradict a Tier A answer; the boundary it returns is the face whose signed area is negative with the largest magnitude (bounded faces come out of the walk with one orientation, the unbounded one with the other), measured with arc bulges exactly like any other loop. Ordering at a junction uses the TANGENT, not the chord — an arc whose chord bearing differs from its tangent would otherwise order wrongly and hand back a wrong contour silently. Reaches 7 of the 28 sample views, each one a view where Tier A had found nothing at all (f-3's SECTION A-A among them).",
   "area": "number — mm^2, ABSOLUTE, with each arc's circular-segment bulge included exactly (verified: f-1's 100x60 outline with an R10 corner and a 4 mm chamfer = 5970.5398 = 6000 − 21.4602 − 8.0)",
   "bbox": "[x0, y0, x1, y1] in view-local TRUE mm",
-  "seq": "array of [code, index, dir] — code is one of covered.seq_codes, index points into the matching `geometry` array, dir is +1 when the primitive is traversed from its stored start to its stored end and -1 when reversed. Consecutive entries share an endpoint exactly; that is what closes the contour on rebuild."
+  "seq": "array of [code, index, dir] — code is one of covered.seq_codes ('l' lines, 'a' arcs, 'c' circles, 'e' ellipses), index points into the matching `geometry` array, dir is +1 when the primitive is traversed from its stored start to its stored end and -1 when reversed. Consecutive entries share an endpoint exactly; that is what closes the contour on rebuild. A FULL ellipse, like a circle, is a loop of one entry ([['e', i, 1]]); an ellipse ARC chains like an arc and its bulge is in `area` exactly (measured on the parametric sweep)."
  },
-
+ "answer_shape": {
+  "_role": "analyze_drawing answers in ONE of two shapes and the READER chooses, never the caller. DIRECT_BUILDABLE = a short plain-text summary of a flat pattern already lowered to IR (blank, thickness + its source, each bend with its edge-class corroboration, anything SKIPPED, the expected volume) -- deliberately WITHOUT the contour, which would cost the tokens twice. NOT_DIRECT | <reason> = the WHOLE artifact below the verdict line.",
+  "one_format": "There is no summary/pull split any more (retired 2026-09-07 on its own measurement). It used to be a first-turn SUMMARY with each view's geometry pulled back by `view='v0'`; once the wire form landed, the complete artifact came out SMALLER on all 10 samples than a summary plus the pulls it made necessary (f-3: 14.0 KB against 28.7). `mode='full'` and `view=` are gone with it; `mode` is auto | ir | build."
+ },
  "bend_note": {
   "dir": "one of covered.bend_directions",
   "angle_deg": "number — DEGREES, as annotated",
@@ -66,7 +71,6 @@
   "bend_line": "{ seg: [code, index], class, note_offset, in_loop } — present when the note matched exactly one line. `in_loop` true means the match landed on a line that IS part of a closed contour, which a bend line never should be: suspicious, kept for observation.",
   "unpaired": "{ reason: one of covered.unpaired_reasons, candidates: [[code, index], …] } — present INSTEAD of bend_line. Never a guess: repairing a wrong bend costs a delete plus a full re-create (no sketch-entity move/delete tool exists), and a wrong fold is invisible to volume, area and topology alike."
  },
-
  "direct_build": {
   "_role": "Not part of the artifact — the verdict `lowering.assess` returns for it, and the reason the tool has two result shapes at all. The reader decides; the model is never asked to choose before it has seen any geometry.",
   "direct": "boolean",
@@ -74,16 +78,52 @@
   "summary": "{ flat_view, blank{size,outer_segments,area_mm2,cutouts}, thickness{value_mm,source}, bends[], skipped_bends[], k_factor, expected{volume_m3}, fixed_point_mm } — what the model judges the build on. The contour itself stays out of it.",
   "scope_v1": "Sheet-metal FLAT PATTERNS. A plain plate is excluded on purpose (thickness source and which view carries the profile are interpretive). Failing the gate costs nothing: the caller falls back to the full analysis, which is the pre-existing behaviour."
  },
-
  "covered": {
   "_note": "CONTRACT: every ARRAY here is machine-diffed against the matching frozenset in cad-planner/drawing/*.py by tests/test_draw_contract.py — both directions, exact set equality. Adding a token on one side alone FAILS the gate. Everything else in this file is prose and is deliberately NOT checked (mirrors feature-graph.schema.json's own contract/prose split).",
-  "edge_classes": ["visible", "hidden", "cut_line", "center"],
-  "view_roles": ["view", "annotation", "frame_item"],
-  "loop_roles": ["outer", "inner"],
-  "seq_codes": ["l", "a", "c"],
-  "primitive_kinds": ["lines", "arcs", "circles"],
-  "bend_directions": ["UP", "DOWN"],
-  "unpaired_reasons": ["no_candidate", "ambiguous"],
+  "edge_classes": [
+   "visible",
+   "hidden",
+   "cut_line",
+   "center"
+  ],
+  "view_roles": [
+   "view",
+   "annotation",
+   "frame_item"
+  ],
+  "alignment_grades": [
+   "span",
+   "mid",
+   "label"
+  ],
+  "loop_roles": [
+   "outer",
+   "inner"
+  ],
+  "chain_tiers": [
+   "A",
+   "B"
+  ],
+  "seq_codes": [
+   "l",
+   "a",
+   "c",
+   "e"
+  ],
+  "primitive_kinds": [
+   "lines",
+   "arcs",
+   "circles",
+   "ellipses"
+  ],
+  "bend_directions": [
+   "UP",
+   "DOWN"
+  ],
+  "unpaired_reasons": [
+   "no_candidate",
+   "ambiguous"
+  ],
   "gate_reasons": [
    "no_bend_notes",
    "bend_notes_split",
@@ -98,10 +138,11 @@
    "fixed_point_ambiguous"
   ]
  },
-
  "known_limits": {
   "chaining": "Tier A only — strict degree-2 endpoint chaining. Solves flat patterns completely; leaves ORTHO views partly chained, because a feature silhouette ending mid-edge on the outline is a T-junction (degree 3) and the chainer refuses to guess there. Tier B (planar arrangement: split at interior touch points, then walk faces by leftmost turn) is a separate job — ADR-064.",
   "bend_note_rotation": "The note-above-the-line rule is generalised through the note's own rotation, but only rotation 0 has been observed. See logs.md KNOWN RISKS.",
-  "hatch": "HATCH entities are dropped (they are not part geometry). Verified they are real HATCH entities in the samples, not exploded line fans."
+  "not_read": "HATCH / SOLID / OLE2FRAME entities and the GEOMETRY inside blocks are dropped (none is part geometry in any sample: fills, a logo, centre-mark crosses, hatch drawn as lines, a rolling-direction symbol) — counted in sheet.not_read, never silently. If a real drawing ever puts part edges inside a block, that count is the signal.",
+  "curve_fit": "Only ELLIPSES are recovered from exploded fans (every fan in the 10 samples was one: a circle on a tilted plane, or a cylinder's foot on a face). A run that is neither an ellipse nor short stays RAW — there is no decimated free-curve tier yet, deliberately: no sample has produced such a run, and code with no fixture is not written here. Short runs (< min_segments) stay raw too: the parameters of a 4-chord fit are not a measurement.",
+  "partial_ellipse_ir": "The IR has a full `ellipse` profile primitive but NO partial-ellipse arc. The direct-build lowering transcribes an ellipse ARC as a `spline` through points sampled at the drawing's own resolution (its `n`); a model building by hand faces the same choice (recipe R2b)."
  }
 }

@@ -342,38 +342,30 @@ def add_sketch_entity(
     entity_type='line':       uses x1,y1 (start) and x2,y2 (end).
     entity_type='arc':        uses x1,y1 (start), x2,y2 (end), xm,ym (mid-arc point) — a 3-point arc.
     entity_type='arc_center': uses cx,cy (exact center), x1,y1 (start), x2,y2 (end) and optional
-                              direction. Prefer this over 'arc' when the exact center/radius are
-                              known (e.g. straight from analyze_model): it guarantees the radius
-                              and is numerically stable for shallow/near-collinear arcs where the
-                              3-point circle-fit is unreliable.
+                              direction. PREFER this over 'arc' whenever the exact centre/radius are
+                              known: it guarantees the radius, and the 3-point fit is unreliable on
+                              shallow or near-collinear arcs.
     entity_type='ellipse':    uses cx,cy (center), x1,y1 (a point on the MAJOR axis), x2,y2 (a point
-                              on the MINOR axis). Mirrors analyze_model's ellipse segment exactly.
+                              on the MINOR axis).
     entity_type='spline':     uses points — a JSON array STRING of flat through-points
-                              '[x1,y1,x2,y2,...]' (>= 2 points). Mirrors analyze_model's spline segment
-                              (its 'points'). Round-trips its through-points exactly.
+                              '[x1,y1,x2,y2,...]' (>= 2 points), round-tripped exactly.
     entity_type='fillet':     uses vx,vy (vertex to round) and radius.
     entity_type='chamfer':    uses vx,vy (vertex to cut) and distance.
-    direction: only for 'arc_center' — sweep sense from start to end. OMIT IT (or pass 0) to get
-               the MINOR (<=180°) arc automatically — what a corner round/fillet arc virtually
-               always means; a wrong explicit sign silently draws the >180° complement. Pass +1
-               (CCW) or -1 (CW) ONLY when you deliberately need a specific/major sweep (round-trip
-               replays pass analyze's 'dir' verbatim). Ignored by other types.
-    points: only for 'spline' — a JSON array string of flat (x,y) through-points, e.g.
-            '[-0.2,0.0,-0.18,0.04,-0.14,0.05]'. Ignored by other types.
-    construction: True makes the created entity CONSTRUCTION/reference geometry (centerline,
-            symmetry axis, hole-position scaffolding) — it guides the profile but adds no edge.
-            Mirrors analyze_model's per-segment 'construction' flag, so an analyzed sketch's
-            construction entities can be reproduced faithfully.
-    This tool MIRRORS analyze_model: every sketch segment analyze_model emits (line, arc/circle,
-    ellipse, spline, with cx/cy/x1/y1/x2/y2/radius/points/construction, partial arcs also 'dir'
-    +1 CCW / -1 CW = arc_center's 'direction') maps 1:1 onto an entity_type here, so an
-    analyzed sketch can be rebuilt without dropping/simplifying any curve.
-    On COMPLETED the result includes result_geometry: the REAL geometry SolidWorks created (read back,
-    not echoed) — use it to self-verify the radius/endpoints match your intent before moving on.
-    Rebuilding from exact (frozen) coordinates: do NOT add coincident constraints between segments —
-    segments that share identical endpoint coordinates already close the profile, so a cut/extrude finds
-    the region automatically. Adding constraints is unnecessary and can fail and roll the sketch back.
-    All coordinates in document units (meters)."""
+    direction: only for 'arc_center' — sweep sense from start to end. OMIT IT (or pass 0) for the
+               MINOR (<=180°) arc, which a corner round virtually always is; a wrong explicit sign
+               SILENTLY draws the >180° complement. Pass +1 (CCW) or -1 (CW) only for a deliberate
+               major sweep (a round-trip replays analyze's 'dir' verbatim).
+    construction: True makes the entity CONSTRUCTION/reference geometry — it guides the profile but
+               adds no edge. Mirrors analyze_model's per-segment 'construction' flag.
+
+    This tool MIRRORS analyze_model 1:1 — every segment it emits (line, arc/circle, ellipse, spline,
+    with cx/cy/x1/y1/x2/y2/radius/points/construction, and 'dir' on partial arcs) maps onto an
+    entity_type here, so an analyzed sketch rebuilds without dropping or simplifying a curve.
+    On COMPLETED the result carries result_geometry: what SolidWorks actually created, READ BACK
+    rather than echoed — check the radius/endpoints against your intent before moving on.
+    Rebuilding from exact coordinates: do NOT add coincident constraints between segments. Shared
+    endpoint coordinates already close the profile, and a constraint that fails rolls the sketch back.
+    All coordinates in METERS."""
     return _call(
         "add_sketch_entity",
         {
@@ -496,22 +488,20 @@ def extrude_feature(
     feature_type='revolve': solid of revolution — angle in DEGREES (default 360 = full revolve); axis defined by axis_x1/y1 to axis_x2/y2 (midpoint of that segment selects the centerline).
     feature_type='sweep': sweeps profile along a path — requires path_sketch (name of the path sketch).
     feature_type='loft': lofts through multiple profiles — requires profiles (JSON array of sketch names, e.g. '[\"Sketch1\",\"Sketch2\"]').
-    reverse (boss/cut): flip the feature direction. Needed e.g. for a cut/boss sketched on a part FACE, where the material is on the opposite side from the default.
-    through (boss/cut): through-all end condition (depth is ignored). Use for through holes/cuts instead of guessing a depth.
-    up_to_face_index (boss/cut): >= 0 selects the UP-TO-SURFACE end condition — the feature terminates
-        exactly ON that model face (index from analyze_model(analysis_type='faces'), same indexing as
-        create_sketch face_index). depth is ignored, like through. Use when the recipe says
-        extrude end='up_to_surface', or to land a boss/cut precisely on existing geometry without
-        computing a blind depth. -1 (default) = off.
-    mid_plane (boss/cut): True selects the MID-PLANE end condition — the feature extrudes
-        SYMMETRICALLY about the sketch plane; depth is the TOTAL width. Use when the recipe says
-        extrude end='mid_plane'. Conflicts with through/up_to_face_index (pick one).
-    depth is required only for a BLIND or MID-PLANE boss/cut (not for through, up_to_face_index, revolve, sweep, or loft).
-    Sheet metal: a 'cut' on a sheet-metal body (incl. holes after a bend) is handled automatically — it
-        applies a Normal Cut and inserts before the Flat-Pattern; no special params needed. Use
-        analyze_model(analysis_type='edges') to get real edge midpoints for selection.
-    On COMPLETED the result includes result_geometry {volume, faces, edges} of the body after the feature
-        — verify the step from this instead of a separate analyze_model + manual volume math.
+    END CONDITION (boss/cut) — pick ONE; depth is required only for BLIND or mid_plane:
+      through=True          through-all; depth ignored. Use it instead of guessing a depth.
+      up_to_face_index >= 0 terminates exactly ON that model face (index from
+                            analyze_model('faces'), same indexing as create_sketch face_index);
+                            depth ignored. -1 (default) = off.
+      mid_plane=True        SYMMETRIC about the sketch plane; depth is the TOTAL width.
+    reverse (boss/cut): flip the direction — needed when a cut/boss sketched on a part FACE has its
+        material on the opposite side from the default. DIRECTION IS THE SILENT ONE: a feature built
+        on the wrong side leaves volume, area and topology identical (recipe R6b/R14), so bind the
+        sketch plane to a face explicitly and read one coordinate back afterwards.
+    Sheet metal: a 'cut' on a sheet-metal body (holes after a bend included) is handled
+        automatically — Normal Cut, inserted before the Flat-Pattern; no special params.
+    On COMPLETED the result carries result_geometry {volume, faces, edges} after the feature — verify
+        the step from that rather than a separate analyze_model.
     Exits sketch mode automatically before executing."""
     return _call(
         "extrude_feature",
@@ -671,11 +661,10 @@ def add_flat_pattern_view(
     hide_bend_lines: bool = False,
     flip_view: bool = False,
 ) -> str:
-    """Add a FLAT PATTERN view of a SHEET-METAL part to the active drawing — the unfolded blank
-    with bend lines/notes. This is the correct, standard way to detail sheet metal: sheet metal is
-    dimensioned on its flat pattern (overall blank size, hole positions, bend lines), NOT on the
-    folded orthographic views. Use this instead of (or alongside an isometric of) the folded views
-    for a sheet-metal part; then call auto_dimension_drawing to place the blank/hole dimensions.
+    """Add a FLAT PATTERN view of a SHEET-METAL part to the active drawing — the unfolded blank with
+    bend lines/notes. Sheet metal is dimensioned on its FLAT PATTERN (blank size, hole positions,
+    bend lines), not on the folded orthographic views, so use this rather than them; then call
+    auto_dimension_drawing.
 
     pos_x/pos_y: position on the drawing sheet in meters.
     scale: view scale (default 1.0 = 1:1).
@@ -726,12 +715,11 @@ def auto_dimension_drawing(
     include_unmarked: bool = False,
     eliminate_duplicates: bool = True,
 ) -> str:
-    """Automatically transfer the MODEL's driving dimensions into the active drawing's views
-    (SolidWorks 'Insert Model Items > Dimensions'). This is the PREFERRED way to dimension a
-    drawing — far more reliable than add_drawing_dimension's coordinate pick, because the
-    dimensions come straight from the model's real parametric dimensions and are placed for you.
-    Call it AFTER create_drawing + add_drawing_view(s); then verify with analyze_slddrw_test
-    (dimension_count should be > 0 and the values should match the model's driving dims).
+    """Transfer the MODEL's driving dimensions into the active drawing's views (SolidWorks 'Insert
+    Model Items > Dimensions'). PREFER this over add_drawing_dimension's coordinate pick — the
+    values come from the model's own parametric dimensions and are placed for you. Call it AFTER
+    create_drawing + add_drawing_view(s), then verify with analyze_slddrw_test (dimension_count > 0,
+    values matching the model).
 
     all_views: insert into all drawing views (True) or only the currently selected view (False). Default True.
     include_unmarked: also insert driving dimensions NOT marked for drawing (i.e. ALL driving dims), not just
@@ -810,10 +798,10 @@ def add_section_view(
     place the depth).
 
     Two ways to define the cut (provide ONE pair-set):
-    - EDGE mode (edge_x, edge_y): cut ALONG an existing straight edge/line already projected in a view —
-      point at it. Best when a real edge lies on the plane you want (the cut runs collinear with it).
-    - LINE mode (x1,y1 → x2,y2): draw a cut line. Best for cutting THROUGH a feature's interior (e.g. the
-      MIDDLE of a pocket, where no edge exists). The line must fully cross the view through the feature.
+    - EDGE mode (edge_x, edge_y): cut collinear with an existing straight edge already projected in
+      a view — point at it.
+    - LINE mode (x1,y1 → x2,y2): draw the cut line, for cutting THROUGH a feature's interior where
+      no edge exists. It must fully cross the view through the feature.
     All coordinates are drawing sheet coordinates in meters (KNOWN-LIMITATIONS #6 — coordinate-based).
 
     px,py: where to place the section view (meters) — also picks which side the section projects toward.
@@ -1032,8 +1020,8 @@ def _summarise_direct(art, summary, graph):
         % (b["area_mm2"], summary["expected"]["volume_m3"]),
         "  graph      %d IR nodes: sketch + sheet_metal, then sketch + sketched_bend per direction"
         % len(graph["nodes"]),
-        "  NEXT       mode='build' builds it | mode='ir' shows the graph first | mode='full' gives",
-        "             the raw analysis. AFTER building, verify: analyze_model('mass_properties')",
+        "  NEXT       mode='build' builds it | mode='ir' shows the graph first.",
+        "             AFTER building, verify: analyze_model('mass_properties')",
         "             against the expected volume above, and read one bend face back — a mirrored",
         "             fold is invisible to volume, area and topology alike (recipe R14).",
     ]
@@ -1043,9 +1031,90 @@ def _summarise_direct(art, summary, graph):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# ADVISORIES — the third home (payload trim phase 5, 2026-09-07)
+# ---------------------------------------------------------------------------
+# Three channels carry what the model needs, and each costs differently: a tool docstring is paid
+# EVERY session whatever the job, a recipe section once per job that fetches it, and a payload note
+# only when the thing it warns about actually happens. So guidance that applies to ONE flag belongs
+# on that flag: `reverse` used to spend a paragraph on "if you see printed_mismatch, do X" in every
+# read, whether or not any dimension carried it.
+#
+# Computed HERE, in the adapter, deliberately NOT in the reader: the saved artifact stays pure DATA
+# (the research pool is not polluted, ANALYSIS_VERSION does not move, the draw-dialect contract and
+# gate 4 are untouched). Only the ANSWER gains a short advisory block.
+#
+# A closed set, one line each, emitted ONCE per condition with the places it fired.
+def _advisories(art) -> str:
+    """A short plain-text block naming the conditions this read actually raised. '' when none."""
+    out = []
+    views = art.get("views") or []
+
+    scaled = [v["vid"] for v in views if v.get("scale_factor") is not None]
+    if scaled:
+        out.append("view scale_factor @ %s — this view is drawn at a DIFFERENT ratio from the "
+                   "sheet; say which factor produced a number before you quote it."
+                   % ", ".join(scaled))
+
+    not_read = (art.get("sheet") or {}).get("not_read") or {}
+    if not_read:
+        out.append("not_read @ sheet (%s) — the reader saw these and did not emit them; a named "
+                   "block you cannot account for is evidence that never reached you."
+                   % ", ".join(sorted(not_read)))
+
+    ang, lin = [], []
+    for k, d in enumerate(art.get("dimensions") or []):
+        if d.get("printed_mismatch"):
+            (ang if d.get("kind") == "angular" else lin).append("dim[%d]" % k)
+    if ang:
+        out.append("printed_mismatch/ANGULAR @ %s — the value is a JUDGEMENT, not a reading; "
+                   "corroborate it against the geometry or an ellipse ratio before building."
+                   % ", ".join(ang))
+    if lin:
+        out.append("printed_mismatch @ %s — the scale, the arc match or the per-view factor is "
+                   "wrong. Reading the flag is free; ignoring it is not." % ", ".join(lin))
+
+    tier_b = ["%s/%s" % (v["vid"], lp.get("id"))
+              for v in views for lp in (v.get("loops") or []) if lp.get("tier") == "B"]
+    if tier_b:
+        out.append("tier:B @ %s — this boundary was WALKED, not chained; check its area against a "
+                   "stated length or width before you build on it." % ", ".join(tier_b))
+
+    unpaired = [b for b in (art.get("bend_notes") or []) if b.get("unpaired")]
+    if unpaired:
+        out.append("unpaired bend x%d — the reader refused to guess, so those bends are NOT built. "
+                   "Resolve them from the drawing or declare a gap; never split the difference."
+                   % len(unpaired))
+    in_loop = [b for b in (art.get("bend_notes") or [])
+               if (b.get("bend_line") or {}).get("in_loop")]
+    if in_loop:
+        out.append("bend_line in_loop x%d — the match landed on OUTLINE geometry, and a bend line "
+                   "belongs to no closed contour. Say so." % len(in_loop))
+
+    vg = art.get("view_graph")
+    if isinstance(vg, dict) and vg.get("solved") is False:
+        out.append("view_graph.solved:false (%s) — the axes did not join; that joining is yours."
+                   % vg.get("reason", "reason in the field"))
+
+    if not out:
+        return ""
+    return "\nADVISORIES (%d) — only what actually fired in THIS read:\n  %s" % (
+        len(out), "\n  ".join(out))
+
+
+def _wire_json(obj) -> str:
+    """The drawing payload, serialized as tightly as JSON allows.
+
+    `json.dumps` defaults to ', ' and ': ' — two bytes of whitespace per comma and colon, which on
+    an artifact made mostly of short numeric arrays is 18,854 B across the 10 samples (11 points of
+    payload, measured). Nothing is lost: JSON whitespace is not data.
+    """
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
 @mcp.tool(structured_output=False)
 def analyze_drawing(file_path: str, save_analysis: bool = True,
-                    mode: Literal["auto", "full", "ir", "build"] = "auto") -> str:
+                    mode: Literal["auto", "ir", "build"] = "auto") -> str:
     """Read a 2D technical drawing — **.DXF or .DWG** — and either BUILD the part from it or hand
     you the evidence to build it yourself. This is the drawing→part front end: a real drawing
     arrives as DXF/DWG (a .SLDDRW is model-linked and nobody ships one), so start here for ANY
@@ -1062,54 +1131,117 @@ def analyze_drawing(file_path: str, save_analysis: bool = True,
         `mode='build'`. Anything the reader could not attribute is listed as SKIPPED and will not
         be built; completing or declaring it is then yours (recipe R15).
 
-    (B) `NOT_DIRECT | <reason>` followed by the full analysis JSON — the drawing needs real
-        reading. This is the normal path for machined parts. The reason names exactly which
-        decision the drawing left open. Nothing is lost: read the JSON per the
-        recipe://usage/reverse resource and build with submit_feature_graph as before.
+    (B) `NOT_DIRECT | <reason>` followed by the WHOLE analysis — the drawing needs real reading
+        (the normal path for machined parts); the reason names exactly which decision the drawing
+        left open. You get sheet/frame, every view complete (boxes, size, geometry, loops with
+        their `seq`, open chains), alignment, view_graph, every dimension, bend note and note, in
+        one answer. Read it per get_recipe('reverse') and build with submit_feature_graph.
 
-    mode='full'  — always the full analysis JSON, even when it is directly buildable.
     mode='ir'    — the lowered Feature Graph IR, without building. For inspection or saving.
     mode='build' — lower and BUILD, through the same deterministic pycompiler as
                    submit_feature_graph. **CHANGES GEOMETRY and bumps state_version.** Opens a new
                    part. Re-derives from the same file, so it needs no cached graph — but verify
                    the sha256 in the summary is the file you looked at.
 
-    ⮕ Before reading a `full` payload, read the MCP resource `recipe://usage/reverse` — it holds
-      the reading discipline (scale, edge classes, projection standard, sheet-metal bend
-      arithmetic) and the self-verification rules that make this small payload sufficient.
+    ⮕ Before interpreting a single number below, call `get_recipe(section='reverse')` — the TOOL,
+      not the `recipe://usage/reverse` resource, which most hosts give the model no way to read
+      (ADR-077). It holds the reading discipline (projection standard, face binding, contour gaps,
+      sheet-metal bend arithmetic) and the self-verification rules. When you then need the IR
+      vocabulary, `get_recipe('feature_graph_schema', profile='part')` is the right shape for this
+      job — it drops the assembly vocabulary and keeps every part and sheet-metal feature type.
 
-    The full JSON:
+    The artifact — WHAT EVERY FIELD MEANS. (The DECISIONS you make with them are the recipe's;
+    read get_recipe('reverse') for those. Nothing is documented in both places.)
       sheet — dxf_version, units, **scale_factor** and the sheet box. `scale_factor` is ALREADY
-        applied to every size/coordinate/dimension below, so all numbers are TRUE model mm.
-      views[] — one per detected view: `vid`, `paper_box` (sheet coords, for reading the LAYOUT),
-        `size` [w,h] in true mm, and `geometry` {lines, arcs, circles} in view-local true mm with
-        the view's own bottom-left as origin. Every primitive carries `c`, its EDGE CLASS:
-        'visible' (near-side edge) | 'hidden' (obscured — a real feature seen through material) |
-        'cut_line' (a section's cutting line, not part geometry) | 'center' (an axis).
+        applied to every size/coordinate/dimension below, so all numbers are TRUE model mm and
+        multiplying again builds a half- or double-size part. An ANGLE is never scaled (DIMLFAC is
+        a length factor).
+        `not_read` counts what the reader saw and did NOT emit, by entity class and — for an
+        INSERT — by block name, e.g. {"HATCH": 5, "INSERT": {"WALZRICHTUNG": 1}}. Nothing vanishes
+        silently: a named block you cannot account for is evidence that exists on the sheet and
+        did not reach you.
+      frame — {paper_box, title_block_top, primitives, circles[], note_count}: the border/title
+        block cluster, which is never emitted as a view. A candidate is accepted ONLY when it
+        CONTAINS every other cluster, so `paper_box: null` means this sheet has no frame and every
+        cluster was a view candidate. A cluster in the title-block corner that no dimension points
+        at arrives as `role: "frame_item"` (a projection symbol, a weld symbol) — furniture.
+      frame_notes[] / notes[] — the sheet's text in reading order, `frame_notes` being the title
+        block's. Text INSIDE inserted blocks (SW_NOTE, BIEGETEILE, a company stamp) is included,
+        one entry per ROW, nested to any depth. The DWG route splits a row into per-glyph
+        fragments that are re-joined left to right, so match on content, not on exact spacing.
+      views[] — one per detected view: `vid`, `role`, `paper_box` (sheet coords, for reading the
+        LAYOUT), `geom_box`, `size` [w,h] in true mm, `dropped_duplicates`? (exact duplicates the
+        DWG route re-emitted), `scale_factor`? — PRESENT ONLY when this view is drawn at a ratio
+        DIFFERENT from the sheet's (a detail or section labelled 'A-A 1 : 1' on a 1:10 sheet); its
+        geometry and dimensions are already scaled with THAT factor.
+        Then `geometry` {lines, arcs, circles, ellipses} in view-local
+        true mm with the view's own bottom-left as origin. The EDGE CLASS is carried on every
+        primitive as `c`: 'visible' (near-side edge) | 'hidden' (obscured — a real feature seen
+        through material) | 'cut_line' (a section's cutting line, not part geometry) | 'center'
+        (an axis).
+        `lines` is the one array grouped BY that class instead of carrying it per record:
+        {"visible": [[index, x1, y1, x2, y2], …], "hidden": […]}. THE FIRST NUMBER IS THE INDEX —
+        the one a `seq` entry names — written in rather than implied by position, so ['l', 12, 1]
+        is found by looking for the row starting with 12, in whichever group, and never by
+        recomputing an offset. Indices run 0..n-1 across all the groups together.
+        `ellipses` {cx, cy, rx, ry, rot (+ t1, t2, x1..y2 for an arc)} are PARAMETRIC — a circle
+        on a plane tilted by θ projects with ry/rx = cos θ and rx its true radius, so a Ø10 hole
+        on a 20° face arrives as rx 5 / ry 4.699, not as 48 line segments. A record carrying
+        `n` + `fit` was recovered from an exploded fan of n segments (fit = max deviation, mm);
+        one without is a real DXF ellipse.
         The sheet border/title block is NOT a view; a cluster INSIDE a view is that view's feature.
       views[].loops[] — the CLOSED contours, already chained: {id, class, role outer|inner, parent,
-        area (mm^2, arc bulges exact), bbox, seq}. `seq` is [[code, index, dir], …] referencing
-        that view's own geometry arrays — the contour IN ORDER, ready to transcribe as a sketch
-        path profile. Traverse it as given; consecutive entries share an endpoint exactly.
-      views[].open_chains[] — segments belonging to no contour: bend lines, centre lines, and (in
-        an ortho view) silhouette fragments the chainer refused to guess through a T-junction. An
-        open chain you cannot account for is a GAP to declare, never a contour to invent.
-      alignment[] — view pairs sharing a paper axis: shares='x' is a vertical projection pair,
-        'y' a horizontal one. This gives the shared AXIS; the projection standard (config) gives
-        which physical face a placed view shows.
+        area (mm^2, arc bulges exact), bbox, seq, tier?}. `seq` is [[code, index, dir], …]
+        referencing that view's own geometry arrays — the contour IN ORDER, ready to transcribe as
+        a sketch path profile. Traverse it as given; consecutive entries share an endpoint exactly.
+        `tier` is PRESENT ONLY when it is "B", so the common case costs nothing. Absent = Tier A,
+        strict chaining, which stops dead at any junction of three or more and therefore never
+        guesses. "B" = planar face traversal, run ONLY on a view whose visible graph has no free
+        end — with no dangling edge the figure is a closed planar subdivision and its faces are
+        DEFINED by the angular order of the edges at each vertex, so walking it is a reading. It
+        appears only where Tier A found nothing, and the direct-build path ignores it by design.
+      views[].open_singles[] — [position, code, index] triples: the SINGLE-segment open chains,
+        which are most of them. Nothing is abbreviated away — the id is 'O<position>', the class is
+        that primitive's own `c`, the direction is 1 — and a chain whose id/class/direction are not
+        all recoverable stays a full record in `open_chains` instead. Read the two together: a
+        primitive named here is exactly as unattributed as one in `open_chains`.
+      views[].open_chains[] — the MULTI-segment chains belonging to no contour: bend lines, centre
+        lines, and (in an ortho view) silhouette fragments the chainer refused to guess through
+        a T-junction.
+      alignment[] — GRADED view pairs: shares='x' is a vertical projection pair, 'y' a horizontal
+        one, and `grade` says how strong the evidence is. 'span' = the two share that axis's span
+        edge-for-edge, the strongest. 'mid' = only the midpoints coincide — still a measurement,
+        but silhouette ends may genuinely differ, and on a bend-note sheet a mid pair may relate
+        the FLAT and the BENT state (two states of the part, not two projections). 'label' = a
+        section caption ties the section view `b` to the view `a` carrying its cut line, with
+        shares=null, so it survives a cross-scale section.
+      view_graph — {solved, views:{vid: [h_axis, v_axis]}} when the pairs pin every view's two
+        paper axes onto the part's three. TOPOLOGY ONLY, over ANONYMOUS axes ax0/ax1/ax2: which
+        axis is depth and which view is "front" is the projection convention's SIGN, not a field.
+        `solved: false` names why, and the joining is yours again.
       dimensions[] — `value` (TRUE), `kind` (linear|aligned|angular|diameter|radius|ordinate),
         `defpts` (the dimension's own reference points, sheet coords) and the owning `view`.
-        `text` appears only when the drafter overrode it (e.g. '8x <>' = a count).
+        `printed` is the string the CAD system actually DREW, taken from the dimension's own
+        block, with `%%c`→Ø, `%%d`→°, `%%p`→± decoded (the symbol is evidence about what was
+        dimensioned); `text` beside it is the raw undecoded override (e.g. '8x <>' = a count).
+        The DWG→DXF route corrupts the stored measurement in two whole classes — an ANGULAR value
+        comes back as 180+θ, a RADIUS loses its arc side — so the reader ARBITRATES: for radius and
+        diameter the printed value wins outright, and for an angle it takes the candidate ≤ 180°.
+        `printed_mismatch: true` marks what it could not settle.
+        `kind_from: "printed"` marks a dimension whose TYPE the drawn symbol overruled — a plain
+        linear dim drawn across a circle with a hand-typed Ø is re-emitted as `kind: "diameter"`.
+        `measures` links a dimension to the primitive the reader matched it to.
       bend_notes[] — sheet metal: {dir UP|DOWN, angle_deg, radius, view} plus either `bend_line`
         (the line it annotates, that line's edge class, and `in_loop` — true would mean the match
         landed on outline geometry, which a bend line never is) or `unpaired` with the reason and
         the candidates. Direction comes from the NOTE; the class corroborates it.
-      notes[] — other free text on the sheet (e.g. a bare '2 mm' thickness note, 'SECTION C-C').
+      notes[] — other free text on the sheet (e.g. a bare '2 mm' thickness note, 'SECTION C-C'),
+        text inside note blocks included.
 
     file_path: absolute path to the .DXF or .DWG.
     save_analysis (default True): also write `<name>.analysis-v<version>.json` beside the source —
         a research artifact for cross-part study, versioned by the analyzer. Same version
-        overwrites; you never need to read it back."""
+        overwrites. You never need to read it back: this answer already carries everything in it."""
     src = os.path.abspath(file_path)
     if not os.path.exists(src):
         return f"FAILED | FILE_NOT_FOUND | {src}"
@@ -1117,46 +1249,48 @@ def analyze_drawing(file_path: str, save_analysis: bool = True,
     if ext not in (".dxf", ".dwg"):
         return ("FAILED | UNSUPPORTED_TYPE | analyze_drawing reads .DXF or .DWG. "
                 "A native .SLDDRW is a test-only path (analyze_slddrw_test).")
+    # DWG is binary; the reader parses DXF only. SolidWorks opens the DWG as a drawing and exports
+    # DXF — measured lossless for geometry, dimensions, DIMLFAC, linetypes and notes.
+    dxf_path = src if ext == ".dxf" else os.path.splitext(src)[0] + ".dwg2dxf.dxf"
 
-    dxf_path, converted_from = src, None
-    if ext == ".dwg":
-        # DWG is binary; the reader parses DXF only. SolidWorks opens the DWG as a drawing and
-        # exports DXF — measured lossless for geometry, dimensions, DIMLFAC, linetypes and notes.
-        dxf_path = os.path.splitext(src)[0] + ".dwg2dxf.dxf"
-        opened = _call_raw("open_document", {"file_path": src})
-        if opened.get("status") != "COMPLETED":
-            err = opened.get("error") or {}
-            return f"FAILED | DWG_OPEN_FAILED | {err.get('code')}: {err.get('message')}"
-        exported = _call_raw("export_document", {"format": "DXF", "file_path": dxf_path})
-        _call_raw("close_document", {})          # the import is scratch — discard, never save
-        if exported.get("status") != "COMPLETED":
-            err = exported.get("error") or {}
-            return f"FAILED | DWG_CONVERT_FAILED | {err.get('code')}: {err.get('message')}"
-        converted_from = os.path.basename(src)
-
-    if _draw is None:
-        return f"FAILED | READER_UNAVAILABLE | {_DXF_READER_IMPORT_ERROR}"
-    try:
-        cfg = _draw.load_config()
-        art = _draw.read(dxf_path, cfg)
-    except Exception as exc:
-        return f"FAILED | DXF_READ_FAILED | {type(exc).__name__}: {exc}"
-
-    if converted_from:
-        art["source"]["converted_from"] = converted_from
-    if save_analysis:
-        out = os.path.join(os.path.dirname(dxf_path),
-                           "%s.analysis-v%s.json" % (os.path.splitext(os.path.basename(src))[0],
-                                                     art["analysis_version"]))
+    def _load():
+        """Convert (DWG) + read + save -> (art, cfg, None) | (None, None, error string)."""
+        converted_from = None
+        if ext == ".dwg":
+            opened = _call_raw("open_document", {"file_path": src})
+            if opened.get("status") != "COMPLETED":
+                err = opened.get("error") or {}
+                return None, None, f"FAILED | DWG_OPEN_FAILED | {err.get('code')}: {err.get('message')}"
+            exported = _call_raw("export_document", {"format": "DXF", "file_path": dxf_path})
+            _call_raw("close_document", {})      # the import is scratch — discard, never save
+            if exported.get("status") != "COMPLETED":
+                err = exported.get("error") or {}
+                return None, None, f"FAILED | DWG_CONVERT_FAILED | {err.get('code')}: {err.get('message')}"
+            converted_from = os.path.basename(src)
+        if _draw is None:
+            return None, None, f"FAILED | READER_UNAVAILABLE | {_DXF_READER_IMPORT_ERROR}"
         try:
-            with open(out, "w", encoding="utf-8") as fh:
-                json.dump(art, fh, indent=1, ensure_ascii=False)
-        except OSError:
-            pass                                  # the artifact is research-only, never the result
+            cfg = _draw.load_config()
+            art = _draw.read(dxf_path, cfg)
+        except Exception as exc:
+            return None, None, f"FAILED | DXF_READ_FAILED | {type(exc).__name__}: {exc}"
+        if converted_from:
+            art["source"]["converted_from"] = converted_from
+        if save_analysis:
+            out = os.path.join(os.path.dirname(dxf_path),
+                               "%s.analysis-v%s.json" % (os.path.splitext(os.path.basename(src))[0],
+                                                         art["analysis_version"]))
+            try:
+                with open(out, "w", encoding="utf-8") as fh:
+                    json.dump(_draw.wire_encode(art), fh, indent=1, ensure_ascii=False)
+            except OSError:
+                pass                              # the artifact is research-only, never the result
+        return art, cfg, None
 
-    full = json.dumps(art, ensure_ascii=False)
-    if mode == "full":
-        return full
+    art, cfg, err = _load()
+    if err:
+        return err
+    full = _wire_json(_draw.wire_encode(art))
 
     # The GATE decides the result shape. The model must never be asked to choose between "give me
     # the analysis" and "just build it" BEFORE it has seen any geometry — that was the flaw in
@@ -1169,10 +1303,14 @@ def analyze_drawing(file_path: str, save_analysis: bool = True,
     if not verdict["direct"]:
         if mode in ("ir", "build"):
             return (f"FAILED | NOT_DIRECTLY_BUILDABLE | {verdict['reason']} | {verdict['detail']} — "
-                    f"call analyze_drawing(mode='full') and build with submit_feature_graph.")
+                    f"call analyze_drawing(mode='auto') and build with submit_feature_graph.")
+        # ONE SHAPE, the whole analysis (payload phase 1, 2026-09-07). This used to be a SUMMARY
+        # with the geometry pulled back per view, and the split was retired on its own measurement:
+        # once the wire form landed, the complete artifact came out smaller on all 10 samples than
+        # the summary plus the pulls it made necessary (f-3: 14.0 KB against 28.7).
         return (f"NOT_DIRECT | {verdict['reason']} | {verdict['detail']}\n"
-                f"Read the analysis below per the recipe://usage/reverse resource and build it "
-                f"with submit_feature_graph.\n{full}")
+                f"The whole analysis is below. Read it per get_recipe(section='reverse') and build "
+                f"with submit_feature_graph.{_advisories(art)}\n{full}")
 
     try:
         graph = _draw.lower_flat_pattern(art, cfg, verdict)
@@ -1180,9 +1318,12 @@ def analyze_drawing(file_path: str, save_analysis: bool = True,
         return f"NOT_DIRECT | LOWERING_ERROR | {type(exc).__name__}: {exc}\n{full}"
 
     if mode == "ir":
-        return json.dumps(graph, ensure_ascii=False)
+        return _wire_json(graph)
     if mode == "auto":
-        return _summarise_direct(art, verdict["summary"], graph)
+        # The direct path reports its own skipped bends; the advisories add what the READ raised
+        # (unread entities, a walked boundary, a mismatched dimension) — equally true when the
+        # drawing turned out to be buildable without you.
+        return _summarise_direct(art, verdict["summary"], graph) + _advisories(art)
 
     # mode == "build": the THIRD IR door — same _run_graph, same pycompiler (IR-ADR-005).
     s = verdict["summary"]
@@ -1222,59 +1363,41 @@ def analyze_slddrw_test(include_geometry: bool = False, include_relations: bool 
       file `cad-planner/slddrw-testing-recipe-usage.md`. Read it from disk when this tool is the
       job; port a rule out of it into the active recipe only as a conscious decision (ADR-063).
 
-    Read-only, does NOT change state. Returns {view_count, dimension_count, views:[{name, type, scale,
-    pos, dimensions:[...], section?}]}: each view's name, type (swDrawingViewTypes_e int), scale, sheet
-    position [x,y] in meters, and its display dimensions. The FIRST view is the drawing SHEET (interpret
-    accordingly).
+    Read-only, does NOT change state. Requires an active NATIVE drawing document. All lengths are
+    METERS (angles radians), 6 decimals. Returns {view_count, dimension_count, views:[…]}, and the
+    FIRST view is the drawing SHEET.
 
-    Each dimension is {name, value_si (meters/radians, 6 decimals), diametric?, attached?, anchors?}:
-      diametric — true flags a Ø (diameter) dimension, so "is this 17 a diameter?" is DATA, not a guess.
-      attached  — the KIND(s) of geometry the dim hangs off (edge/vertex/sketch_seg/...).
-      anchors   — the dimension's reference points in MODEL space [x,y,z] meters — the concrete geometry it
-                  snaps to (maps "what is this 17 the dimension of?" to a 3D location arithmetically; an
-                  anchor whose coordinate lies BEYOND the base body's depth signals a feature that extends
-                  past it — an offset-plane boss/loft — not bad data).
-    A view's section block (present only on SECTION views) is {parent_view, cut_normal, axis?, frame, label?}:
-      cut_normal — the cutting-plane NORMAL in MODEL space (= the section's viewing direction);
-      axis       — that normal snapped to 'X'/'Y'/'Z' when axis-aligned (the direct answer to "A-A ⟂ which axis?");
-      frame      — {origin, xdir, ydir} in MODEL space: a 2D section-geometry coord (u,v) maps to 3D as
-                   p_model = origin + u*xdir + v*ydir; parent_view names the view the cut was taken in.
+    view — {name, type (swDrawingViewTypes_e int), scale, pos [x,y], dimensions[], section?}
+    dimension — {name, value_si, diametric?, attached?, anchors?}. `diametric` true means Ø is DATA,
+      not a guess. `anchors` are the dim's reference points in MODEL space; an anchor beyond the base
+      body's depth signals a feature that extends past it (offset-plane boss/loft), not bad data.
+    section (SECTION views only) — {parent_view, cut_normal (the cutting plane's MODEL-space normal,
+      i.e. the viewing direction), axis? (that normal snapped to X/Y/Z when axis-aligned), frame
+      {origin, xdir, ydir}, label?}. A 2D coord maps to 3D as p = origin + u*xdir + v*ydir.
 
-    include_geometry (default False): also return each view's PROJECTED 2D GEOMETRY as clean primitives —
-        geometry:{lines:[{x1,y1,x2,y2}], curves:[{n,x1,y1,xm,ym,x2,y2,cx?,cy?,r?}], circles:[{cx,cy,r}],
-        frame:{origin,xdir,ydir}}. This is the CLEAN SHAPE for reverse-engineering a part from its drawing,
-        independent of dimension-line clutter. Coordinates are MODEL-scale METERS in the view plane; the
-        view's frame maps ANY of them (incl. circle centers) to 3D: p_model = origin + x*xdir + y*ydir.
-        circles are FULL circles with their true center+radius (a bore/boss cross-section — TRUST cx,cy:
-        concentric circles of differing r in a plan view + slanted silhouette lines in an adjacent view
-        = a loft/cone/taper). curves are partial arcs (fillets etc.) as start/mid/end + fitted center.
-        The line segments carry the UP/DOWN / which-face profile structure a dimension VALUE alone cannot.
-        Source: IView.GetPolylines7. Heavier payload — use when you need the shape, not for a dim check.
-        Each frame also carries normal_axis (the view's viewing direction as a SIGNED principal axis,
-        e.g. 'Y'/'-Z'): a CIRCLE in a view is the cross-section of a feature whose axis runs along that
-        view's normal — circles in different-normal_axis views are DIFFERENT features unless a section
-        proves otherwise. Do NOT chain circles across views into one feature by radius alone.
-        Axis-aligned views also carry geometry.extent {axis:[min,max]} — the SERVER-computed model-space
-        span of all primitives (frame signs applied). Read it BEFORE any "no material beyond X" claim;
-        never re-derive a view's span from raw 2D coordinates (frame direction components can be negative).
+    include_geometry (default False) — each view's projected 2D geometry as clean primitives:
+      {lines[{x1,y1,x2,y2}], curves[{n,x1,y1,xm,ym,x2,y2,cx?,cy?,r?}] (partial arcs as start/mid/end
+      + fitted centre), circles[{cx,cy,r}] (FULL circles, true centre+radius), frame{origin,xdir,ydir,
+      normal_axis}, extent? }. Source IView.GetPolylines7; heavier payload, so use it when you need
+      the SHAPE, not for a dimension check. Two rules that fail silently if broken:
+      · `normal_axis` is the view's viewing direction as a SIGNED principal axis. A circle is the
+        cross-section of a feature whose axis runs along it, so circles in views with DIFFERENT
+        normal_axis are DIFFERENT features — never chain them into one by radius alone.
+      · `extent` {axis:[min,max]} is the SERVER-computed model-space span, frame signs applied. Read
+        it before any "no material beyond X" claim; never re-derive a span from raw 2D coordinates,
+        because a frame's direction components can be negative.
 
-    include_relations (default False; forces include_geometry): ADDITIVE deterministic enrichment for
-        reverse reading — pass BOTH flags True for a drawing→part reconstruction. Ids are positional,
-        per-read: each view gets vid ('v<views[] index>'); within a view c<i>=circles[i],
-        a<i>=curves[i], l<i>=lines[i]. Every relation carries source (closed enum) + residual (max
-        deviation, meters 6dp) — "why is this concentric?" is answerable by reading the field. Adds:
-      relations per view — concentric:{members,center,radii} (TRUST these shared centers — never
-        re-derive), equal_diameter:{members,r,centers} (same Ø at distinct centers = twin bores),
-        tangent (circle/arc/line contacts). (`touches` and the root `stations` table were REMOVED
-        from the reader in 0.16.1 / ADR-059 — redundant and unconsumed.)
-      measures per dimension — the primitive id(s) the dim measures, resolved from its anchors
-        (measure_src anchor_at_center|anchor_on_primitive); a dim with unattached:true resolved to NO
-        primitive — a loud gap to close from geometry, never dropped.
-      center_marks / centerlines per view — which circles carry center marks (on:[ids]), centerline
-        segments (through:[ids]); a view reporting centerlines it cannot expose emits
-        {centerlines_reported, unreadable:true} instead of a guess.
-
-    Requires an active NATIVE drawing document."""
+    include_relations (default False; forces include_geometry) — additive deterministic enrichment;
+      pass BOTH for a reconstruction. Ids are positional per read: vid 'v<i>', and within a view
+      c<i>/a<i>/l<i> for circles/curves/lines. Every relation carries `source` (closed enum) and
+      `residual` (max deviation), so "why is this concentric?" is answerable by reading the field.
+      · relations — concentric {members,center,radii} (TRUST these centres, never re-derive),
+        equal_diameter {members,r,centers} (same Ø at distinct centres = twin bores), tangent.
+      · measures — per dimension, the primitive id(s) it measures. `unattached:true` means it
+        resolved to NO primitive: a loud gap to close from geometry, never to drop.
+      · center_marks / centerlines — which circles carry marks (on:[ids]), which segments run
+        through which (through:[ids]). A view that cannot expose its centerlines says so
+        ({centerlines_reported, unreadable:true}) instead of guessing."""
     return _call("analyze_slddrw_test", {"include_geometry": include_geometry,
                                          "include_relations": include_relations})
 
@@ -1383,12 +1506,10 @@ def create_pattern(
             evenly divided across it and NEVER overlap (count distinct == count).
         equal_spacing=False: angle is the spacing BETWEEN adjacent instances. count*angle can exceed 360, in which
             case later instances WRAP and overlap earlier ones, so the number of DISTINCT instances < count.
-    Round-trip with analyze_model: a CirPattern reports instances, equal_spacing, spacing_deg, plus the
-        EFFECTIVE distinct_instances and a wraps flag. To reproduce a pattern faithfully, EITHER replay the
-        stored form verbatim (count=instances, angle=spacing_deg, equal_spacing as reported) OR, when it wraps,
-        use the simpler equivalent full ring: count=distinct_instances, angle=360, equal_spacing=True.
-        (Example: a gear analyzed as 30 @ 15° equal_spacing=False has distinct_instances=24 → reproduce as
-        either 30 @ 15° False or 24 @ 360° True; both yield the same 24 teeth.)
+        Round-trip: analyze_model reports a CirPattern's instances, equal_spacing, spacing_deg plus
+        the EFFECTIVE distinct_instances and a `wraps` flag. Either replay the stored form verbatim,
+        or — when it wraps — use the equivalent full ring (count=distinct_instances, angle=360,
+        equal_spacing=True). Both give the same geometry.
     pattern_type='mirror': mirrors one or more FEATURES about a plane. features_json = a JSON array of
         feature tree names, e.g. '["Edge-Flange1","Sketched Bend2"]' (feature_name works for a single
         feature). plane = the mirror plane name ('Right Plane' default; canonical English default-plane
@@ -1468,41 +1589,39 @@ def sheet_metal_feature(
     clear_profile: bool = True,
     edge_index: int = -1,
 ) -> str:
-    """Create sheet metal features on the active part.
-    feature_type='base_flange': creates a sheet metal base from the active sketch profile.
-        thickness: sheet thickness (meters). bend_radius: bend radius (default = thickness). k_factor: default 0.5.
-        reverse_thickness: thicken to the OPPOSITE side of the sketch plane (default False). Direction matters
-        for reproduction — when rebuilding an analyzed part, derive it from which side of the sketch plane the
-        original blank's big faces sit (e.g. feature_map's SMBaseFlange created faces).
-        symmetric_thickness: thicken BOTH ways off the sketch plane (±t/2, mid-plane style; default False).
-        When rebuilding, reproduce the original's own flag (analyze_model(features) reports it on the
-        SMBaseFlange) — the flags also set the intrinsic sheet orientation downstream bends fold against.
-        Exits sketch mode automatically.
-    feature_type='edge_flange': adds a DEFAULT-profile (full-edge-width) flange to an existing sheet metal
-        edge. Select the edge by edge_index (from analyze_model(edges), PREFERRED — a coordinate pick can
-        miss a real edge) or by a point (ex, ey, ez) on it.
-        flange_length: flange length (meters). angle: bend angle in degrees (default 90).
-    feature_type='edge_flange_sketch' + 'edge_flange_finish': the CUSTOM-profile edge flange, two calls.
-        edge_flange_sketch selects the attach edge — pass edge_index (from analyze_model(edges),
-        PREFERRED; a coordinate pick can miss a real edge) or ex/ey/ez — generates the edge-linked
-        profile sketch (the flange API accepts ONLY a sketch it generated), clears its default content
-        (clear_profile=True) and leaves it ACTIVE, echoing the sketch's MEASURED frame in the result —
-        express your profile coordinates in THAT frame. Draw the profile with add_sketch_entity, then
-        call edge_flange_finish with the SAME edge_index/coords (+ angle, bend_radius or
-        use_default_radius, bend_position from the original's edge_flange recipe block) to create the
-        flange. The custom profile itself defines the flange outline/length (flange_length is ignored).
-    feature_type='sketched_bend': bends the sheet about the bend LINE(S) in the ACTIVE sketch (draw the
-        line(s) on a sheet face with create_sketch + add_sketch_entity first — the sketch must still be
-        active). The side of the sheet that stays PUT is the fixed face: pass fixed_face_index (from
-        analyze_model(faces), PREFERRED — index-robust) or fixed_x/y/z (a 3D point ON that face, meters).
-        angle: bend angle in DEGREES (default 90). bend_radius: bend radius in meters, or set
-        use_default_radius=True to use the sheet's default (bend_radius is then ignored). flip: reverse
-        the bend direction (up vs down). bend_position: where the bend sits relative to the line —
-        'centerline' (default), 'material_inside', 'material_outside', or 'bend_outside' — matches the
-        `position` value analyze_model(features) reports on an SM3dBend, so a recipe value replays as-is.
-        A sketch with MULTIPLE bend lines creates one feature with one bend per line (like 4-1's Sketch6).
-    feature_type='flat_pattern': unfolds all bends to create the flat pattern view.
-        No additional parameters required. Requires an existing base_flange feature."""
+    """Create sheet metal features on the active part. Lengths METERS, angles DEGREES.
+
+    'base_flange' — a sheet metal base from the ACTIVE sketch profile; exits sketch mode.
+        thickness · bend_radius (default = thickness) · k_factor (0.5).
+        THICKENING SIDE IS A BUILD DECISION, and it is silent when wrong: `reverse_thickness`
+        thickens to the OPPOSITE side of the sketch plane, `symmetric_thickness` splits ±t/2.
+        Rebuilding an analyzed part, replay the original's own flags (analyze_model(features)
+        reports them on the SMBaseFlange) — they also set the sheet orientation later bends fold
+        against, so a wrong side fails downstream and less clearly.
+    'edge_flange' — a DEFAULT-profile (full-edge-width) flange on an existing sheet metal edge.
+        Select by edge_index (from analyze_model(edges), PREFERRED — a coordinate pick can miss a
+        real edge) or a point ex/ey/ez on it. flange_length · angle (90).
+    'edge_flange_sketch' + 'edge_flange_finish' — the CUSTOM-profile flange, in two calls. The
+        sketch call takes the attach edge (edge_index preferred, else ex/ey/ez), generates the
+        edge-linked profile sketch (the API accepts ONLY a sketch it generated), clears it
+        (clear_profile) and leaves it ACTIVE, echoing the sketch's MEASURED frame — express your
+        profile in THAT frame. Draw with add_sketch_entity, then call the finish with the SAME
+        edge (+ angle, bend_radius or use_default_radius, bend_position). The profile defines the
+        outline, so flange_length is ignored.
+    'sketched_bend' — bends the sheet about the bend LINE(S) in the ACTIVE sketch (draw them on a
+        sheet face with create_sketch + add_sketch_entity first; the sketch must still be active).
+        The side that stays PUT is the fixed face: fixed_face_index (from analyze_model(faces),
+        PREFERRED) or fixed_x/y/z, a 3D point ON that face. angle (90) · bend_radius, or
+        use_default_radius=True to take the sheet's default and ignore it · flip reverses the fold
+        direction · bend_position 'centerline' (default) | 'material_inside' | 'material_outside' |
+        'bend_outside', matching the `position` analyze_model(features) reports on an SM3dBend, so a
+        recipe value replays as-is. ONE sketch with SEVERAL bend lines makes one feature with one
+        bend per line.
+    'flat_pattern' — unfolds every bend. No extra parameters; needs an existing base_flange.
+
+    A wrong fold is expensive: there is no sketch-entity move/delete tool, so repairing one costs
+    deleting the feature and re-creating it. And a mirrored fold is invisible to volume, area AND
+    topology alike — read one bend face back after building (recipe R14)."""
     params = {
         "feature_type": feature_type,
         "thickness": thickness,
@@ -1669,6 +1788,130 @@ def _contract_json(filename: str) -> str:
         return fh.read()
 
 
+# ---------------------------------------------------------------------------
+# The IR schema, as the MODEL needs it (payload trim, 2026-09-07)
+# ---------------------------------------------------------------------------
+# `feature-graph.schema.json` serves two audiences at once and only one of them is the model.
+# Gate 3 (`pycompiler/tests/test_ir_schema_contract.py`) machine-diffs every ARRAY under
+# `covered_subset` against ir_schema.py's frozensets, and the prose beside those arrays documents
+# that contract for whoever maintains it. So the FILE cannot be trimmed — the trim happens HERE,
+# at serve time, on the copy the model receives.
+#
+# Dropped for every profile (measured; none of it is model-facing):
+#   _meta.status                                2,135 B — the version narrative (IR-ADR references,
+#                                                         "do NOT freeze before the MAT v1 set
+#                                                         arrives"): a developer's changelog.
+#   covered_subset._note/._grammar_note/.assumptions
+#                                               1,529 B — half of it gate 3's own machine-diff
+#                                                         instructions ("every ARRAY in this block
+#                                                         is diffed against ir_schema.py").
+# The covered_subset ARRAYS are left untouched: ~1,400 B carrying the entire capability list, the
+# highest-value bytes in the file.
+_SCHEMA_DEV_ONLY_SUBSET_KEYS = ("_note", "_grammar_note", "assumptions")
+
+# What a PROFILE drops on top of that. Two values, because only two of them mean anything:
+# `part` keeps every feature type ON PURPOSE — a drawing job does not know it is sheet metal until
+# R21 decides, so the sheet-metal vocabulary must stay reachable. (A 'sheet_metal' profile would
+# therefore be byte-identical to 'part', and an 'assembly' profile identical to 'all'; offering
+# either would advertise a filter that does not exist.)
+_SCHEMA_PROFILE_DROPS = {
+    "all": (),
+    "part": ("assembly_types_v06",),
+}
+
+
+def _feature_graph_schema_text(profile: str = "all") -> str:
+    """`feature-graph.schema.json` with the developer-only blocks removed, re-serialized compactly.
+
+    Falls back to the raw file if it will not parse: a malformed schema must still reach the caller
+    (an unreadable capability registry is a loud failure, not a silent empty one).
+    """
+    raw = _contract_json("feature-graph.schema.json")
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return raw
+    meta = doc.get("_meta")
+    if isinstance(meta, dict):
+        meta.pop("status", None)
+    subset = doc.get("covered_subset")
+    if isinstance(subset, dict):
+        for key in _SCHEMA_DEV_ONLY_SUBSET_KEYS:
+            subset.pop(key, None)
+    for key in _SCHEMA_PROFILE_DROPS.get(profile, ()):
+        doc.pop(key, None)
+    return json.dumps(doc, ensure_ascii=False, indent=1)
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_recipe  (RESTORED 2026-09-03, ADR-077 — reverses ADR-069's retirement)
+# ---------------------------------------------------------------------------
+# ADR-069 moved the recipe from a TOOL to 13 MCP resources on a measured saving of 2,146 chars of
+# `tools/list` per turn. The measurement was right; the assumption underneath it was not. MCP has
+# three primitives and only ONE of them is in the MODEL's action space:
+#
+#     tool      tools/call       <- the model can call this
+#     resource  resources/read   <- the CLIENT calls this; the model needs a host-provided bridge
+#     prompt    prompts/get      <- the user invokes this
+#
+# ADR-069 probed the host and found it DID bridge resources for the model, so the migration looked
+# safe. That bridge is gone: neither this host nor the one running the isolated tests exposes any
+# `ReadMcpResource`-style tool, so the recipe left the model's action space entirely. Two isolated
+# reconstructions of f-3 both reported they could not read `recipe://usage/reverse` and proceeded
+# on their own judgement — which is exactly the "a resource no host reads is WORSE than a tool"
+# risk ADR-069 named and accepted. A server cannot push a resource at a model; the only handle we
+# can put in a model's hand is a TOOL. So the tool comes back.
+#
+# The RESOURCES STAY. They are spec-correct, the user can attach them by hand, and a host that
+# does bridge them still benefits. Both channels read the same `recipe-usage.md` on every call, so
+# there is exactly one copy of the rules and no sync burden.
+@mcp.tool(structured_output=False)
+def get_recipe(
+    section: Literal["index", "contract", "canonicalization", "forward", "mapping",
+                     "mapping_part", "mapping_sheet_metal", "mapping_assembly", "verification",
+                     "reverse", "coverage", "feature_graph_schema",
+                     "analysis_artifact_schema"] = "index",
+    profile: Literal["all", "part"] = "all",
+) -> str:
+    """The IR-generation recipe — REQUIRED READING before writing any Feature Graph IR
+    (an artifact's `ir.graph`), reconstructing a part from a drawing, or producing a drawing
+    meant for reconstruction. Serves the rules section-by-section so token cost stays
+    proportional to the task.
+
+    Call order for the ARTIFACT→IR flow: 'contract' + 'canonicalization' + 'mapping' first,
+    then the vocabulary section matching the document ('mapping_part' / 'mapping_sheet_metal' /
+    'mapping_assembly'), then 'verification' before labeling anything. 'forward' holds the
+    INTENT→IR authoring discipline (grammar cheat-sheet, anchor design without an original,
+    computed-expectation self-verification) — read it FIRST when writing a graph for
+    submit_feature_graph from design intent. 'reverse' holds the DXF/DWG drawing→part
+    reconstruction discipline (scale/DIMLFAC, edge classes, view clustering, projection
+    standard, contour tiers, sheet-metal bend arithmetic) — read it FIRST when rebuilding a part
+    from a 2D drawing, before you interpret a single number of `analyze_drawing`'s answer.
+
+    section='index' (default): the version header + a one-line table of contents.
+    section='feature_graph_schema': the Feature Graph IR schema / capability registry JSON —
+        the node types and params the compiler accepts (what is NOT in it cannot be built).
+        `profile='part'` drops the ASSEMBLY vocabulary from the answer (~2.4 KB) and is what a
+        part or drawing→part job wants; every feature type stays, sheet metal included, because a
+        drawing is not known to be sheet metal until you decide it (R21). `profile='all'`
+        (default) is the whole registry.
+    section='analysis_artifact_schema': the persistent analysis-artifact contract JSON
+        (identity/hash, recipe, parameters, ir block + the formal 'verified' definition).
+    The same rules are also published as `recipe://usage/*` MCP resources; use whichever your
+    host actually lets you reach. Read-only; does NOT touch SolidWorks or state_version."""
+    if section == "feature_graph_schema":
+        return _feature_graph_schema_text(profile)
+    if section == "analysis_artifact_schema":
+        return _contract_json("analysis-artifact.schema.json")
+    header, sections = _recipe_sections()
+    if section == "index":
+        toc = "\n".join(f"- {slug} — {title}" for slug, (title, _b) in sections.items())
+        return (f"{header.strip()}\n\nSections (pass as `section`):\n{toc}\n"
+                "- feature_graph_schema — the IR schema / capability registry (JSON)\n"
+                "- analysis_artifact_schema — the analysis-artifact contract (JSON)")
+    return _recipe_section_text(section)
+
+
 @mcp.resource("recipe://usage/index", name="recipe_index", mime_type="text/markdown",
               description="START HERE for IR work: the recipe version header + every section URI. "
                           "Rules for turning an analysis artifact or a 2D drawing into a Feature "
@@ -1740,7 +1983,9 @@ def _recipe_section_alias(section: str) -> str:
                           "node types and params the deterministic compiler accepts. What is not "
                           "in it cannot be built. Read before authoring any ir.graph.")
 def _feature_graph_schema() -> str:
-    return _contract_json("feature-graph.schema.json")
+    # Same trimmed copy the tool serves at profile='all' — one shape, whichever channel reaches
+    # the model. A resource URI takes no arguments, so the resource is always the full registry.
+    return _feature_graph_schema_text("all")
 
 
 @mcp.resource("schema://analysis-artifact", name="analysis_artifact_schema",

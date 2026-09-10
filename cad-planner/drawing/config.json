@@ -25,5 +25,16 @@
     "_cluster_gap_mm": "Bounding-box gap below which two primitives are treated as one view cluster.",
     "chain_eps_mm": 0.01,
     "_chain_eps_mm": "Endpoint-coincidence tolerance for contour chaining. Deliberately looser than coord_eps_mm (0.001 is inside DXF float noise) and far below any real feature."
+  },
+
+  "curve_fit": {
+    "fit_eps_paper_mm": 0.03,
+    "_fit_eps_paper_mm": "Exploded curve fans (a tilted hole's ellipse written as 48 LINEs by the DXF exporter) are collapsed to ONE parametric ellipse only when the whole polyline — vertices AND chord midpoints — lies within this distance of the fitted curve. PAPER mm, multiplied by the view's own scale, because the exporter tessellates on paper: measured sag 0.011 (f-3) and 0.019 (s-6, a different document's image-quality setting). 0.03 = 1.6–2.8x those; a 24-gon drawn at 5 mm paper radius sags 0.043 and is refused, so a polygon stays a polygon. Decided with the user 2026-09-03.",
+    "min_segments": 8,
+    "_min_segments": "A run shorter than this is never fitted: 5 points determine a conic EXACTLY, so a 4-segment run fits a WRONG ellipse inside the sag (measured 4.916 for a true 5.000 on f-3). Eight segments = nine points for five unknowns.",
+    "max_turn_deg": 40.0,
+    "_max_turn_deg": "Consecutive chords of a curve turn by less than this (a 12-segment ellipse turns 30 deg per chord); a chamfer (45) or a hexagon (60) never enters a run.",
+    "min_sweep_deg": 90.0,
+    "_min_sweep_deg": "A fitted ARC is emitted only when it sweeps at least this much (parametric degrees). The residual proves the curve passes through the points, not that its parameters are DETERMINED: on synthetic fans with the exporter's own sag, a 45-60 deg arc fits the semi-axes 2-9% wrong, a >= 90 deg arc <= 0.65%, a half ellipse 0.03% (measured 2026-09-03; f-3's 53 deg boss arcs read rx 11.5 for a true 12). Shorter arcs stay raw."
   }
 }

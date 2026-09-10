@@ -15,7 +15,9 @@ Key facts it recovers (each one cost a real bug when missing):
   * Edge class per entity  -- linetype with BYLAYER resolved through the layer: Continuous =
     visible, HIDDEN = obscured, PHANTOM = section cut line, CENTER* = axis.
   * Views by clustering    -- bbox union-find; the cluster spanning the whole sheet is the FRAME
-    (title block), never a view. The frame is REPORTED (counts + its round primitives) rather than
+    (title block), never a view -- but only once it PROVES itself by containing every other
+    cluster (viewgraph.frame_plausible; a borderless sheet has NO frame and f-3's front view is
+    a view, not furniture). The frame is REPORTED (counts + its round primitives) rather than
     dropped, and a cluster lying wholly inside the title-block band that no dimension points at is
     tagged role="frame_item" -- the projection-method symbol and the weld symbol are not views.
   * A view's true extent   -- `geom_box` / `size` come from the VISIBLE silhouette with true arc
@@ -26,6 +28,18 @@ Key facts it recovers (each one cost a real bug when missing):
   * Title-block text       -- `frame_notes`, in reading order. NOT part information on a bare CAD
     template, but on a real industrial title block it IS the parameter table (length, width,
     thickness, material, scale, projection standard, weight). Separated, never dropped.
+  * Text inside note BLOCKS -- SolidWorks wraps some notes in INSERTs (SW_NOTE, BIEGETEILE ...)
+    whose MTEXT a top-level walk never sees: s-6's "Abwicklung / developed view" (the flat-pattern
+    label) and "Biegelinie / bending line", s-7's manufacturing notes were all being dropped.
+    Read as ROWS (the DWG route splits a row into per-glyph fragments; they are re-joined).
+  * Parametric ellipses    -- the exporter writes every non-circular curve as a fan of short LINEs
+    (a tilted hole's ellipse = 48 segments; 49% of f-3's payload). `curvefit` collapses a fan to
+    ONE ellipse record when the whole polyline lies within `fit_eps` of the fitted curve (the
+    fitter proposes, the residual decides); the real DXF ELLIPSE entity is read as the same
+    record. Anything the fit refuses stays raw.
+  * What was NOT read      -- `sheet.not_read` counts every entity class the reader saw and did
+    not emit (HATCH, SOLID, OLE2FRAME, geometry inside blocks: centre marks, hatch lines, symbols),
+    so nothing vanishes silently.
 
 Usage:
   python dxf_read.py <file.dxf>                 # print the draw-dialect JSON
@@ -48,19 +62,77 @@ import re
 import sys
 from collections import Counter
 
-try:
-    from ezdxf import recover
-except ImportError as _exc:      # NEVER sys.exit() here: this module is imported INTO a hosted
-    raise ImportError(           # MCP server, where exiting would kill the whole process.
-        "ezdxf is required for DXF reading - pip install ezdxf") from _exc
+def _ezdxf_recover():
+    """ezdxf, imported LAZILY at first read.
+
+    Deferred on purpose: everything in this module except `read()` itself is pure arithmetic over
+    values already pulled out of the file, and the 4th gate must be able to import those helpers
+    (e.g. `reconcile_angular`) on a machine with NO ezdxf -- CI runs exactly that way. Importing at
+    module level would silently drop those checks from CI, which is the failure class this project
+    least wants. NEVER sys.exit() here: this module is imported INTO a hosted MCP server, where
+    exiting would kill the whole process."""
+    try:
+        from ezdxf import recover
+    except ImportError as _exc:
+        raise ImportError(
+            "ezdxf is required for DXF reading - pip install ezdxf") from _exc
+    return recover
 
 try:                             # normal: imported as part of the `drawing` package
-    from . import contour, pairing
+    from . import contour, curvefit, pairing, viewgraph
 except ImportError:              # fallback: run directly as a script from this directory
     import contour
+    import curvefit
     import pairing
+    import viewgraph
 
-ANALYSIS_VERSION = "0.3.0"   # 0.3.0: title-block text EMITTED (frame_notes) instead of dropped;
+ANALYSIS_VERSION = "0.7.0"   # 0.7.0: the WIRE form (payload phase 1). Everything the model or the
+                             #        saved artifact carries goes through `wire.encode`, while the
+                             #        pipeline keeps the record shape it always had -- one boundary,
+                             #        no consumer touched. `lines` become {class: [[index, x1, y1,
+                             #        x2, y2], ...]} (the index is written IN, so a `seq` reference
+                             #        never has to be recomputed from group lengths), and a
+                             #        single-segment open chain collapses to [position, code,
+                             #        index] in `open_singles` -- but ONLY where id, class and
+                             #        direction are provably recoverable, else it stays a full
+                             #        record. Measured on the 10 samples: lines -49%, chains -65%.
+                             # 0.6.0: TIER B, phase 1 -- where a view's VISIBLE graph has NO free
+                             #        end the figure is a closed planar subdivision, so its outer
+                             #        boundary is DETERMINED and is walked by planar face traversal
+                             #        (ordering by TANGENT, not chord) and emitted as a loop tagged
+                             #        `tier: "B"`. Runs only where Tier A returned no visible outer
+                             #        loop, so it can never contradict Tier A; the direct-build
+                             #        path ignores it by design. Reaches 7 of 28 sample views --
+                             #        every one a view Tier A left empty, f-3's SECTION A-A among
+                             #        them. Also `view='v0,v2'`: several views in one pull.
+                             # 0.5.2: an ANGULAR dim is RECONCILED, not handed to `printed` --
+                             #        the DWG route corrupts EITHER candidate (usually the stored
+                             #        measurement as 180+theta, but f-3's rendered text as
+                             #        360-theta = 250 for a real 110). In all 7 angular dims of the
+                             #        sample set exactly one candidate is <= 180 and it is the true
+                             #        one every time; a drawing does not dimension a reflex angle.
+                             #        `reconcile_angular` + a 7-case gate-4 golden. ezdxf's import
+                             #        went LAZY so that golden can run in CI.
+                             # 0.5.1: the printed string keeps its SYMBOL -- AutoCAD %% control
+                             #        codes decoded (%%c->diameter, %%d->degree, %%p->+/-) instead
+                             #        of leaking raw into the payload; and a LINEAR dim whose
+                             #        override opens '%%c' is emitted as `diameter` + kind_from
+                             #        ='printed' (4 of 10 samples hand-fake a hole this way, so a
+                             #        reverse read was putting a length where a hole belonged).
+                             #        Bumped although the change is small: 0.3.0 silently named TWO
+                             #        readers (s-6/s-5 predate printed-arbitration, s-3/s-7 carry
+                             #        it), which is exactly how a stale artifact reads as a
+                             #        regression. Output changes => the version moves.
+                             # 0.5.0: PARAMETRIC ellipses -- exploded curve fans collapsed by a
+                             #        residual-gated fit (curvefit.py) and the real ELLIPSE entity
+                             #        read (f-3: 39.3 -> 20.2 KB); text inside note BLOCKS read as
+                             #        rows; sheet.not_read accounting; 3-decimal coordinates (1 um)
+                             # 0.4.0: the frame must PROVE itself (contain every other cluster) or
+                             #        the sheet has none -- f-3's borderless sheet had its front
+                             #        view eaten whole; alignment GRADED (span > mid > label,
+                             #        s-7's bevelled stack + cross-scale sections) and the solved
+                             #        view-axis graph emitted (view_graph)
+                             # 0.3.0: title-block text EMITTED (frame_notes) instead of dropped;
                              #        geom_box + true arc extents (size / alignment no longer
                              #        inflated); title-block furniture tagged role="frame_item";
                              #        the frame cluster itself reported instead of vanishing
@@ -79,8 +151,90 @@ def load_config():
 
 
 # --------------------------------------------------------------------------- helpers
-def _r(v, nd=4):
+def _r(v, nd=3):
+    """3 decimals = 1 um in TRUE mm, the house convention (a 4th decimal bought nothing and cost
+    3% of every payload)."""
     return round(float(v), nd)
+
+
+# Entity classes the reader consumes. Everything else it sees is COUNTED in sheet.not_read.
+_READ_TYPES = frozenset(("LINE", "ARC", "CIRCLE", "ELLIPSE", "DIMENSION", "MTEXT", "TEXT",
+                         "INSERT", "VIEWPORT"))
+
+
+def _text_of(e):
+    return (e.text if e.dxftype() == "MTEXT" else e.dxf.text) or ""
+
+
+def _walk_block(ins):
+    """Every entity inside an INSERT, nested blocks included, in WCS (ezdxf applies the insert
+    transform). A block the file does not define yields nothing."""
+    try:
+        for ve in ins.virtual_entities():
+            if ve.dxftype() == "INSERT":
+                yield from _walk_block(ve)
+            else:
+                yield ve
+    except Exception:
+        return
+
+
+def _block_rows(ins):
+    """Text inside a note block -> [(row_text, x, y)] in reading order.
+
+    A SolidWorks note block holds one MTEXT per line -- or, through the DWG route, one MTEXT per
+    GLYPH RUN (a Turkish 'AKSİ BELİRTİLMEDİĞİ' arrives as 'AKS', 'İ', 'BEL', 'İ', 'RT' ...). The
+    fragments of one row share a baseline; they are re-joined left to right, with a space only
+    where the gap after the previous fragment's estimated extent says there was one."""
+    frags = []
+    for ve in _walk_block(ins):
+        if ve.dxftype() in ("MTEXT", "TEXT"):
+            t = re.sub(r"\s+", " ", _text_of(ve).replace("\n", " ")).strip()
+            if t:
+                h = (ve.dxf.char_height if ve.dxftype() == "MTEXT" else ve.dxf.height) or 1.0
+                frags.append((t, ve.dxf.insert.x, ve.dxf.insert.y, h))
+    frags.sort(key=lambda f: (-f[2], f[1]))
+    rows = []
+    for f in frags:
+        if rows and abs(rows[-1][0][2] - f[2]) <= 0.5 * f[3]:
+            rows[-1].append(f)
+        else:
+            rows.append([f])
+    out = []
+    for row in rows:
+        row.sort(key=lambda f: f[1])
+        text, end = row[0][0], row[0][1] + 0.75 * row[0][3] * len(row[0][0])
+        for t, x, _y, h in row[1:]:
+            text += (" " if x - end > 0.35 * h else "") + t
+            end = x + 0.75 * h * len(t)
+        out.append((text, row[0][1], row[0][2]))
+    return out
+
+
+def _block_has_geometry(ins):
+    return any(ve.dxftype() not in ("MTEXT", "TEXT", "ATTRIB", "ATTDEF") for ve in _walk_block(ins))
+
+
+def ellipse_params(e):
+    """A DXF ELLIPSE -> (center, rx, ry, rot_deg, p1, p2, ccw) in PAPER mm; p1/p2 None = full.
+    Read through ezdxf's construction tool so a flipped extrusion cannot mirror the arc: the
+    endpoints and a mid-arc sample are taken in WCS, and the sweep sense is measured from them."""
+    ct = e.construction_tool()
+    maj = ct.major_axis
+    rx = math.hypot(maj.x, maj.y)
+    ry = rx * float(ct.ratio)
+    rot = math.degrees(math.atan2(maj.y, maj.x)) % 180.0
+    c = (float(ct.center.x), float(ct.center.y))
+    s, en = float(ct.start_param), float(ct.end_param)
+    span = (en - s) % (2.0 * math.pi)
+    if span < 1e-9:
+        return c, rx, ry, rot, None, None, True
+    p1, p2, pm = [(float(v.x), float(v.y)) for v in ct.vertices([s, en, s + span / 2.0])]
+    el = (c[0], c[1], rx, ry, rot)
+    t1, t2, tm = (curvefit.param_of(p, el) for p in (p1, p2, pm))
+    two_pi = 2.0 * math.pi
+    ccw = ((tm - t1) % two_pi) <= ((t2 - t1) % two_pi)
+    return c, rx, ry, rot, p1, p2, ccw
 
 
 def edge_class(doc, e):
@@ -110,7 +264,23 @@ def bbox(e):
     if t in ("CIRCLE", "ARC"):
         c, r = e.dxf.center, e.dxf.radius
         return (c.x - r, c.y - r, c.x + r, c.y + r)
+    if t == "ELLIPSE":
+        return _ellipse_extent(e)
     return None
+
+
+def _ellipse_extent(e):
+    """True extent of an ELLIPSE (arc) by sampling its construction tool -- exact enough for
+    clustering and for the visible-geometry box (64 samples: < 0.01 mm at any drawn size)."""
+    try:
+        ct = e.construction_tool()
+        pts = [(float(v.x), float(v.y)) for v in ct.vertices(ct.params(64))]
+    except Exception:
+        return None
+    if not pts:
+        return None
+    return (min(p[0] for p in pts), min(p[1] for p in pts),
+            max(p[0] for p in pts), max(p[1] for p in pts))
 
 
 # A drawing-scale ratio inside a view label ("A-A 1 : 1", "DETAIL B 2:1", "M 1:2"). Bare integers
@@ -135,19 +305,65 @@ def printed_text(doc, e):
         return None
     out = [(b.text if b.dxftype() == "MTEXT" else b.dxf.text)
            for b in doc.blocks[blk] if b.dxftype() in ("MTEXT", "TEXT")]
-    return " ".join(t for t in out if t).strip() or None
+    return _decode_cad_escapes(" ".join(t for t in out if t).strip()) or None
+
+
+# AutoCAD's %% control codes. They must be DECODED, not stripped: the symbol is evidence.
+# s-6 prints two dimensions as '%%c<>' -- DXF dimtype base 0, i.e. plain LINEAR entities whose
+# author typed a diameter prefix by hand. The entity type says "linear"; the drawing says
+# "diameter 60". R18 -- what the drawing PRINTS arbitrates -- so the symbol has to survive into
+# `printed`, where the reader of the payload can see it. The reader does NOT reclassify the
+# dimension on that evidence: two instances in one sample is not a rule.
+_CAD_ESCAPES = (("%%c", "Ø"), ("%%C", "Ø"),   # diameter
+                ("%%d", "°"), ("%%D", "°"),   # degree
+                ("%%p", "±"), ("%%P", "±"),   # plus/minus
+                ("%%%", "%"))
+
+
+def _decode_cad_escapes(txt):
+    if not txt:
+        return txt
+    for code, glyph in _CAD_ESCAPES:
+        txt = txt.replace(code, glyph)
+    return txt
 
 
 def printed_value(txt):
     """The number inside a printed dimension string, or None. Strips MTEXT formatting runs and the
-    CAD escapes (%%c diameter, %%d degree) and accepts a comma decimal separator."""
+    CAD symbols -- both as raw escapes (%%c diameter, %%d degree) and as the glyphs
+    `_decode_cad_escapes` turns them into -- and accepts a comma decimal separator."""
     if not txt:
         return None
     t = re.sub(r"\\[A-Za-z][^;]*;", " ", txt)
-    for junk in ("%%c", "%%C", "%%d", "%%D", "°", "{", "}"):
+    for junk in ("%%c", "%%C", "%%d", "%%D", "%%p", "%%P",
+                 "Ø", "°", "±", "{", "}"):
         t = t.replace(junk, " ")
     m = _NUM_RE.search(t)
     return float(m.group(0).replace(",", ".")) if m else None
+
+
+def reconcile_angular(computed, printed):
+    """Which of an ANGULAR dim's two candidates is the real angle. Returns (value, mismatch).
+
+    The DWG->DXF route loses an angular dimension's SIDE, and the damage lands on EITHER
+    candidate: usually the stored measurement comes back as 180+theta (s-7: a 7.9 deg bend reads
+    187.8765, a 45 deg weld bevel reads 225), but on f-3 it is the RENDERED BLOCK TEXT that is
+    wrong -- it prints 250 where the measurement, the ray geometry AND the view's own ellipse
+    foreshortening all say 110 (250 = 360 - 110, the explement).
+
+    Measured over every angular dimension in the sample set (7): 2 agree, 4 have a corrupt
+    measurement, 1 has corrupt printed text -- and in ALL SEVEN exactly one candidate is <= 180,
+    which is the true one every time. A mechanical drawing does not dimension a reflex angle. So
+    on disagreement take the candidate <= 180; if BOTH exceed it there is no evidence to choose on,
+    so keep the printed value (R18's default) and let the caller flag `printed_mismatch`."""
+    if printed is None:
+        return computed, False
+    if computed is None:
+        return printed, False
+    mismatch = abs(computed - printed) > max(0.01, 0.01 * abs(printed))
+    if mismatch and (computed <= 180.0) != (printed <= 180.0):
+        return (computed if computed <= 180.0 else printed), True
+    return printed, mismatch
 
 
 _CARDINALS = (0.0, 90.0, 180.0, 270.0)
@@ -179,7 +395,16 @@ def geom_bbox(doc, items):
     by definition: hidden geometry is obscured and therefore inside it, centre lines overhang by
     drafting convention, cut lines overhang too — and BREAK-VIEW furniture, drawn hidden on s-3,
     overhangs the silhouette on both sides. Arcs contribute their true extent (arc_bbox). Falls
-    back through hidden and then the raw cluster for a cluster with no visible primitive."""
+    back through hidden and then the raw cluster for a cluster with no visible primitive.
+
+    KNOWN GAP (measured, deliberately not patched): on a borderless sheet the section-arrow
+    apparatus (a lw-35 stroke + a lw=-1 arrowhead per end; real edges are lw 25) clusters INTO the
+    view that carries the cut line and inflates its measured size (f-3's 100x40 front view reads
+    124x49.6). Excluding it by cut-end proximity is UNSOUND — the cut line may run exactly along a
+    real edge (f-3 cuts at its own step height), and any transitive flood from the ends eats the
+    silhouette (f-2's front view measured 17x9 that way). The apparatus is symmetric about the cut
+    line, so the MIDPOINT alignment grade survives the inflation; a future exclusion must key on
+    the lineweight evidence, not on geometry."""
     for keep in (("visible",), ("visible", "hidden"), None):
         boxes = []
         for e, b in items:
@@ -221,7 +446,7 @@ def cluster(items, gap):
 
 # --------------------------------------------------------------------------- main read
 def read(path, cfg):
-    doc, auditor = recover.readfile(path)
+    doc, auditor = _ezdxf_recover().readfile(path)
     gap = cfg["tolerance"]["cluster_gap_mm"]
 
     # ---- scale: TRUE value = raw measurement x dimlfac (per dimstyle). ----------------
@@ -240,6 +465,34 @@ def read(path, cfg):
         for e in layout:
             ents.append(e)
 
+    # ---- what is NOT read, counted so it cannot vanish silently: HATCH/SOLID (fills), OLE2FRAME
+    #      (an embedded logo), and GEOMETRY inside blocks (centre-mark crosses, hatch-as-lines,
+    #      a rolling-direction symbol). Block TEXT is read (see `texts` below); the VIEWPORT is
+    #      the paper-space window, not drawing content.
+    not_read, block_geom = Counter(), Counter()
+    for e in ents:
+        t = e.dxftype()
+        if t == "INSERT":
+            name = e.dxf.name or ""
+            if _block_has_geometry(e):
+                block_geom[re.sub(r"[_\d]+$", "", name) or name] += 1
+        elif t not in _READ_TYPES:
+            not_read[t] += 1
+
+    # ---- every piece of TEXT on the sheet: top-level MTEXT/TEXT plus each ROW inside a note
+    #      block (rotation = the block's). One list, so the scale-label pass and the notes pass
+    #      cannot disagree about what text exists.
+    texts = []
+    for e in ents:
+        t = e.dxftype()
+        if t in ("MTEXT", "TEXT"):
+            texts.append((_text_of(e), e.dxf.insert.x, e.dxf.insert.y,
+                          getattr(e.dxf, "rotation", 0.0) or 0.0))
+        elif t == "INSERT":
+            rot = getattr(e.dxf, "rotation", 0.0) or 0.0
+            for row, x, y in _block_rows(e):
+                texts.append((row, x, y, rot))
+
     # A section CUT LINE overhangs the view it is drawn in, so it must not enlarge that view's
     # measured size (f-2's front view read 85.15 instead of 70 before this). It stays in the
     # geometry -- it is the evidence naming WHERE the section was taken -- just not in the bbox.
@@ -247,14 +500,24 @@ def read(path, cfg):
     cut_lines = [(e, bbox(e)) for e in ents if bbox(e) and edge_class(doc, e) == "cut_line"]
     clusters = cluster(geom, gap) if geom else []
 
-    # sheet extent = the biggest cluster's bbox (the border/title frame)
     def cbox(cl):
         xs = [b[0] for _, b in cl] + [b[2] for _, b in cl]
         ys = [b[1] for _, b in cl] + [b[3] for _, b in cl]
         return (min(xs), min(ys), max(xs), max(ys))
 
-    frame = max(clusters, key=lambda c: (cbox(c)[2] - cbox(c)[0]) * (cbox(c)[3] - cbox(c)[1])) if clusters else None
-    fb = cbox(frame) if frame else (0, 0, 0, 0)
+    # The FRAME candidate is the biggest cluster -- but it must PROVE itself by containing every
+    # other cluster (a border encloses the drawing by construction). f-3 has no border at all, and
+    # the unproven heuristic ate its FRONT VIEW whole: 152 lines + 8 arcs became "frame", seven
+    # dimensions went view-less and the projection pairs vanished. No proof -> the sheet has NO
+    # frame, and the candidate stays a view like any other.
+    frame = None
+    if clusters:
+        cand = max(clusters, key=lambda c: (cbox(c)[2] - cbox(c)[0]) * (cbox(c)[3] - cbox(c)[1]))
+        if viewgraph.frame_plausible(cbox(cand), [cbox(c) for c in clusters if c is not cand], gap):
+            frame = cand
+    # sheet extent = the frame's bbox; with no frame, the bbox of everything on the sheet
+    fb = cbox(frame) if frame else (
+        cbox([it for cl in clusters for it in cl]) if clusters else (0, 0, 0, 0))
     sheet_w, sheet_h = fb[2] - fb[0], fb[3] - fb[1]
 
     # ---- the TITLE BLOCK band. Its rows are ruled by horizontal lines spanning (nearly) the whole
@@ -324,6 +587,7 @@ def read(path, cfg):
                 v["ents"].append((e, b))
                 break
 
+
     # ---- PER-VIEW SCALE. A view may be drawn at its OWN scale — s-7 is a 1:10 sheet carrying a
     #      section labelled "A-A 1 : 1", so the sheet DIMLFAC is wrong for that view's geometry AND
     #      its dimensions by a factor of ten (a 9.5 mm weld-prep leg read as 95). The DIMSTYLEs
@@ -333,15 +597,12 @@ def read(path, cfg):
     #      otherwise the block's own "Maßstab 1:10" would be read as a view label.
     for v in views:
         v["scale"] = sheet_scale
-    for e in ents:
-        if e.dxftype() not in ("MTEXT", "TEXT"):
-            continue
-        m = _SCALE_RE.search(((e.text if e.dxftype() == "MTEXT" else e.dxf.text) or "").replace("\n", " "))
+    for raw, px, py, _rot in texts:
+        m = _SCALE_RE.search(raw.replace("\n", " "))
         if not m:
             continue
-        p = e.dxf.insert
         if (title_block_top is not None
-                and p.y <= title_block_top and p.x >= title_block_left):
+                and py <= title_block_top and px >= title_block_left):
             continue
         a, b = (float(m.group(i).replace(",", ".")) for i in (1, 2))
         if not (a > 0 and b > 0):
@@ -349,9 +610,9 @@ def read(path, cfg):
         best, bd = None, 0.1 * sheet_h
         for v in views:
             bx = v["box"]
-            if not bx[0] <= p.x <= bx[2]:
+            if not bx[0] <= px <= bx[2]:
                 continue
-            dist = bx[1] - p.y if p.y < bx[1] else p.y - bx[3] if p.y > bx[3] else 0.0
+            dist = bx[1] - py if py < bx[1] else py - bx[3] if py > bx[3] else 0.0
             if dist < bd:
                 best, bd = v, dist
         if best is not None:
@@ -362,7 +623,7 @@ def read(path, cfg):
     for vi, v in enumerate(views):
         x0, y0, x1, y1 = v["box"]
         vscale = v["scale"]                      # this VIEW's scale, not the sheet's (see above)
-        prims = {"lines": [], "arcs": [], "circles": []}
+        prims = {"lines": [], "arcs": [], "circles": [], "ellipses": []}
         # DEDUP at emit time. The SolidWorks DWG->DXF route is lossless but ADDITIVE: it re-emits a
         # section view's boundary geometry (f-2: 20->36 lines, 2->4 arcs; the direct DXF has none).
         # Duplicates make every shared endpoint look like a degree-4 junction, which would stop the
@@ -398,6 +659,17 @@ def read(path, cfg):
                      "d": _r(2 * e.dxf.radius * vscale), "c": k}
                 sig = ("c", k, p["cx"], p["cy"], p["d"])
                 bucket = "circles"
+            elif t == "ELLIPSE":
+                # The one curve the exporter keeps PARAMETRIC. Same record the fitter emits for
+                # a collapsed fan, minus n/fit -- their absence is the provenance.
+                c, rx, ry, rot, p1, p2, ccw = ellipse_params(e)
+                el = ((c[0] - x0) * vscale, (c[1] - y0) * vscale, rx * vscale, ry * vscale, rot)
+                if p1 is not None:
+                    p1 = ((p1[0] - x0) * vscale, (p1[1] - y0) * vscale)
+                    p2 = ((p2[0] - x0) * vscale, (p2[1] - y0) * vscale)
+                p = curvefit.make_record(el, k, p1, p2, ccw)
+                sig = ("e", k, p["cx"], p["cy"], p["rx"], p["ry"], p["rot"], p.get("t1"), p.get("t2"))
+                bucket = "ellipses"
             else:
                 continue
             if sig in seen:
@@ -405,6 +677,20 @@ def read(path, cfg):
                 continue
             seen.add(sig)
             prims[bucket].append(p)
+
+        # EXPLODED CURVE FANS -> parametric ellipses. Runs of short chords are fitted, and a run is
+        # replaced only when the whole polyline lies within fit_eps (PAPER mm x this view's scale)
+        # of the fitted curve -- the fitter proposes, the residual decides. Refused runs stay raw.
+        # Done BEFORE chaining so loops reference the collapsed arrays the model receives.
+        cf = cfg.get("curve_fit") or curvefit.DEFAULTS
+        prims["lines"], fitted = curvefit.collapse_fans(
+            prims["lines"], prims["arcs"], prims["ellipses"],
+            fit_eps=cf["fit_eps_paper_mm"] * vscale, chain_eps=chain_eps,
+            min_segments=cf["min_segments"], max_turn_deg=cf["max_turn_deg"],
+            min_sweep_deg=cf.get("min_sweep_deg", curvefit.DEFAULTS["min_sweep_deg"]))
+        prims["ellipses"] += fitted
+        if not prims["ellipses"]:
+            del prims["ellipses"]                 # omitted when empty: most views have none
 
         # paper_box is the CLUSTER box and stays the local-coordinate origin. It over-reports the
         # view (overhanging centre lines, an arc's circle box), so the view's SIZE and its
@@ -473,6 +759,18 @@ def read(path, cfg):
             kind = DIMKIND.get(int(e.dxf.dimtype) & 7, "?")
         except Exception:
             kind = "?"
+        # A HAND-FAKED DIAMETER. 4 of the 10 sample drawings dimension a hole with a plain LINEAR
+        # dimension across the circle and type the diameter symbol in front of it by hand, as the
+        # override '%%c<>'. The DXF entity then says "linear" while the drawing says "diameter 60",
+        # and a reverse read that believes the entity puts a 60 mm LENGTH where a 60 mm HOLE
+        # belongs. R18 -- what the drawing PRINTS arbitrates -- so the printed symbol decides the
+        # kind. The signature is mechanical (dimtype base 0 + an override opening with %%c), not a
+        # guess, and it is VALUE-NEUTRAL: the measured length across a circle already IS the
+        # diameter, so only `kind` moves. The value therefore keeps the LINEAR path below --
+        # linear scaling, and the linear printed-arbitration branch that prefers the computed
+        # value's extra decimals -- and is relabelled only where the dimension is emitted.
+        override = getattr(e.dxf, "text", "") or ""
+        faked_diameter = kind == "linear" and override.lstrip().lower().startswith("%%c")
         # The OWNING VIEW's scale wins over the dimstyle's DIMLFAC: s-7 puts every dimension,
         # including the 1:1 section's, on a dimstyle carrying the sheet's factor of 10.
         owner = which_view(pts[-1][0], pts[-1][1]) if pts else None
@@ -500,20 +798,27 @@ def read(path, cfg):
                 vs = view_scale.get(best[1].split(":")[0], sheet_scale)
                 value = _r(best[0] * vs * (2.0 if kind == "diameter" else 1.0))
                 measures = best[1]
-        # The PRINTED text ARBITRATES. For an angular or a radius/diameter dim it simply wins —
-        # both are unreliable through the DWG route, and the printed string is what the drafter
-        # signed off on. For a linear dim the computed value stays (it carries more decimals than
-        # the printed rounding), but a disagreement beyond rounding is REPORTED, never swallowed.
+        # The PRINTED text ARBITRATES. For a radius/diameter dim it simply wins -- both are
+        # unreliable through the DWG route, and the printed string is what the drafter signed off
+        # on. An ANGULAR dim is the exception: EITHER candidate can be the corrupted one, so it
+        # goes through `reconcile_angular` (see there for the measurement that settled the rule).
+        # For a linear dim the computed value stays (it carries more decimals than the printed
+        # rounding), but a disagreement beyond rounding is REPORTED, never swallowed.
         printed = printed_text(doc, e)
         pv = printed_value(printed)
         mismatch = False
         if pv is not None:
-            if kind in ("angular", "angular3p", "radius", "diameter"):
+            if kind in ("angular", "angular3p"):
+                value, mismatch = reconcile_angular(value, pv)
+                value = _r(value)
+            elif kind in ("radius", "diameter"):
                 mismatch = value is not None and abs(value - pv) > max(0.01, 0.01 * abs(pv))
                 value = _r(pv)
             elif value is not None:
                 mismatch = abs(value - pv) > max(0.05, 0.01 * abs(pv))
-        d = {"value": value, "kind": kind, "defpts": pts}
+        d = {"value": value, "kind": "diameter" if faked_diameter else kind, "defpts": pts}
+        if faked_diameter:
+            d["kind_from"] = "printed"     # the ENTITY said linear; the printed symbol overruled it
         if printed:
             d["printed"] = printed
         if mismatch:
@@ -522,20 +827,23 @@ def read(path, cfg):
             d["measures"] = measures
         if owner:
             d["view"] = owner
-        txt = getattr(e.dxf, "text", "") or ""
-        if txt not in ("<>", ""):
-            d["text"] = txt          # e.g. '8x <>' (count prefix) or '%%c<>' (diameter)
+        if override not in ("<>", ""):
+            d["text"] = override     # RAW code-1, undecoded: '8x <>' (count prefix), '%%c<>'
         dims.append(d)
 
     # ---- notes: bend annotations, free notes, section labels ---------------------------
     bend_re = re.compile(cfg["sheet_metal"]["bend_note_pattern"], re.I)
     notes, frame_notes, bends = [], [], []
-    for e in ents:
-        if e.dxftype() not in ("MTEXT", "TEXT"):
-            continue
-        txt = (e.text if e.dxftype() == "MTEXT" else e.dxf.text) or ""
+
+    class _P:                                     # the insert point, top-level or block row
+        __slots__ = ("x", "y")
+
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+
+    for txt, px, py, rot in texts:
         t = re.sub(r"\s+", " ", txt.replace("\n", " ")).strip()
-        p = e.dxf.insert
+        p = _P(px, py)
         if not t:
             continue
         # Inside the title block / sheet margin. This used to be a DELETE, and it was wrong: on a
@@ -544,12 +852,13 @@ def read(path, cfg):
         # LENGTH (`l=338`, the only source, since the drawing is a break view), the projection
         # standard (`ISO-E`), the sheet scale (`1:2`), the description (`Blech`) and the weight
         # (`0,464 kg`, a free independent check on the whole reading). So: separated, never dropped.
-        in_frame = (p.y < fb[1] + 0.25 * sheet_h or p.y > fb[3] - 0.03 * sheet_h
-                    or p.x < fb[0] + 0.03 * sheet_w or p.x > fb[2] - 0.03 * sheet_w)
+        in_frame = frame is not None and (
+            p.y < fb[1] + 0.25 * sheet_h or p.y > fb[3] - 0.03 * sheet_h
+            or p.x < fb[0] + 0.03 * sheet_w or p.x > fb[2] - 0.03 * sheet_w)
         m = bend_re.match(t.replace("°", " ").replace("  ", " ").strip()) or bend_re.match(t)
         if m:
             bends.append({"dir": m.group(1).upper(), "angle_deg": float(m.group(2)),
-                          "radius": float(m.group(3)), "rot": _r(getattr(e.dxf, "rotation", 0.0) or 0.0, 2),
+                          "radius": float(m.group(3)), "rot": _r(rot, 2),
                           "at": [_r(p.x, 2), _r(p.y, 2)], "view": which_view(p.x, p.y)})
         elif not in_frame:
             notes.append({"text": t, "at": [_r(p.x, 2), _r(p.y, 2)], "view": which_view(p.x, p.y)})
@@ -593,15 +902,32 @@ def read(path, cfg):
     #      config['projection']. Compared on GEOM_BOX, not paper_box: the cluster box carries
     #      overhanging centre lines and whole-circle arc boxes, which moved s-3's front view 20 mm
     #      off its own side view and lost a pair that is exact to 0.01 mm. Furniture never pairs.
-    align = []
     real = [v for v in out_views if v["role"] == "view"]
-    for i in range(len(real)):
-        for j in range(i + 1, len(real)):
-            a, b = real[i]["geom_box"], real[j]["geom_box"]
-            if abs(a[0] - b[0]) < 0.5 and abs(a[2] - b[2]) < 0.5:
-                align.append({"a": real[i]["vid"], "b": real[j]["vid"], "shares": "x"})
-            elif abs(a[1] - b[1]) < 0.5 and abs(a[3] - b[3]) < 0.5:
-                align.append({"a": real[i]["vid"], "b": real[j]["vid"], "shares": "y"})
+    align = viewgraph.compute_alignment(real)
+
+    # The solved view-axis graph -- {view paper axis -> anonymous part axis}, emitted only when the
+    # pair evidence exists. Axes stay ax0/ax1/ax2 on purpose: WHICH is width/height/depth and which
+    # view is "front" is the projection convention's sign + the model's call (recipe R4), never the
+    # reader's. A detail/section at its own scale re-shows existing geometry and stays out.
+    # No view_graph on a flat-pattern sheet (bend notes present): those drawings belong to the
+    # direct-build gate, and a bent-state companion view is another STATE of the part, not another
+    # projection -- s-2's 30x60 bent view midpoint-aligns with its 20x99 flat and would "solve"
+    # to a wrong axis graph presented as fact.
+    view_graph = None
+    if align and not bends:
+        view_graph = viewgraph.solve_view_graph(
+            [{"vid": v["vid"], "size": v["size"]} for v in real if "scale_factor" not in v],
+            align)
+
+    # Section LABELS pair a section view to the view carrying its cut line even where box math
+    # cannot (a cross-scale section never shares a span). Facts stack: a same-scale aligned section
+    # may appear both as a span pair and as a label pair.
+    def _has_cut(v):
+        return any(p["c"] == "cut_line"
+                   for arr in v["geometry"].values() for p in arr)
+    align += viewgraph.pair_sections(
+        [{"vid": v["vid"], "role": v["role"], "has_cut_line": _has_cut(v)} for v in out_views],
+        notes)
 
     # ---- the FRAME cluster is not emitted as a view (it is the border + title block), but it must
     #      not VANISH either: on s-3 it silently swallowed the projection symbol's two concentric
@@ -626,9 +952,16 @@ def read(path, cfg):
             "scale_factor": sheet_scale,      # TRUE = paper x this  (DIMLFAC)
             "paper_box": [_r(fb[0], 2), _r(fb[1], 2), _r(fb[2], 2), _r(fb[3], 2)],
             "audit_errors": len(auditor.errors),
+            # entity classes seen and NOT emitted (block text IS read; block geometry is not)
+            "not_read": {**{k: not_read[k] for k in sorted(not_read)},
+                         **({"INSERT": {k: block_geom[k] for k in sorted(block_geom)}}
+                            if block_geom else {})},
         },
         "frame": {
-            "paper_box": [_r(fb[0], 2), _r(fb[1], 2), _r(fb[2], 2), _r(fb[3], 2)],
+            # paper_box None = NO border/title block on this sheet (nothing contained the other
+            # clusters, so the big-cluster candidate stayed a view -- see frame_plausible).
+            "paper_box": ([_r(fb[0], 2), _r(fb[1], 2), _r(fb[2], 2), _r(fb[3], 2)]
+                          if frame is not None else None),
             "title_block_top": _r(title_block_top, 2) if title_block_top is not None else None,
             "title_block_left": _r(title_block_left, 2) if title_block_left is not None else None,
             "primitives": {"lines": fcount.get("LINE", 0), "arcs": fcount.get("ARC", 0),
@@ -638,6 +971,7 @@ def read(path, cfg):
         },
         "views": out_views,
         "alignment": align,
+        **({"view_graph": view_graph} if view_graph is not None else {}),
         "dimensions": dims,
         "bend_notes": bends,
         "notes": notes,

@@ -26,8 +26,17 @@ from __future__ import annotations
 
 import math
 
+try:                             # normal: imported as part of the `drawing` package
+    from . import curvefit
+except ImportError:              # fallback: imported flat (the offline gate, scripts)
+    import curvefit
+
 # Closed vocabularies (LOOP_ROLES / SEQ_CODES / PRIMITIVE_KINDS) live in vocab.py, which the
 # contract test diffs against draw-dialect.schema.json.
+#
+# Since 0.5.0 a view may carry `ellipses` (code "e"): a FULL ellipse is a closed loop of one entity
+# exactly like a circle; an ellipse ARC carries endpoints (x1..y2) and chains like an arc, its
+# bulge measured on the PARAMETRIC sweep (curvefit.segment_area).
 
 
 # --------------------------------------------------------------------------- geometry helpers
@@ -85,6 +94,7 @@ def chain_view(view, eps_mm=0.01):
     """
     g = view.get("geometry") or {}
     lines, arcs, circles = g.get("lines", []), g.get("arcs", []), g.get("circles", [])
+    ellipses = g.get("ellipses", [])
 
     # A CIRCLE is a closed loop of one entity by definition -- it never enters the walk.
     loops = []
@@ -95,6 +105,15 @@ def chain_view(view, eps_mm=0.01):
                       "poly": [(c["cx"] + r, c["cy"]), (c["cx"], c["cy"] + r),
                                (c["cx"] - r, c["cy"]), (c["cx"], c["cy"] - r)],
                       "probe": (c["cx"], c["cy"]), "seq": [["c", i, 1]]})
+    # ... and so is a FULL ellipse (no t1): area pi*rx*ry exactly, extremes as its chord polygon.
+    for i, e in enumerate(ellipses):
+        if "t1" in e:
+            continue
+        el = curvefit.record_ellipse(e)
+        loops.append({"class": e["c"], "area": math.pi * e["rx"] * e["ry"],
+                      "bbox": list(curvefit.ellipse_bbox(el)),
+                      "poly": [curvefit.point_at(el, t) for t in (0.0, 90.0, 180.0, 270.0)],
+                      "probe": (e["cx"], e["cy"]), "seq": [["e", i, 1]]})
 
     segs = []   # (code, index, class, p_start, p_end, payload)
     for i, l in enumerate(lines):
@@ -102,6 +121,9 @@ def chain_view(view, eps_mm=0.01):
     for i, a in enumerate(arcs):
         s, e = _arc_ends(a)
         segs.append(("a", i, a["c"], s, e, a))
+    for i, e in enumerate(ellipses):
+        if "t1" in e:
+            segs.append(("e", i, e["c"], (e["x1"], e["y1"]), (e["x2"], e["y2"]), e))
 
     open_chains = []
     for cls in sorted({s[2] for s in segs}):
@@ -121,9 +143,19 @@ def chain_view(view, eps_mm=0.01):
             head, tail = sub[seed][3], sub[seed][4]
 
             def _grow(at, backwards):
-                """Extend from point `at`; returns the new free endpoint (or None when stuck)."""
-                cands = [si for si in inc.get(_key(at, eps_mm), []) if si not in used]
-                if len(cands) != 1:          # 0 = dead end, >1 = ambiguous junction: never guess
+                """Extend from point `at`; returns the new free endpoint (or None when stuck).
+
+                The degree is counted over EVERY segment incident at the point, used or not:
+                a T-junction is a junction no matter which of its branches some earlier chain
+                already consumed. Counting only the unused ones made the result depend on the
+                seed ORDER -- f-3's front outline "closed" through a boss-foot T only because
+                the outline's own continuation had been eaten by another chain first, and the
+                same drawing chained differently once the array indices shifted (0.5.0)."""
+                here = inc.get(_key(at, eps_mm), [])
+                if len(here) != 2:           # 1 = dead end, >2 = junction: never guess
+                    return None
+                cands = [si for si in here if si not in used]
+                if len(cands) != 1:
                     return None
                 si = cands[0]
                 used.add(si)
@@ -139,9 +171,10 @@ def chain_view(view, eps_mm=0.01):
 
             closed = False
             while True:
-                # len>1 for a real chain; a single ARC with coincident ends is a full circle.
+                # len>1 for a real chain; a single ARC (or ellipse arc) with coincident ends is a
+                # full turn.
                 if _key(tail, eps_mm) == _key(head, eps_mm) and (len(chain) > 1
-                                                                 or sub[seed][0] == "a"):
+                                                                 or sub[seed][0] in ("a", "e")):
                     closed = True
                     break
                 nxt = _grow(tail, backwards=False)
@@ -185,9 +218,15 @@ def chain_view(view, eps_mm=0.01):
                  for lp in loops]
     for i, oc in enumerate(open_chains):
         oc["id"] = "O%d" % i
-    return {"loops": out_loops,
-            "open_chains": [{"id": oc["id"], "class": oc["class"], "seq": oc["seq"]}
-                            for oc in open_chains]}
+    chained = {"loops": out_loops,
+               "open_chains": [{"id": oc["id"], "class": oc["class"], "seq": oc["seq"]}
+                               for oc in open_chains]}
+    # TIER B (phase 1): where the visible graph is a CLOSED subdivision and Tier A returned no
+    # outer loop, the boundary is determined and can be walked -- see `outer_face`.
+    tier_b = outer_face(view, chained, eps_mm)
+    if tier_b is not None:
+        chained["loops"].append(tier_b)
+    return chained
 
 
 def _measure(chain, sub, seq, cls):
@@ -203,6 +242,11 @@ def _measure(chain, sub, seq, cls):
             ccw = (payload.get("dir", 1) * d) > 0
             theta = _sweep(payload["cx"], payload["cy"], a, b, ccw)
             extra += (1 if ccw else -1) * _segment_area(payload["r"], theta)
+        elif code == "e":
+            ccw = (payload.get("dir", 1) * d) > 0
+            el = curvefit.record_ellipse(payload)
+            theta = curvefit.sweep_param(el, a, b, ccw)
+            extra += (1 if ccw else -1) * curvefit.segment_area(el, theta)
     shoelace = 0.0
     for i in range(len(verts)):
         x0, y0 = verts[i]
@@ -214,6 +258,128 @@ def _measure(chain, sub, seq, cls):
     return {"class": cls, "area": abs(area), "seq": seq,
             "bbox": [min(xs), min(ys), max(xs), max(ys)],
             "poly": verts, "probe": verts[0]}
+
+
+def _leave_angle(entry, d):
+    """The direction a half-edge LEAVES its start vertex, as an angle. Tangent, not chord.
+
+    This is the whole correctness question for Tier B: the face walk picks the next edge by
+    angular order at a junction, so an arc leaving on a chord bearing that differs from its real
+    tangent can order wrongly and hand back a WRONG contour with no error anywhere -- the exact
+    silent-failure class R17 exists to prevent. A line's tangent is its chord; an arc's is
+    perpendicular to its radius, signed by the sweep sense; an ellipse arc's is sampled off its
+    own parameterisation."""
+    code, _idx, _c, ps, pe, payload = entry
+    a, b = (ps, pe) if d == 1 else (pe, ps)
+    if code == "l":
+        return math.atan2(b[1] - a[1], b[0] - a[0])
+    if code == "a":
+        ccw = (payload.get("dir", 1) * d) > 0
+        rad = math.atan2(a[1] - payload["cy"], a[0] - payload["cx"])
+        return rad + (math.pi / 2.0 if ccw else -math.pi / 2.0)
+    # ellipse arc: sample a short step along its own parameter, in the traversal sense
+    el = curvefit.record_ellipse(payload)
+    ccw = (payload.get("dir", 1) * d) > 0
+    t0 = curvefit.param_of(a, el)
+    nxt = curvefit.point_at(el, t0 + (0.5 if ccw else -0.5))
+    return math.atan2(nxt[1] - a[1], nxt[0] - a[0])
+
+
+def outer_face(view, chained, eps_mm=0.01):
+    """TIER B, phase 1: recover a view's OUTER boundary by planar face traversal.
+
+    Tier A stops at every junction of three or more, which is right -- it must never guess. But
+    where a view's visible graph has NO FREE END, the figure is already a closed planar
+    subdivision, and its faces are then DEFINED by the angular order of the edges at each vertex.
+    "Take the next edge in angular order" is not a heuristic there; it is what a face IS. So this
+    adds no guessing to the pipeline -- it reads a boundary that was fully determined all along
+    and that Tier A simply declines to walk.
+
+    Deliberately narrow (phase 1, decided with the user):
+      * VISIBLE edges only -- the part's silhouette, never hidden/centre/cut-line furniture.
+      * runs ONLY when no vertex has degree 1. One free end means a dangling edge, the
+        subdivision is not closed, and the faces are no longer determined. Those views wait for
+        phase 2.
+      * runs ONLY when Tier A found no visible OUTER loop, so this can never duplicate or
+        contradict a Tier A answer -- it only fills a hole where Tier A returned nothing.
+    The outer boundary is the face whose SIGNED area is negative with the largest magnitude:
+    bounded faces come out of this walk with one orientation and the unbounded one with the
+    other. Verified against the value f-3's v0 outline was independently reported to have
+    (3993.1327 mm^2, 8 primitives).
+
+    Returns a loop dict tagged `tier: "B"`, or None.
+    """
+    if any(lp["class"] == "visible" and lp["role"] == "outer" for lp in chained["loops"]):
+        return None
+    g = view.get("geometry") or {}
+    sub = []
+    for i, l in enumerate(g.get("lines", [])):
+        if l["c"] == "visible":
+            sub.append(("l", i, l["c"], (l["x1"], l["y1"]), (l["x2"], l["y2"]), l))
+    for i, a in enumerate(g.get("arcs", [])):
+        if a["c"] == "visible":
+            s, e = _arc_ends(a)
+            sub.append(("a", i, a["c"], s, e, a))
+    for i, e in enumerate(g.get("ellipses", [])):
+        if e["c"] == "visible" and "t1" in e:
+            sub.append(("e", i, e["c"], (e["x1"], e["y1"]), (e["x2"], e["y2"]), e))
+    if len(sub) < 3:
+        return None
+
+    deg, out = {}, {}
+    for si, s in enumerate(sub):
+        for p in (s[3], s[4]):
+            deg[_key(p, eps_mm)] = deg.get(_key(p, eps_mm), 0) + 1
+    if any(v == 1 for v in deg.values()):      # a free end: not a closed subdivision
+        return None
+    for si, s in enumerate(sub):
+        out.setdefault(_key(s[3], eps_mm), []).append((si, 1))
+        out.setdefault(_key(s[4], eps_mm), []).append((si, -1))
+
+    def end_key(h):
+        si, d = h
+        return _key(sub[si][4] if d == 1 else sub[si][3], eps_mm)
+
+    seen, best = set(), None
+    for seed in [(si, d) for si in range(len(sub)) for d in (1, -1)]:
+        if seed in seen:
+            continue
+        face, h = [], seed
+        while h not in seen:
+            seen.add(h)
+            face.append(h)
+            at = end_key(h)
+            # The direction pointing BACK down the edge just traversed. Reversing the half-edge
+            # gives the tangent leaving the far vertex; back is simply that direction itself.
+            back = _leave_angle(sub[h[0]], -h[1])
+            cands = [c for c in out.get(at, []) if c != (h[0], -h[1])] or out.get(at, [])
+            if not cands:
+                face = []
+                break
+            h = max(cands, key=lambda c: (_leave_angle(sub[c[0]], c[1]) - back) % (2 * math.pi))
+        if len(face) < 3:
+            continue
+        m = _measure(face, sub, [[sub[si][0], sub[si][1], d] for si, d in face], "visible")
+        signed = _signed_area(face, sub)
+        if signed < 0 and (best is None or m["area"] > best[0]["area"]):
+            best = (m, face)
+    if best is None:
+        return None
+    m = best[0]
+    return {"id": "B0", "class": "visible", "role": "outer", "parent": None, "tier": "B",
+            "area": round(m["area"], 4), "bbox": [round(v, 4) for v in m["bbox"]],
+            "seq": m["seq"]}
+
+
+def _signed_area(face, sub):
+    """Shoelace over the traversal's chord polygon -- SIGN only (the exact magnitude, arc bulges
+    included, comes from _measure). The unbounded face traverses opposite to the bounded ones."""
+    s = 0.0
+    for si, d in face:
+        ps, pe = sub[si][3], sub[si][4]
+        a, b = (ps, pe) if d == 1 else (pe, ps)
+        s += a[0] * b[1] - b[0] * a[1]
+    return s / 2.0
 
 
 def loop_member_segments(chained):

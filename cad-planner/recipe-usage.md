@@ -1,8 +1,10 @@
 # recipe-usage.md — The IR Generation Recipe (usage edition)
 
-**Version: 0.22.0** · Owner: cad-planner · Served to the model section-by-section as MCP
-**resources** — one static `recipe://usage/<slug>` per section, indexed by
-`recipe://usage/index` (ADR-069, 2026-07-30; previously the `get_recipe` tool). This is the
+**Version: 0.27.0** · Owner: cad-planner · Served to the model section-by-section through
+**TWO channels reading this same file**: the **`get_recipe(section)` TOOL** — the one the model
+can actually call, restored 2026-09-03 (ADR-077) — and the `recipe://usage/<slug>` **MCP
+resources**, indexed by `recipe://usage/index` (ADR-069). Resources live in the CLIENT's
+action space, not the model's: where a host provides no bridge, the tool is the only way in. This is the
 operational rule set for turning an analysis artifact's recipe into a Feature Graph IR (and for
 producing reconstructable drawings). Sections are addressed by the slug in each `##` header.
 
@@ -298,60 +300,64 @@ frozen rules to a DXF job.
 
 ## reverse — Drawing (DXF/DWG) → part reconstruction
 
-The input is a **2D DXF** (a DWG is converted to DXF first — the SolidWorks route is lossless for
-every field below, though ADDITIVE: it duplicates section-view geometry, which the reader dedups).
-Read it with the `draw`-dialect analysis tool: it hands over sheet scale, views, per-view geometry
-with an EDGE CLASS, **contours already chained into closed loops**, true-valued dimensions, and notes.
-These rules are v1 — each one was USED in a reconstruction that came back topology-exact (f-1, s-1,
-f-2, s-2, 2026-07-27).
+**What the payload MEANS is documented on `analyze_drawing` itself** — the fields, the edge classes,
+the loop/`seq` encoding, the ellipse records, the two answer shapes. That description reaches you
+whether or not you ever call this tool, which is exactly why it lives there. **This section is the
+DECISIONS**: what to do with those numbers, and which mistakes are silent. One home each; nothing is
+said twice.
 
-**Read R16 FIRST.** The tool answers in one of two shapes, and the shape tells you which job you have.
+The input is a **2D DXF** (a DWG is converted first — lossless, but ADDITIVE: it duplicates
+section-view geometry, which the reader dedups). Read the answer's shape first: `DIRECT_BUILDABLE`
+means every decision was forced by the drawing and it is already lowered, so check the summary and
+build. `NOT_DIRECT | <reason>` means a decision was left open, the reason names which, and the rest
+of this section is how you close it.
 
-**R1 — Apply the scale before anything else — and it is PER VIEW, not per sheet.** A DXF dimension's
-stored value is PAPER space. The TRUE value is `value × scale` (DXF `DIMLFAC`; the tool already applies
-it, and view sizes and geometry are emitted in TRUE mm). A 1:2 sheet reads 50 for a 100 mm part — an
-unscaled read silently builds a half-size part and every downstream check still "passes". Two riders:
+**R1 — The numbers are TRUE mm already. Never scale a second time.** The reader applied `DIMLFAC`,
+per view, before you saw anything. Multiplying again silently builds a half- or double-size part and
+every downstream check still "passes". Where a view carries its own `scale_factor` (a detail or
+section drawn at a different ratio from the sheet), SAY which factor produced a number before you
+quote it.
 
-- A VIEW MAY CARRY ITS OWN SCALE. A detail or section labelled `A-A 1 : 1` on a 1:10 sheet is drawn at
-  1:1, and the sheet factor is wrong for it by ten. The reader reads the ratio from the view's own
-  LABEL and reports `view.scale_factor` when it differs from the sheet's; its geometry and its
-  dimensions are then scaled with THAT factor. Where a view carries a `scale_factor`, say so before
-  using any number from it.
-- AN ANGLE IS NEVER SCALED. `DIMLFAC` is a length factor; an angular dimension is dimensionless.
+**R2 — The edge CLASS is data, never appearance.** A feature drawn with VISIBLE lines is on the face
+that view shows; the same feature drawn HIDDEN is on the far side. This one test places a pocket on
+the correct face (R6) — never plausibility.
 
-**R2 — The edge CLASS is data, never appearance.** Every primitive carries `c`: `visible` (a real edge
-on the near side) · `hidden` (obscured — a real feature seen through material) · `cut_line` (a
-section's cutting line, not part geometry) · `center` (an axis). Consequence: a feature drawn with
-VISIBLE lines is on the face that view shows; the same feature drawn HIDDEN is on the far side. This
-one test places a pocket on the correct face (R6).
+**R2b — A loop is a fact; an open chain is a question.** A closed loop may be built on. An open chain
+is a real segment belonging to no contour — a bend line, a centre line, or a silhouette fragment the
+chainer stopped at a T-junction. It is never an invitation to close the loop yourself (R17).
 
-**R2b — Contours arrive CHAINED; a loop is a fact, an open chain is a question.** Each view carries
-`loops[]` (closed contours: `role` outer|inner, `parent`, exact `area` with arc bulges included, and
-`seq` — the primitives IN ORDER, as index references) and `open_chains[]` (everything that closed into
-nothing). An open chain is a real segment belonging to no contour: a bend line, a centre line, or an
-ortho silhouette fragment the chainer stopped at a T-junction. It is never an invitation to close the
-loop yourself — see R17.
+**R2c — An ellipse is a MEASUREMENT of the third dimension.** A circle on a plane tilted by θ
+projects to an ellipse whose MAJOR axis is the true radius, with `ry/rx = cos θ`. Read the tilt off
+it, then CROSS-CHECK against an angular dimension: two independent measurements agreeing is the
+strongest statement a drawing can make about a tilt, and it is free.
 
-**R3 — The frame is not a view; the TITLE BLOCK is a parameter TABLE, not junk.** The border/title
-block is one cluster the size of the sheet — never a view. A cluster fully INSIDE another view's box is
-a FEATURE of that view (a hole, a slot), not a separate view; a cluster sitting in the title-block
-corner that no dimension points at is furniture and arrives as `role: "frame_item"` (a projection
-symbol, a weld symbol, the oval around a check dimension). But the TEXT down there is often the most
-important evidence on the sheet, and it arrives separately as **`frame_notes`**, in reading order:
+A short fitted run pins its parameters badly even at a good residual — the residual proves the curve
+passes through the points, not that the parameters are determined. And the IR has NO primitive for a
+PARTIAL ellipse: a FULL one lowers to `ellipse`; an ellipse ARC must cross as a sampled spline or be
+declared a gap (R17). Never round one to a circular arc — it changes the geometry with no error
+anywhere.
 
-- Read it as a TABLE: a label and its value share an x, one row apart. On a real industrial block that
-  is where LENGTH, WIDTH, THICKNESS, MATERIAL, the standard, the DESCRIPTION, the SCALE, the
-  PROJECTION METHOD and the WEIGHT live. On a break view the title-block length is the ONLY length
-  there is (R19).
-- A field whose value is IDENTICAL across DIFFERENT parts is template boilerplate, not part data —
-  a check dimension repeating `257 ±0.1` on five unrelated drawings is not a feature.
-- Still do not trust a title-block LABEL over geometry where the two overlap: the f-1/f-2 template
-  prints "A3" on a 210×297 (A4) sheet.
+**R3 — The TITLE BLOCK is a parameter TABLE, not junk.** Read `frame_notes` as a table: a label and
+its value share an x, one row apart. On a real industrial block that is where LENGTH, WIDTH,
+THICKNESS, MATERIAL, the standard, the DESCRIPTION, the SCALE, the PROJECTION METHOD and the WEIGHT
+live. On a break view the title-block length is the ONLY length there is (R19). Three riders:
 
-**R4 — Alignment gives the axis; the PROJECTION STANDARD gives the sign.** Two views sharing their
-paper-X span are a vertical projection pair; sharing paper-Y, a horizontal pair. That much is
-convention-independent. What the convention decides is WHICH physical face a placed view shows, and it
-is read from config (`projection`), never guessed:
+- A field whose value is IDENTICAL across DIFFERENT parts is template boilerplate, not part data — a
+  check dimension repeating `257 ±0.1` on five unrelated drawings is not a feature.
+- Do not trust a title-block LABEL over geometry where the two overlap: a template prints "A3" on a
+  210×297 (A4) sheet.
+- A constraint stated in a note OVERRIDES a naive read of the geometry. "Only bended sheet geometry
+  is valid" means the flat pattern is not the authority; do not build the blank as if the bent
+  dimensions were advisory.
+
+**Read `sheet.not_read` before concluding anything is absent.** A HATCH is usually a section fill and
+costs nothing, but a named block you cannot account for (a rolling-direction symbol, say) is evidence
+that EXISTS on the sheet and did not reach you. Say so rather than reporting a clean read.
+
+**R4 — Alignment gives the axis; the PROJECTION STANDARD gives the sign.** The reader grades the
+pairs and, where they pin every view's axes, solves the view graph over ANONYMOUS axes. What no field
+decides is the NAME: which axis is depth and which view is "front" is the convention's SIGN, read
+from config (`projection`), never guessed:
 
 - **first_angle (ISO/European — the configured default):** the view BELOW the front view is the TOP
   view, and the object's **BACK** is the edge ADJACENT to the front view (that view's top edge).
@@ -360,42 +366,40 @@ is read from config (`projection`), never guessed:
 A wrong sign builds VALID geometry with no error — only a comparison catches it. State the front/back
 (and left/right) assignment EXPLICITLY before placing any depth-axis feature.
 
-**R5 — The base profile comes from ONE view; the other views only place things along the third axis.**
-Build the outline — chamfers and corner radii included as sketch primitives, since a profile corner of
-a prism is geometrically identical to an edge feature — from the view that shows it, extrude it by the
-depth an adjacent view gives, then position the remaining features. In-plane coordinates carry no
-convention risk; only the extrusion axis does (R4). f-1 and f-2 were both built this way.
+**R5 — The base profile comes from ONE view; the other views only place things along the third
+axis.** Build the outline — chamfers and corner radii included as sketch primitives, since a profile
+corner of a prism is geometrically identical to an edge feature — from the view that shows it,
+extrude it by the depth an adjacent view gives, then position the remaining features. In-plane
+coordinates carry no convention risk; only the extrusion axis does (R4). Transcribe the outline from
+the loop's own `seq`, in the order given, and use the loop's exact `area` for R13 instead of
+recomputing it.
 
-Transcribe the outline from the loop's own `seq`, in the order given: consecutive entries already
-share an endpoint exactly, so a line/arc chain maps 1:1 onto a sketch path profile with no
-re-derivation (an arc even carries its endpoints and sweep sense). The loop's `area` is exact — use it
-for R13 instead of recomputing.
-
-**R6 — Which FACE a pocket or groove sits on is decided by R2, not by plausibility.** f-2's channel is
-drawn with VISIBLE lines in the front view ⇒ it is cut into the face the front view shows. Placing it on
-the opposite face produced identical topology, volume AND area — the error surfaced only as a CG shift
-and a flipped face normal. Depth-axis placement is the highest-risk decision on this path.
+**R6 — Which FACE a pocket or groove sits on is decided by R2, not by plausibility.** Placing a
+channel on the opposite face produced identical topology, volume AND area — the error surfaced only
+as a CG shift and a flipped face normal. Depth-axis placement is the highest-risk decision on this
+path.
 
 **R6b — Knowing which view shows which face is only HALF the decision: bind it to the IR's own BUILD
 DIRECTION, explicitly, before the first extrude node.** The IR extrudes toward the datum's POSITIVE
-normal by default (Front→+Z, Top→+Y, Right→+X). A boss on `front` therefore grows toward the direction
-the front view is looked at FROM — so with the default the sketch plane is the part's **BACK** face, not
-its front, and every depth you then take from the drawing's front datum lands mirrored. State the
-binding in one sentence and then hold to it:
+normal by default (Front→+Z, Top→+Y, Right→+X). A boss on `front` therefore grows toward the
+direction the front view is looked at FROM — so with the default the sketch plane is the part's
+**BACK** face, not its front, and every depth you then take from the drawing's front datum lands
+mirrored. State the binding in one sentence and then hold to it:
 
-- *"the drawing's FRONT face is my sketch plane"* ⇒ set **`reversed: true`** on the base extrude, after
-  which every subsequent depth is measured from that plane with the drawing's own sign. This is usually
-  the cheaper choice, because it is the datum the drawing dimensions from.
+- *"the drawing's FRONT face is my sketch plane"* ⇒ set **`reversed: true`** on the base extrude,
+  after which every subsequent depth is measured from that plane with the drawing's own sign. This is
+  usually the cheaper choice, because it is the datum the drawing dimensions from.
 - *"my sketch plane is the BACK face"* ⇒ leave the default and SUBTRACT every drawing depth from the
   part's thickness.
 
-Either is legal. Leaving it IMPLICIT is what produced f-2's mirrored first build — and it passed
+Either is legal. Leaving it IMPLICIT is what produced a mirrored first build — and it passed
 topology, volume AND area (R14 is why: none of the three can see a reflection). Two riders:
 
 - **A BASE FLANGE's default runs the OTHER WAY.** `sheet_metal` thickens to the sketch plane's
-  **−normal** side unless `reverse_thickness` (`symmetric_thickness` splits ±t/2). So the same binding
-  question has the opposite default from `extrude` — do not carry one habit into the other. A wrong side
-  also puts every downstream bend-sketch plane off the sheet, so it fails later and less clearly.
+  **−normal** side unless `reverse_thickness` (`symmetric_thickness` splits ±t/2). So the same
+  binding question has the opposite default from `extrude` — do not carry one habit into the other. A
+  wrong side also puts every downstream bend-sketch plane off the sheet, so it fails later and less
+  clearly.
 - `mid_plane` is symmetric by construction and immune; `reversed` is ignored there.
 
 Verify it, do not trust it: after the base feature, read one face or edge back
@@ -403,125 +407,128 @@ Verify it, do not trust it: after the base feature, read one face or edge back
 it. That single readback is the whole guard (R14).
 
 **R7 — A section view is read along its cut line's axis.** The `cut_line` primitives name where the
-section was taken; the section view's horizontal axis is then the depth axis. Decide which SIDE of the
-section is the front by cross-checking a feature already placed by R2/R6 (in f-2 the channel notch sits
-on the front side), then read every depth from that datum. Two independent views must agree — f-2's
-hole read 40-from-front in the section and 20-from-back in the top view: the same point.
+section was taken; the section view's horizontal axis is then the depth axis. Decide which SIDE of
+the section is the front by cross-checking a feature already placed by R2/R6, then read every depth
+from that datum. Two independent views must agree — a hole reading 40-from-front in the section and
+20-from-back in the top view is the same point.
 
 **R8 — Undimensioned twins and centred features are conventions, not gaps.** A feature carrying no
 position dimension across an axis is CENTRED on that axis, or repeats a dimension given for its
-symmetric partner. Say which reading you used. (f-2's top hole carries only its depth-axis distance;
-its left/right position is the centre.)
+symmetric partner. Say which reading you used.
 
-**R9 — A Ø equal to another Ø + 2R is that round's RIM, not an orphan circle.** f-2's top view shows a
-concentric Ø15 and Ø19; 19 = 15 + 2×2, and the section shows R2 arcs running from the top face into the
-bore ⇒ ONE blind Ø15 hole with an R2 fillet at its MOUTH. Consume the whole concentric group or declare
-an explicit gap.
+**R9 — A Ø equal to another Ø + 2R is that round's RIM, not an orphan circle.** A concentric Ø15 and
+Ø19 with 19 = 15 + 2×2, plus R2 arcs running from the top face into the bore in the section, is ONE
+blind Ø15 hole with an R2 fillet at its MOUTH. Consume the whole concentric group or declare an
+explicit gap.
 
 ### Sheet metal
 
-**R10 — The flat-pattern annotation carries the whole bend, and the READER does the pairing.**
-`UP 90 R 1` / `DOWN 90 R 1` gives direction, angle and bend radius. The tool matches each note to its
-line on three independent channels — the line's edge class must match the direction (SolidWorks draws
-DOWN bend lines `hidden` and UP `visible`, because the flat pattern is viewed from one side and a bend
-folding away is an obscured edge), the note sits ABOVE its line along the note's own up axis, and a
-line may annotate only one bend. Read the result, do not re-derive it:
+**R10 — The READER does the bend pairing; read the result, do not re-derive it.** A matched note
+brings its bend line and that line's edge class. Two things to act on:
 
-- `bend_line` present ⇒ matched. `in_loop: true` on it is a WARNING, not a detail: a bend line belongs
-  to no closed contour, so a true there means the match landed on outline geometry — say so.
-- `unpaired` present ⇒ the reader refused to guess, and lists why and which candidates it saw. That
-  bend is NOT built. Resolve it from the drawing or declare it a gap (R15) — never split the
-  difference. A wrong bend cannot be nudged afterwards (there is no sketch-entity move/delete tool);
-  repairing one costs deleting the feature and re-creating it.
+- `in_loop: true` on a bend line is a WARNING, not a detail: a bend line belongs to no closed
+  contour, so a true there means the match landed on outline geometry — say so.
+- `unpaired` means the reader refused to guess and listed why. That bend is NOT built. Resolve it
+  from the drawing or declare it a gap (R15) — never split the difference. A wrong bend cannot be
+  nudged afterwards (there is no sketch-entity move/delete tool); repairing one costs deleting the
+  feature and re-creating it.
 
-**R11 — Build sheet metal as FLAT BLANK + sketched bends.** One `sheet_metal` node (thickness from the
-thickness view or from a bare text note like "2 mm"; `bend_radius` and `k_factor` from the notes and
-config), then one `sketched_bend` node per DIRECTION group — a single sketch may hold several bend
-lines, and they share one angle/radius/flip. Order the groups so each bend sketch still lies on FLAT
-material: fold the OUTER bends first when an inner region must stay planar for a later sketch. The
-`sketched_bend` `fixed` point must sit on material that stays put for EVERY bend — the blank's own
-centroid, when it is clear of the bend lines and outside every cutout. (When the reader answers
-DIRECT_BUILDABLE it has already done all of this — see R16.)
+**R11 — Build sheet metal as FLAT BLANK + sketched bends.** One `sheet_metal` node (thickness from
+the thickness view or from a bare text note like "2 mm"; `bend_radius` and `k_factor` from the notes
+and config), then one `sketched_bend` node per DIRECTION group — a single sketch may hold several
+bend lines, and they share one angle/radius/flip. Order the groups so each bend sketch still lies on
+FLAT material: fold the OUTER bends first when an inner region must stay planar for a later sketch.
+The `sketched_bend` `fixed` point must sit on material that stays put for EVERY bend — the blank's
+own centroid, when it is clear of the bend lines and outside every cutout. (When the reader answers
+DIRECT_BUILDABLE it has already done all of this.)
 
-**R12 — Bent-state dimensioning converts to the flat by closed-form bend arithmetic.** When the drawing
-dimensions the FORMED part (outer-to-outer) instead of the blank, each flat segment is
+**R12 — Bent-state dimensioning converts to the flat by closed-form bend arithmetic.** When the
+drawing dimensions the FORMED part (outer-to-outer) instead of the blank, each flat segment is
 `outer_dim − Σ OSSB + Σ BA/2` over the bends bounding it, with `BA = θ·(R + K·t)` and
-`OSSB = (R + t)·tan(θ/2)`; K comes from config (0.5 = the SolidWorks default). Verified exactly on s-2:
-15/30/60 outer → 13.5708 / 27.1416 / 58.5708 flat, matching the drawn flat pattern to 4 decimals. If a
-flat-pattern view is ALSO present, measure it and cross-check — a mismatch means the K-factor
-assumption is wrong; FLAG it, never silently re-derive.
+`OSSB = (R + t)·tan(θ/2)`; K comes from config (0.5 = the SolidWorks default). If a flat-pattern view
+is ALSO present, measure it and cross-check — a mismatch means the K-factor assumption is wrong; FLAG
+it, never silently re-derive.
 
 ### Self-verification — there is NO original part
 
-A real drawing-only job has nothing to compare against: the part you are producing IS the deliverable,
-and nobody re-models a part they already have. Verify from the DRAWING and from computed expectations
-only. (A benchmark or test prompt may hand you a reference part and ask for an objective diff — that
-instruction comes from the TASK, never from this recipe.)
+A real drawing-only job has nothing to compare against: the part you are producing IS the
+deliverable, and nobody re-models a part they already have. Verify from the DRAWING and from computed
+expectations only. (A benchmark or test prompt may hand you a reference part and ask for an objective
+diff — that instruction comes from the TASK, never from this recipe.)
 
 **R13 — Compute the expected result BEFORE building, then read it back.** Derive the volume from the
 drawing's own dimensions (profile area × depth, minus each pocket/hole, minus the chamfer and fillet
 corners; for sheet metal, blank area × thickness). After the build read
 `analyze_model(mass_properties + geometry)` and compare. A match within rounding is the strongest
-verdict available without an original, and a mismatch localises the error immediately because you know
-which term you added last.
+verdict available without an original, and a mismatch localises the error immediately because you
+know which term you added last.
 
 **R14 — Volume, area and topology cannot see a MIRROR.** A depth feature placed on the wrong face, or
-at the mirrored coordinate, leaves all three identical — proven twice in one session. So for EVERY
-feature whose position came from a SECOND view, read the built geometry back (`analyze_model(edges |
-faces, near=…)` for a hole's axis, a groove's floor plane) and compare that coordinate against the
-dimension that fixed it. Do this BEFORE declaring success: it is the only check that catches a sign
-error, because a sign error fails silently.
+at the mirrored coordinate, leaves all three identical. So for EVERY feature whose position came from
+a SECOND view, read the built geometry back (`analyze_model(edges | faces, near=…)` for a hole's
+axis, a groove's floor plane) and compare that coordinate against the dimension that fixed it. Do
+this BEFORE declaring success: it is the only check that catches a sign error, because a sign error
+fails silently.
 
-**R15 — Close the ledger.** Every dimension and every primitive in the analysis must end in exactly one
-state: consumed by a named feature, an explicit duplicate/silhouette of one, or a written gap. Say
-explicitly what you did NOT build and why. Silence about a dropped feature is the worst outcome — worse
-than an honest gap.
+**R15 — Close the ledger.** Every dimension and every primitive in the analysis must end in exactly
+one state: consumed by a named feature, an explicit duplicate/silhouette of one, or a written gap.
+Say explicitly what you did NOT build and why. Silence about a dropped feature is the worst outcome —
+worse than an honest gap.
 
-A SKIPPED bend is the sharpest case of this. Bending does not change the blank's volume, so a missing
-bend leaves volume, area AND topology untouched — R13 and R14 both pass on a part that is simply not
-folded. The skip report is the only signal there will ever be. Build it by hand (`create_sketch` on the
-flat face → `add_sketch_entity(line)` → `sheet_metal_feature('sketched_bend')`) or state it.
+A SKIPPED bend is the sharpest case. Bending does not change the blank's volume, so a missing bend
+leaves volume, area AND topology untouched — R13 and R14 both pass on a part that is simply not
+folded. The skip report is the only signal there will ever be. Build it by hand (`create_sketch` on
+the flat face → `add_sketch_entity(line)` → `sheet_metal_feature('sketched_bend')`) or state it.
 
-**R16 — The reader answers in one of TWO shapes; the shape is the instruction.**
+**R16 — A NOT_DIRECT verdict is not a failure and not something to argue with.** It says the drawing
+does not force the answer — which is exactly when a human-grade read is what the job needs. Apply
+R1–R15 and build with `submit_feature_graph`.
 
-- **`DIRECT_BUILDABLE`** — every decision this drawing needs is forced by the drawing itself, so it has
-  already been lowered to IR deterministically. You get the blank, the thickness AND its source, each
-  bend with its class corroboration, anything SKIPPED, and the expected volume — but not the contour,
-  deliberately: echoing a 200-segment outline back would pay for it twice. Check the summary against
-  what the drawing should be, then `mode='build'`. Verification (R13/R14) is still yours, and so is
-  every skipped bend.
-- **`NOT_DIRECT | <reason>`** + the full analysis — the drawing needs real reading, which is the normal
-  case for a machined part. The reason names exactly which decision was left open (no bend notes at
-  all, an outline that did not close, competing thickness sources, …). Nothing is lost: apply R1–R15
-  to the JSON and build with `submit_feature_graph`.
+**Never compare two analyses by their VERSION LABEL.** An artifact is a cache keyed by
+`source.sha256`, and the version string is only as honest as the discipline that bumped it — one
+label has already named two different readers, and a stale artifact then reads exactly like a
+regression in the current one. When two analyses disagree, establish IN THIS ORDER: (1) are the
+`source.sha256` values equal — if not, they are different FILES and there is nothing to explain;
+(2) do they carry the same FIELD SET — a missing field dates the reader more reliably than the label
+does; only then (3) argue about the values. And note that the same part can legitimately produce two
+different sources: a direct `.DXF` export and a `.DWG`→DXF conversion are NOT the same sheet.
 
-A NOT_DIRECT verdict is not a failure and not something to argue with. It says the drawing does not
-force the answer — which is exactly when a human-grade read is what the job needs.
+**R17 — An unresolved contour is a GAP, never a guess.** Chaining is strict and stops at any junction
+of three or more, which closes flat patterns completely and leaves fragments in ORTHO views. When the
+outline you need is in pieces, say which pieces you have and what you could not close. Do NOT invent
+the missing segment: a wrong contour builds VALID geometry with no error — the same silent-failure
+class as R14's mirror. If the outline you need is open, it was never actually resolved; get it from
+the dimensions, or declare the gap. The same applies to an ellipse ARC (R2c).
 
-**R17 — An unresolved contour is a GAP, never a guess.** Chaining is strict: where two primitives meet
-unambiguously the contour continues, and at a junction of three or more it STOPS. This closes flat
-patterns completely; in ORTHO views it leaves fragments, because a feature silhouette ending in the
-middle of an outline edge is exactly such a junction. When the outline you need is in pieces, say which
-pieces you have and what you could not close. Do NOT invent the missing segment: a wrong contour builds
-VALID geometry with no error — the same silent-failure class as R14's mirror.
+**A Tier B boundary is a reading, not a guess — but CHECK it before you build on it.** It appears
+only where Tier A found nothing, so it can never contradict a Tier A answer, and the direct-build
+path ignores it by design: it reaches you through the analysis precisely so that you can corroborate
+it. Its area and bbox are exactly the kind of thing a stated length or width confirms in one line.
 
 ### Reading a real production drawing
 
-**R18 — What the drawing PRINTS arbitrates.** Every dimension carries `printed` — the string the CAD
-system actually drew, taken from the dimension's own block. It is more reliable than the stored
-measurement, which the DWG→DXF route corrupts in two whole classes: an ANGULAR value comes back as
-180+θ (a 7.9° bend reads 187.8765, a 45° weld bevel reads 225), and a RADIUS loses its arc side. So for
-angular, radius and diameter the printed value WINS and the reader has already substituted it. For a
-linear dimension the computed value stays (it carries more decimals than the printed rounding), but a
-disagreement beyond rounding is reported as `printed_mismatch` — read that flag, it means the scale,
-the arc match or the per-view factor is wrong, and it is free.
+**R18 — On a `printed_mismatch`, the number is a JUDGEMENT, not a reading.** The reader has already
+arbitrated between the string the CAD system drew and the stored measurement, and where it could not
+decide it leaves the flag set.
 
-**R19 — A BREAK (interrupted) view gives you the PROFILE, never the LENGTH.** A very long part is drawn
-shortened, with the middle cut out. The signature is mechanical, all of it computable from what the
-reader emits: the outline does not close although every primitive is `visible`; the silhouette edges
-appear as COLLINEAR PAIRS with a gap; the gap is spanned by primitives that OVERHANG the silhouette on
-BOTH sides (nothing real overhangs its own outline); and they come as a MATCHED PAIR, one set per
-broken end. When you see it:
+- On a **linear** dimension the flag means the scale, the arc match or the per-view factor is wrong.
+  Read it — it is free.
+- On an **angle** it means the value is a judgement: corroborate it against the geometry or an
+  ellipse ratio (R2c) before you build on it. A mechanical drawing does not dimension a reflex angle,
+  so a value above 180° is the explement of the one you want.
+- Where `kind_from: "printed"` appears, the entity's own type was overruled by the drawn symbol.
+  Believing the entity instead would put a 60 mm LENGTH where a 60 mm HOLE belongs — a silent
+  R2/R6-class error. The relabel is value-neutral: a length measured across a circle already IS the
+  diameter.
+- Where `measures` sits beside a mismatch, distrust the LINK the reader made, not the value.
+  Concentric arcs share a centre, so geometry alone cannot say which one a radial dimension meant.
+
+**R19 — A BREAK (interrupted) view gives you the PROFILE, never the LENGTH.** A very long part is
+drawn shortened, with the middle cut out. The signature is mechanical, all of it computable from what
+the reader emits: the outline does not close although every primitive is `visible`; the silhouette
+edges appear as COLLINEAR PAIRS with a gap; the gap is spanned by primitives that OVERHANG the
+silhouette on BOTH sides (nothing real overhangs its own outline); and they come as a MATCHED PAIR,
+one set per broken end. When you see it:
 
 - Take the cross-section/profile from the drawn body. Its extent along the break axis is VOID.
 - The length comes from an ANNOTATION — a dimension or the title block. If nothing states it, that is
@@ -531,12 +538,10 @@ broken end. When you see it:
 - Classify the break lines explicitly in the R15 ledger. They are furniture, not contour.
 
 **R20 — If the title block states a WEIGHT, it must come out.** Compute it from your reading before
-building: volume × density. It is an independent check on the WHOLE interpretation at once — it caught
-a break view's true length (338 gives 0.464 kg, the drawn 125 gives 0.172) and it confirms
-material-REMOVING detail too, because the stated weight includes it (a 6.7 m plate read 183.47 kg as a
-plain blank and 178.73 kg once the 45° weld preparation along both long edges was subtracted, against
-a stated 178.694). Do NOT go looking for a weight that is not there — many drawings have none. Use it
-when it exists.
+building: volume × density. It is an independent check on the WHOLE interpretation at once — it
+caught a break view's true length (338 gives 0.464 kg, the drawn 125 gives 0.172) and it confirms
+material-REMOVING detail too, because the stated weight includes it. Do NOT go looking for a weight
+that is not there — many drawings have none. Use it when it exists.
 
 **R21 — Sheet metal is decided by DECLARATION first, thickness second.** If the title block says so
 (`Blech`, `plate`, and their equivalents), build it as sheet metal. If it does not, a part of
@@ -545,21 +550,21 @@ flange is more useful downstream (flat pattern, bends, manufacturing intent) tha
 20 mm there is no rule: decide, and say which way you decided and why.
 
 **R22 — With no UP/DOWN note, bend DIRECTION comes from the projection, not from the line's class.**
-`bend_class_map` (visible=UP, hidden=DOWN) is a SolidWorks flat-pattern convention and only applies to
-a flat pattern SolidWorks generated — a real drawing draws bend lines as plain continuous lines and may
-mark them with a hand leader instead. Read the direction from the FORMED view via R4 instead: find the
-edge view of the formed part, apply the projection standard to learn which side of it is the near face,
-and see which way the bend centre lies. Then, because the compiler's own fold convention is a BUILD
-choice and not something the drawing says: build once, READ THE FOLD BACK (R14), and set `flip` if it
-came out mirrored. The magnitude being right and only the sign wrong is the expected first result.
+`bend_class_map` (visible=UP, hidden=DOWN) is a SolidWorks flat-pattern convention and only applies
+to a flat pattern SolidWorks generated — a real drawing draws bend lines as plain continuous lines
+and may mark them with a hand leader instead. Read the direction from the FORMED view via R4: find
+the edge view of the formed part, apply the projection standard to learn which side of it is the near
+face, and see which way the bend centre lies. Then, because the compiler's own fold convention is a
+BUILD choice and not something the drawing says: build once, READ THE FOLD BACK (R14), and set `flip`
+if it came out mirrored. The magnitude being right and only the sign wrong is the expected first
+result.
 
 **R23 — On sheet metal, BENDS come before chamfers and fillets.** SolidWorks cannot fold through a
-chamfer: a sketched bend crossing a chamfered edge returns null with no useful message. Order the graph
-blank → base flange → every bend → only then the edge treatments. Selecting the edges afterwards costs
-more (each long edge is split by every bend it crosses, so one weld preparation became 16 edges instead
-of 4) — pay it. If the edge treatment is easier to express on the flat, that is not a reason: it will
-not build.
-
+chamfer: a sketched bend crossing a chamfered edge returns null with no useful message. Order the
+graph blank → base flange → every bend → only then the edge treatments. Selecting the edges
+afterwards costs more (each long edge is split by every bend it crosses, so one weld preparation
+became 16 edges instead of 4) — pay it. If the edge treatment is easier to express on the flat, that
+is not a reason: it will not build.
 ## coverage — Coverage reporting
 
 Every batch/folder run ends with one summary:
