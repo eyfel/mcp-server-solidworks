@@ -24,14 +24,34 @@ class ExecutionLayerError(Exception):
 # Serializes auto-start so two concurrent tool calls hitting a down server don't each
 # spawn a duplicate exe.
 _spawn_lock = threading.Lock()
+_health_fail_logged = False
+
+
+def _http_client(**kwargs) -> httpx.Client:
+    """Talk to the local execution server, ignoring the Windows system proxy.
+
+    httpx trust_env=True reads HKCU Internet Settings and will send
+    http://localhost:5000 through a LAN proxy (Clash/V2Ray), which hangs or
+    returns HTTP 502. Windows ProxyOverride (localhost / <local>) is not
+    honoured by httpx, so we never inherit env/registry proxies here.
+    """
+    kwargs.setdefault("trust_env", False)
+    return httpx.Client(**kwargs)
 
 
 def _server_is_up() -> bool:
     """Cheap liveness probe — True if /health answers 200."""
+    global _health_fail_logged
     try:
-        with httpx.Client(timeout=2.0) as client:
-            return client.get(HEALTH_ENDPOINT).status_code == 200
-    except Exception:
+        with _http_client(timeout=2.0) as client:
+            ok = client.get(HEALTH_ENDPOINT).status_code == 200
+            if ok:
+                _health_fail_logged = False
+            return ok
+    except Exception as ex:
+        if not _health_fail_logged:
+            _log(f"!! /health probe failed: {type(ex).__name__}: {ex}")
+            _health_fail_logged = True
         return False
 
 
@@ -103,7 +123,7 @@ def _request_with_autostart(do_request, label: str):
 def get_health() -> dict:
     """GET /health — server status + COM attach state (does not touch state_version)."""
     try:
-        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        with _http_client(timeout=HTTP_TIMEOUT) as client:
             response = client.get(HEALTH_ENDPOINT)
     except httpx.ConnectError:
         _log("<- health CONNECT_ERROR (server down?)")
@@ -130,7 +150,7 @@ def get_state() -> int:
     _log("-> get_state (resync)")
 
     def _do():
-        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        with _http_client(timeout=HTTP_TIMEOUT) as client:
             return client.get(STATE_ENDPOINT)
 
     try:
@@ -168,7 +188,7 @@ def call_tool(tool_name: str, operation_id: str, state_version: int, params: dic
     _log(f"-> {tool_name} op={operation_id} sv={state_version}")
 
     def _do():
-        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+        with _http_client(timeout=HTTP_TIMEOUT) as client:
             return client.post(EXECUTE_ENDPOINT, json=payload)
 
     try:
@@ -210,7 +230,7 @@ def ensure_ready() -> dict:
         _ensure_server_up()
 
     def _do():
-        with httpx.Client(timeout=ENSURE_TIMEOUT) as client:
+        with _http_client(timeout=ENSURE_TIMEOUT) as client:
             return client.post(ENSURE_ENDPOINT)
 
     try:
