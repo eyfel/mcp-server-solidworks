@@ -10,6 +10,7 @@ from config import (
     ENSURE_ENDPOINT,
     HTTP_TIMEOUT,
     ENSURE_TIMEOUT,
+    CONNECT_TIMEOUT,
     EXECUTION_EXE_PATH,
     SERVER_SPAWN_TIMEOUT,
 )
@@ -28,31 +29,59 @@ _health_fail_logged = False
 
 
 def _http_client(**kwargs) -> httpx.Client:
-    """Talk to the local execution server, ignoring the Windows system proxy.
+    """Talk to the local execution server: no system proxy, and a CONNECT phase of its own.
 
-    httpx trust_env=True reads HKCU Internet Settings and will send
-    http://localhost:5000 through a LAN proxy (Clash/V2Ray), which hangs or
-    returns HTTP 502. Windows ProxyOverride (localhost / <local>) is not
-    honoured by httpx, so we never inherit env/registry proxies here.
+    1. `trust_env=False` — httpx trust_env=True reads HKCU Internet Settings and will send
+       http://localhost:5000 through a LAN proxy (Clash/V2Ray), which hangs or returns
+       HTTP 502. Windows ProxyOverride (localhost / <local>) is not honoured by httpx, so
+       we never inherit env/registry proxies here.
+
+    2. The connect phase gets CONNECT_TIMEOUT, not the caller's number. Which exception a
+       down server raises is a RACE between that budget and the OS's refusal: win it and
+       httpx raises ConnectError, lose it and ConnectTimeout. `_request_with_autostart`
+       catches only ConnectError, so with a small caller timeout the auto-start would
+       silently never fire. Splitting the phases makes the exception type a property of the
+       code instead of a property of someone's .env (KNOWN-LIMITATIONS #31).
     """
     kwargs.setdefault("trust_env", False)
+    timeout = kwargs.get("timeout")
+    if isinstance(timeout, (int, float)):
+        # A caller passing its own httpx.Timeout has said exactly what it wants — leave it.
+        kwargs["timeout"] = httpx.Timeout(timeout, connect=CONNECT_TIMEOUT)
     return httpx.Client(**kwargs)
 
 
+def _log_health_failure(detail: str) -> None:
+    """Log the first failure of an outage, then stay quiet until /health answers again.
+
+    _ensure_server_up polls the probe twice a second, so an unconditional log would bury
+    adapter.log under one line per poll.
+    """
+    global _health_fail_logged
+    if not _health_fail_logged:
+        _log(f"!! /health probe failed: {detail}")
+        _health_fail_logged = True
+
+
 def _server_is_up() -> bool:
-    """Cheap liveness probe — True if /health answers 200."""
+    """Cheap liveness probe — True if /health answers 200.
+
+    Both failure shapes are logged (once per outage), because they are the two halves of
+    the same bug: a system proxy that hijacks the localhost route either hangs — which
+    surfaces as an exception — or answers 502 itself, which raises nothing at all.
+    """
     global _health_fail_logged
     try:
         with _http_client(timeout=2.0) as client:
-            ok = client.get(HEALTH_ENDPOINT).status_code == 200
-            if ok:
-                _health_fail_logged = False
-            return ok
+            status = client.get(HEALTH_ENDPOINT).status_code
     except Exception as ex:
-        if not _health_fail_logged:
-            _log(f"!! /health probe failed: {type(ex).__name__}: {ex}")
-            _health_fail_logged = True
+        _log_health_failure(f"{type(ex).__name__}: {ex}")
         return False
+    if status != 200:
+        _log_health_failure(f"HTTP {status} from {HEALTH_ENDPOINT}")
+        return False
+    _health_fail_logged = False
+    return True
 
 
 def _ensure_server_up() -> None:
